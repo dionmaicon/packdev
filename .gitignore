@@ -1,0 +1,173 @@
+# PackDev - Node.js and npm Package .gitignore
+# =====================================================
+# Comprehensive gitignore for Node.js projects and npm packages
+#
+# NOTE: This project also has .npmignore for package publishing
+# - .gitignore: Controls what goes into version control (git)
+# - .npmignore: Controls what goes into published package (npm)
+#
+# Key differences for this project:
+# - dist/ may be committed to git but excluded from npm package
+# - Source files are excluded from npm but included in git
+# - Lock files may be committed to git but excluded from npm
+
+# ==========================================
+# Node.js Dependencies
+# ==========================================
+
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Package manager files (uncomment to ignore lock files)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# ==========================================
+# Build Output & Distribution
+# ==========================================
+
+# Compiled output (uncomment dist/ if you don't want to commit built files)
+# dist/
+build/
+out/
+lib/
+# Generated packages
+*.tgz
+*.tar.gz
+
+# TypeScript
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ==========================================
+# Runtime & Logs
+# ==========================================
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+.nyc_output/
+
+# ==========================================
+# Environment & Configuration
+# ==========================================
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# Configuration files (keep templates)
+config/local.json
+config/production.json
+config/development.json
+
+# ==========================================
+# Development Tools
+# ==========================================
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==========================================
+# Testing & Temporary
+# ==========================================
+
+# Test output
+test-results/
+test-reports/
+coverage/
+
+# Temporary folders
+tmp/
+temp/
+
+# ==========================================
+# Specific to PackDev
+# ==========================================
+
+# PackDev development files
+.packdev.json.backup
+*.packdev-backup
+
+# Local development test directories
+test-hooks/
+test-data/
+demo-output/
+debug-*/
+
+# ==========================================
+# Optional: Project-specific patterns
+# ==========================================
+
+# Uncomment if needed:
+# *.min.js
+# *.min.css
+# .cache/
+# public/build/
+# static/build/
+
+# ==========================================
+# Keep Important Files
+# ==========================================
+
+# Force include important files even if they match patterns above
+!.gitkeep
+!.npmrc
+!.yarnrc
+!.nvmrc
+!README*.md
+!LICENSE*
+!CHANGELOG*
+
+# ==========================================
+# Project Notes
+# ==========================================
+#
+# For PackDev development:
+# 1. dist/ is commented out - decide if you want built files in git
+# 2. Lock files are commented out - keeping them helps with reproducible builds
+# 3. *.tgz files are ignored - these are generated packages for testing
+# 4. See .npmignore for what gets excluded from published packages

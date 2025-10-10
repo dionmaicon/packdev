@@ -1,0 +1,24 @@
+{
+  "name": "packdev-test-suite",
+  "version": "1.0.0",
+  "description": "Test suite for packdev local package development management tool",
+  "main": "test-demo.js",
+  "private": true,
+  "scripts": {
+    "test": "node test-demo.js",
+    "demo": "node demo.js",
+    "fake-lodash-test": "cd fake-lodash && npm test"
+  },
+  "keywords": [
+    "packdev",
+    "test",
+    "lodash",
+    "local-development",
+    "package-management"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
