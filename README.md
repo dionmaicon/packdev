@@ -23,9 +23,9 @@ npm install --save-dev packdev
 
 > **Note**: After installation, you can use `packdev` commands anywhere (global) or `npx packdev` (local).
 
-## 💡 What is Packdev?
+## 💡 What is PackDev?
 
-Packdev solves a common problem: **testing your app with local versions of packages before publishing them**.
+PackDev solves a common problem: **testing your app with local versions of packages before publishing them**.
 
 Instead of publishing beta versions or using complicated `npm link` setups, packdev lets you:
 - 🔄 **Temporarily replace** npm packages with local directories
@@ -33,7 +33,7 @@ Instead of publishing beta versions or using complicated `npm link` setups, pack
 - 🔁 **Switch back and forth** between local and published versions
 - 👥 **Share setup** with your team via `.packdev.json` config
 
-### The Problem Packdev Solves
+### The Problem PackDev Solves
 
 **Before packdev:**
 ```bash
@@ -99,7 +99,7 @@ packdev finish                        # Back to npm version
 
 **🔄 Repeat anytime:** Run `packdev init` and `packdev finish` as much as you want!
 
-## 📊 Packdev vs Traditional Alternatives
+## 📊 PackDev vs Traditional Alternatives
 
 **What we're comparing:** Different approaches developers use to test local package changes before publishing.
 
@@ -362,12 +362,14 @@ npx packdev setup-hooks
 **Options:**
 - `--force` - Overwrite existing hooks
 - `--disable` - Remove/disable the safety hooks
+- `--auto-commit` - Enable interactive auto-commit flow when local dependencies are detected
 
 **What it does:**
-- Creates `.github/hooks/pre-commit` and `.github/hooks/check-local-deps.js`
+- Creates `.git/hooks/pre-commit` and `.git/hooks/check-local-deps.js`
 - Prevents commits containing `file:` dependencies
 - Allows commits with "WIP" in the message
-- Provides setup instructions for Git configuration
+- **Auto-commit flow (with `--auto-commit`)**: Prompts to finish development and commit automatically
+- Saves preferences in `.packdev.json` for future use
 
 ## 📋 Configuration
 
@@ -640,8 +642,14 @@ git commit -m "add new features"  # Now allowed
 # Setup hooks
 packdev setup-hooks
 
+# Setup hooks with auto-commit flow
+packdev setup-hooks --auto-commit
+
 # Overwrite existing hooks
 packdev setup-hooks --force
+
+# Enable auto-commit flow on existing hooks
+packdev setup-hooks --auto-commit --force
 
 # Remove hooks
 packdev setup-hooks --disable
@@ -649,6 +657,42 @@ packdev setup-hooks --disable
 # Test the hooks
 npm run demo-hooks
 ```
+
+### Auto-Commit Flow
+
+When enabled with `--auto-commit`, the pre-commit hook provides an interactive workflow:
+
+```bash
+# Enable auto-commit flow
+packdev setup-hooks --auto-commit
+
+# Now when you try to commit with local dependencies:
+git commit -m "feat: add user authentication"
+
+# You'll see:
+# ⚠️  Local file dependencies detected!
+# 
+#   📦 my-shared-lib: file:../shared-lib (dependencies)
+# 
+# 🤖 Do you want to finish development and commit the changes? (y/n): y
+# 
+# 🔄 Running packdev finish...
+# ✅ Dependencies restored
+# 📦 Adding package files...
+# ✅ Package files staged
+# 💾 Committing with message: "feat: add user authentication"
+# ✅ Changes committed
+# 🔄 Running packdev init...
+# ✅ Development environment restored
+# 
+# 🎉 Auto-commit flow completed successfully!
+```
+
+**Benefits:**
+- 🚀 **Streamlined workflow** - Automatic finish → commit → init cycle
+- 🔒 **Safe by default** - Always asks before proceeding
+- 💾 **Preserves commit message** - Uses exactly what you typed
+- ⚙️ **Team configurable** - Setting saved in `.packdev.json`
 
 ### WIP Patterns Recognized
 

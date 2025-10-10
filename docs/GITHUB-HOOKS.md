@@ -45,8 +45,14 @@ git commit -m "WIP: testing local changes"
 # Create new hooks
 packdev setup-hooks
 
+# Create hooks with auto-commit flow
+packdev setup-hooks --auto-commit
+
 # Overwrite existing hooks
 packdev setup-hooks --force
+
+# Enable auto-commit flow on existing hooks
+packdev setup-hooks --auto-commit --force
 
 # Remove/disable hooks
 packdev setup-hooks --disable
@@ -64,7 +70,15 @@ graph TD
     D -->|No| E[✅ Allow Commit]
     D -->|Yes| F{WIP in message?}
     F -->|Yes| G[⚠️ Allow with Warning]
-    F -->|No| H[❌ Block Commit]
+    F -->|No| H{Auto-commit flow enabled?}
+    H -->|No| I[❌ Block Commit]
+    H -->|Yes| J[❓ Ask: Finish and commit?]
+    J -->|No| I
+    J -->|Yes| K[🔄 packdev finish]
+    K --> L[📦 git add package.*]
+    L --> M[💾 git commit]
+    M --> N[🔄 packdev init]
+    N --> O[✅ Complete]
 ```
 
 ### Hook Components
@@ -104,6 +118,55 @@ git commit -m "commit with local deps"
 
 # Re-enable hooks
 packdev setup-hooks
+```
+
+### Method 4: Auto-Commit Flow
+```bash
+# Enable auto-commit flow when setting up hooks
+packdev setup-hooks --auto-commit
+
+# Or enable on existing hooks
+packdev setup-hooks --auto-commit --force
+```
+
+When auto-commit flow is enabled, the pre-commit hook will:
+
+1. **Detect local dependencies** in your commit
+2. **Ask interactively**: "Do you want to finish development and commit the changes? (y/n)"
+3. **If you answer 'yes'**:
+   - Run `packdev finish` to restore original dependencies
+   - Run `git add package.*` to stage package files
+   - Commit with your original commit message
+   - Run `packdev init` to restore development environment
+4. **If you answer 'no'**: Block the commit (traditional behavior)
+
+**Benefits:**
+- 🚀 **Streamlined workflow** - No need to manually run finish/init cycle
+- 🔒 **Safe by default** - Always asks before proceeding
+- 💾 **Preserves your commit message** - Uses exactly what you typed
+- 🔄 **Automatic re-initialization** - Ready for continued development
+- 💡 **Configurable** - Saved in `.packdev.json` for team consistency
+
+**Example interaction:**
+```bash
+$ git commit -m "feat: add new user authentication"
+
+⚠️  Local file dependencies detected!
+
+  📦 my-shared-lib: file:../shared-lib (dependencies)
+
+🤖 Do you want to finish development and commit the changes? (y/n): y
+
+🔄 Running packdev finish...
+✅ Dependencies restored
+📦 Adding package files...
+✅ Package files staged
+💾 Committing with message: "feat: add new user authentication"
+✅ Changes committed
+🔄 Running packdev init...
+✅ Development environment restored
+
+🎉 Auto-commit flow completed successfully!
 ```
 
 ## 🎯 Use Cases

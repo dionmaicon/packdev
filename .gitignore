@@ -39,7 +39,7 @@ lerna-debug.log*
 # ==========================================
 
 # Compiled output (uncomment dist/ if you don't want to commit built files)
-# dist/
+dist/
 build/
 out/
 lib/

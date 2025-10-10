@@ -295,6 +295,11 @@ program
   )
   .option("--force", "Overwrite existing hooks", false)
   .option("--disable", "Disable/remove the safety hooks", false)
+  .option(
+    "--auto-commit",
+    "Enable interactive auto-commit flow in pre-commit hook",
+    false,
+  )
   .action(async (options) => {
     try {
       if (options.disable) {
@@ -303,7 +308,11 @@ program
         console.log("🔧 Setting up GitHub safety hooks...");
       }
 
-      const result = await setupGitHooks(options.force, options.disable);
+      const result = await setupGitHooks(
+        options.force,
+        options.disable,
+        options.autoCommit,
+      );
 
       if (result.success) {
         if (options.disable) {
@@ -313,7 +322,16 @@ program
           console.log(
             "🛡️  The hooks will now prevent commits with development dependencies",
           );
-          console.log("💡 Use 'WIP' in commit messages to bypass the check");
+          if (options.autoCommit) {
+            console.log(
+              "🤖 Auto-commit flow enabled: You'll be prompted to finish and commit when local deps are detected",
+            );
+          } else {
+            console.log("💡 Use 'WIP' in commit messages to bypass the check");
+            console.log(
+              "💡 Enable auto-commit flow with: packdev setup-hooks --auto-commit --force",
+            );
+          }
         }
 
         if (result.message) {

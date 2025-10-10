@@ -89,7 +89,7 @@ class HookDemo {
         env.PACKDEV_VERBOSE = '1';
       }
 
-      const result = execSync('node .github/hooks/check-local-deps.js', {
+      const result = execSync('node .git/hooks/check-local-deps.js', {
         encoding: 'utf8',
         stdio: 'pipe',
         env
@@ -253,7 +253,7 @@ class HookDemo {
     console.log();
     logInfo('To use in your project:');
     console.log('1. Run: packdev setup-hooks');
-    console.log('2. Configure: git config core.hooksPath .github/hooks');
+    console.log('2. Hooks are automatically active in .git/hooks/');
     console.log('3. Commit safely knowing local deps are protected!');
   }
 
@@ -322,7 +322,7 @@ async function main() {
 
   try {
     // Check if hooks are set up
-    if (!fs.existsSync('.github/hooks/check-local-deps.js')) {
+    if (!fs.existsSync('.git/hooks/check-local-deps.js')) {
       logError('Hooks not found! Please run: packdev setup-hooks');
       process.exit(1);
     }

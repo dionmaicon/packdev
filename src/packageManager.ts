@@ -15,6 +15,7 @@ export interface PackdevConfig {
   dependencies: PackdevDependency[];
   created: string;
   lastModified?: string;
+  autoCommitFlow?: boolean;
 }
 
 export interface PackageJson {
@@ -810,11 +811,26 @@ export async function validateProject(
 export async function setupGitHooks(
   force: boolean = false,
   disable: boolean = false,
+  autoCommitFlow: boolean = false,
+  configPath: string = ".packdev.json",
 ): Promise<SetupHooksResult> {
   try {
     const hooksDir = ".git/hooks";
     const preCommitFile = path.join(hooksDir, "pre-commit");
     const checkScriptFile = path.join(hooksDir, "check-local-deps.js");
+
+    // Save autoCommitFlow preference to config if not disabling
+    if (!disable) {
+      let config = await loadConfig(configPath);
+      if (config) {
+        // Only set autoCommitFlow if explicitly true, otherwise preserve existing value
+        if (autoCommitFlow === true) {
+          config.autoCommitFlow = true;
+        }
+        config.lastModified = new Date().toISOString();
+        await saveConfig(configPath, config);
+      }
+    }
 
     if (disable) {
       // Remove hooks
@@ -870,6 +886,8 @@ export async function setupGitHooks(
 
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
+const { execSync } = require('child_process');
 
 function log(message, color = '\\x1b[0m') {
   console.log(\`\${color}\${message}\\x1b[0m\`);
@@ -889,6 +907,21 @@ function logInfo(message) {
 
 function logSuccess(message) {
   log(\`✅ \${message}\`, '\\x1b[32m');
+}
+
+/**
+ * Load .packdev.json config
+ */
+function loadPackdevConfig() {
+  try {
+    const configPath = path.join(process.cwd(), '.packdev.json');
+    if (!fs.existsSync(configPath)) {
+      return null;
+    }
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    return null;
+  }
 }
 
 /**
@@ -971,7 +1004,6 @@ function getCommitMessage() {
 
     // Method 5: Try to read from git log (last commit message as fallback)
     try {
-      const { execSync } = require('child_process');
       const lastCommit = execSync('git log -1 --pretty=%B', { encoding: 'utf8', stdio: 'pipe' });
       return lastCommit.trim();
     } catch {
@@ -984,7 +1016,127 @@ function getCommitMessage() {
   }
 }
 
-function main() {
+/**
+ * Interactive prompt for yes/no question
+ * Handles both TTY and non-TTY environments (like Git hooks)
+ */
+function askYesNo(question) {
+  return new Promise((resolve) => {
+    // Check if we're in a TTY environment (interactive terminal)
+    if (!process.stdin.isTTY) {
+      console.log('⚠️  Non-interactive environment detected (Git hook)');
+      console.log('🤖 Auto-commit flow requires interactive input.');
+      console.log('💡 Use environment variable to control: PACKDEV_AUTO_COMMIT=yes|no');
+      console.log('');
+
+      // Check for environment variable override
+      const envOverride = process.env.PACKDEV_AUTO_COMMIT;
+      if (envOverride) {
+        const shouldProceed = envOverride.toLowerCase() === 'yes' || envOverride.toLowerCase() === 'y';
+        console.log(\`📋 Using environment variable: PACKDEV_AUTO_COMMIT=\${envOverride}\`);
+        console.log(\`🎯 Decision: \${shouldProceed ? 'Proceeding with auto-commit flow' : 'Blocking commit'}\`);
+        resolve(shouldProceed);
+        return;
+      }
+
+      // Default to 'no' in non-interactive environments for safety
+      console.log('🔒 Defaulting to blocking commit for safety in non-interactive mode');
+      console.log('💡 To enable auto-commit in scripts, set: PACKDEV_AUTO_COMMIT=yes');
+      resolve(false);
+      return;
+    }
+
+    // Interactive TTY environment - use readline
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    rl.question(\`\${question} (y/n): \`, (answer) => {
+      rl.close();
+      const normalized = answer.toLowerCase().trim();
+      resolve(normalized === 'y' || normalized === 'yes');
+    });
+  });
+}
+
+/**
+ * Execute auto-commit flow
+ */
+async function executeAutoCommitFlow(commitMessage) {
+  try {
+    logInfo('Starting auto-commit flow...');
+
+    // Find packdev binary - try common locations
+    let packdevCmd = 'packdev';
+    const possiblePaths = [
+      'node ../dist/index.js',  // Relative to test directory
+      'npx packdev',            // Global install
+      'packdev'                 // PATH
+    ];
+
+    // Step 1: Run packdev finish
+    logInfo('🔄 Running packdev finish...');
+    let success = false;
+    for (const cmd of possiblePaths) {
+      try {
+        execSync(\`\${cmd} finish\`, { stdio: 'pipe', timeout: 10000 });
+        packdevCmd = cmd;
+        success = true;
+        break;
+      } catch (error) {
+        // Try next command
+        continue;
+      }
+    }
+
+    if (!success) {
+      logError('❌ Could not run packdev finish - packdev binary not found');
+      return false;
+    }
+    logSuccess('✅ Dependencies restored');
+
+    // Step 2: Add package files
+    logInfo('📦 Adding package files...');
+    execSync('git add package.*', { stdio: 'pipe' });
+    logSuccess('✅ Package files staged');
+
+    // Step 3: Commit with original message (escape quotes)
+    const escapedMessage = commitMessage.replace(/"/g, '\\\\"');
+    logInfo(\`💾 Committing with message: "\${commitMessage}"\`);
+    execSync(\`git commit -m "\${escapedMessage}"\`, { stdio: 'pipe' });
+    logSuccess('✅ Changes committed');
+
+    // Step 4: Run packdev init
+    logInfo('🔄 Running packdev init...');
+    try {
+      execSync(\`\${packdevCmd} init\`, { stdio: 'pipe', timeout: 10000 });
+      logSuccess('✅ Development environment restored');
+    } catch (error) {
+      logError('❌ Warning: Could not restore development environment');
+      logInfo('💡 You may need to run "packdev init" manually later');
+    }
+
+    console.log('');
+    logSuccess('🎉 Auto-commit flow completed successfully!');
+    console.log('');
+
+    return true;
+  } catch (error) {
+    console.log('');
+    logError(\`Auto-commit flow failed: \${error.message}\`);
+    console.log('');
+    logInfo('You can manually:');
+    console.log('1. Run: packdev finish');
+    console.log('2. Run: git add package.*');
+    console.log(\`3. Run: git commit -m "\${commitMessage}"\`);
+    console.log('4. Run: packdev init');
+    console.log('');
+    return false;
+  }
+}
+
+async function main() {
   // Check for debug/verbose mode
   const isVerbose = process.argv.includes('--verbose') || process.env.PACKDEV_VERBOSE === '1';
 
@@ -1023,7 +1175,34 @@ function main() {
     process.exit(0);
   }
 
-  // Block the commit
+  // Check if auto-commit flow is enabled
+  const config = loadPackdevConfig();
+  const autoCommitFlowEnabled = config && config.autoCommitFlow === true;
+
+  if (autoCommitFlowEnabled && commitMessage) {
+    console.log('');
+    logWarning('Local file dependencies detected!');
+    console.log('');
+    dependencies.forEach(dep => {
+      console.log(\`  📦 \${dep.name}: \${dep.version} (\${dep.section})\`);
+    });
+    console.log('');
+
+    try {
+      const shouldProceed = await askYesNo('🤖 Do you want to finish development and commit the changes?');
+
+      if (shouldProceed) {
+        const success = await executeAutoCommitFlow(commitMessage);
+        process.exit(success ? 0 : 1);
+      } else {
+        logInfo('Auto-commit flow cancelled.');
+      }
+    } catch (error) {
+      logError(\`Interactive prompt failed: \${error.message}\`);
+    }
+  }
+
+  // Block the commit - show traditional options
   console.log('');
   logError('Commit blocked: Local file dependencies detected!');
   console.log('');
@@ -1037,6 +1216,9 @@ function main() {
   console.log('1. 📦 Restore original dependencies: packdev finish');
   console.log('2. 🏷️  Add "WIP" to your commit message for work-in-progress commits');
   console.log('3. 🔧 Disable safety checks: packdev setup-hooks --disable');
+  if (!autoCommitFlowEnabled) {
+    console.log('4. 🤖 Enable auto-commit flow: packdev setup-hooks --auto-commit');
+  }
   console.log('');
   console.log('Example WIP commit:');
   console.log('  git commit -m "WIP: testing local changes"');
@@ -1048,7 +1230,10 @@ function main() {
 }
 
 if (require.main === module) {
-  main();
+  main().catch(error => {
+    logError(\`Unexpected error: \${error.message}\`);
+    process.exit(1);
+  });
 }
 `;
 
