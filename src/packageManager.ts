@@ -1278,10 +1278,11 @@ fi
 Created Git safety hooks in .git/hooks/
 ${
   autoCommitFlow
-    ? `Auto-commit flow enabled: Your commits will include both your changes AND restored dependencies.
+    ? `Auto-commit flow enabled: Dependencies are automatically restored during commits.
 - Dependencies are automatically restored before committing
 - Your commit message and changes are preserved
-- Clean dependencies are included in the same commit`
+- Clean dependencies are included in the same commit
+- No user prompting - the process is fully automated`
     : `The hooks are automatically active and will prevent commits with development dependencies unless:
 1. You run 'packdev finish' to restore original dependencies, or
 2. You include 'WIP' in your commit message`

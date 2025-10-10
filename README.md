@@ -4,11 +4,13 @@ A TypeScript-based CLI tool for managing local package dependencies during devel
 
 ## 🚀 Features
 
-- **Local Development Mode**: Replace npm versions with local file paths
+- **Local Development Mode**: Replace npm versions with local file paths or git URLs
 - **Easy Restoration**: Restore original versions when ready for production
+- **Privacy by Default**: Keep .packdev.json private in .gitignore (recommended)
+- **CI/CD Integration**: Automate package testing with different dependency versions
 - **Configuration Management**: Track local dependencies in `.packdev.json`
 - **TypeScript Support**: Full TypeScript implementation with type safety
-- **Path Validation**: Automatic validation of local package paths
+- **Path Validation**: Automatic validation of local package paths and git URLs
 - **Backup & Safety**: Safe operations with validation and error handling
 
 ## 📦 Installation
@@ -28,10 +30,11 @@ npm install --save-dev packdev
 PackDev solves a common problem: **testing your app with local versions of packages before publishing them**.
 
 Instead of publishing beta versions or using complicated `npm link` setups, packdev lets you:
-- 🔄 **Temporarily replace** npm packages with local directories
+- 🔄 **Temporarily replace** npm packages with local directories or git URLs
 - 🏠 **Work locally** on packages and test them immediately in your app
 - 🔁 **Switch back and forth** between local and published versions
-- 👥 **Share setup** with your team via `.packdev.json` config
+- 👥 **Privacy-first collaboration** - Keep personal configs private (.gitignore recommended)
+- 🤖 **CI/CD automation** - Test with git URLs or pipeline-built local packages
 
 ### The Problem PackDev Solves
 
@@ -127,7 +130,8 @@ PackDev is a **new tool** that replaces several traditional approaches for testi
 - ✅ You have local source code you're actively developing
 - ✅ You want instant hot reloading and live changes
 - ✅ You're working on features across multiple interdependent packages
-- ✅ You want a clean, team-friendly workflow with configuration sharing
+- ✅ You want a clean, team-friendly workflow 
+- ✅ Each team member has different local directory structures (.gitignore recommended)
 
 **Use PackDev with Git Dependencies when:**
 - ✅ You need to test specific branches/commits from remote repositories
@@ -135,6 +139,17 @@ PackDev is a **new tool** that replaces several traditional approaches for testi
 - ✅ You're collaborating on features across multiple repositories
 - ✅ You need temporary dependencies that aren't published to npm yet
 - ✅ You want the same clean workflow but with remote git repositories
+
+**Use PackDev for CI/CD & Automation when:**
+- ✅ Testing dependency matrix across different package versions
+- ✅ Validating compatibility with experimental/beta branches
+- ✅ Automated integration testing without publishing packages
+- ✅ Running tests against multiple git branches in parallel
+- ✅ Package compatibility validation in build pipelines
+- ✅ Testing different build variants of the same package in one pipeline
+- ✅ Multi-step builds where packages are built and tested in sequence
+- ✅ Using pipeline-accessible local paths (builds created within CI/CD)
+- ✅ Mixed testing (external git URLs + pipeline-built local packages)
 
 **Use Direct Git Dependencies (package.json) when:**
 - ⚠️ You permanently want to use a specific git branch/commit in production
@@ -251,17 +266,18 @@ packdev init
 # Test cutting-edge features without waiting for npm publish
 ```
 
-**Scenario 4: Team collaboration setup**
+**Scenario 4: Personal development setup (Recommended)**
 ```bash
-# Share configuration with your team
-packdev add shared-components ../shared-components
-packdev add design-system https://github.com/company/design-system.git#latest
-git add .packdev.json
-git commit -m "add local development config"
+# Add .packdev.json to .gitignore (best practice)
+echo ".packdev.json" >> .gitignore
 
-# Team members just run:
-git pull
-packdev init  # Everyone gets the same setup
+# Each developer sets up their own local paths
+packdev add shared-components ../my-local-shared-components
+packdev add ui-library ~/projects/ui-library
+packdev add design-system https://github.com/company/design-system.git#develop
+packdev init
+
+# Your local setup stays private, paths don't leak to team
 ```
 
 ### 📋 Command Comparison for Common Tasks
@@ -362,14 +378,14 @@ npx packdev setup-hooks
 **Options:**
 - `--force` - Overwrite existing hooks
 - `--disable` - Remove/disable the safety hooks
-- `--auto-commit` - Enable interactive auto-commit flow when local dependencies are detected
+- `--auto-commit` - Enable automatic dependency restoration during commits when local dependencies are detected
 
 **What it does:**
 - Creates `.git/hooks/pre-commit` and `.git/hooks/check-local-deps.js`
 - Prevents commits containing `file:` dependencies
 - Allows commits with "WIP" in the message
-- **Auto-commit flow (with `--auto-commit`)**: Prompts to finish development and commit automatically
-- Saves preferences in `.packdev.json` for future use
+- **Auto-commit flow (with `--auto-commit`)**: Automatically restores dependencies and commits changes
+- Saves preferences in `.packdev.json` (recommended: keep private in .gitignore)
 
 ## 📋 Configuration
 
@@ -415,9 +431,123 @@ The `.packdev.json` file structure:
 **Important**: The `.packdev.json` configuration file is **never deleted** by any command. This allows you to:
 
 - ✅ Run `packdev init` and `packdev finish` repeatedly with the same setup
-- ✅ Share configuration with team members via version control
-- ✅ Maintain consistent local development environments
+- ✅ Maintain your personal development environment consistently
+- ✅ Keep your local dependency configurations private (recommended: use .gitignore)
 - ✅ Easily restart development after finishing
+
+### Team Collaboration & CI/CD Usage
+
+**Best Practice: Keep .packdev.json Private (Recommended):**
+```bash
+# Always add .packdev.json to .gitignore 
+echo ".packdev.json" >> .gitignore
+
+# For local file dependencies (most common case)
+packdev add ui-library ../my-local-ui-library
+packdev add shared-utils ~/projects/shared-utils
+
+# For git/URL dependencies
+packdev add design-system https://github.com/company/design-system.git#develop
+packdev add beta-package https://github.com/vendor/package.git#v2.0-beta
+```
+
+**Why Keep .packdev.json Private:**
+- 🔒 **No directory structure leakage** - Local paths vary between developers
+- 👥 **Team flexibility** - Each developer organizes projects differently
+- 🚀 **Individual workflows** - Everyone can use their preferred setup
+- 🛡️ **Clean repository** - No personal configuration pollutes the codebase
+- ✅ **Works for all scenarios** - Both local files and git URLs
+
+**When to Share .packdev.json (Rare Cases):**
+```bash
+# ONLY when using git URLs/references (no local paths)
+packdev add design-system https://github.com/company/design-system.git#develop
+packdev add experimental https://github.com/vendor/package.git#experimental
+git add .packdev.json
+git commit -m "add shared git dependency configuration"
+
+# Team members get the same git-based dependencies
+git pull
+packdev init  # Everyone uses the same git references
+```
+
+**CI/CD & Automation Usage:**
+```bash
+# Option 1: Use git URLs for external packages
+packdev add test-package https://github.com/vendor/package.git#experimental
+packdev init
+npm test  # Test against experimental branch
+
+# Option 2: Use pipeline-built local packages
+# Step 1: Build package variants in pipeline
+npm run build:variant-a  # Outputs to ./builds/variant-a
+npm run build:variant-b  # Outputs to ./builds/variant-b
+
+# Step 2: Test with each variant
+packdev add my-package ./builds/variant-a
+packdev init && npm test  # Test with variant A
+packdev finish
+
+packdev add my-package ./builds/variant-b  
+packdev init && npm test  # Test with variant B
+
+# Option 3: Test matrix with mixed dependencies
+packdev add framework https://github.com/vendor/framework.git#v2.0-beta
+packdev add ui-lib ./pipeline-builds/ui-lib-experimental
+packdev init && npm test
+```
+
+**⚠️ Important Notes:**
+- 📝 **Best practice: Don't commit .packdev.json** - Keep it in .gitignore
+- 🔗 **Personal local paths = Private** - Never commit configs with personal file paths (`~/projects/`, `../my-lib/`)
+- 🤖 **Pipeline local paths = OK** - CI/CD can use paths created within the pipeline (`./builds/`, `./dist/`)
+- 🌐 **Git URLs = Shareable** - External git references are safe to share
+- 🏠 **Each developer's setup differs** - Personal directory structures vary between team members
+
+**Real-World CI/CD Example:**
+```yaml
+# GitHub Actions / GitLab CI example
+jobs:
+  test-package-variants:
+    steps:
+      # Step 1: Build package with different configurations
+      - name: Build package variants
+        run: |
+          npm run build -- --flag=experimental ./builds/experimental
+          npm run build -- --flag=stable ./builds/stable
+          npm run build -- --flag=beta ./builds/beta
+
+      # Step 2: Test app with each variant
+      - name: Test with experimental variant
+        run: |
+          packdev add my-package ./builds/experimental
+          packdev init
+          npm test
+          packdev finish
+
+      - name: Test with stable variant  
+        run: |
+          packdev add my-package ./builds/stable
+          packdev init
+          npm test
+          packdev finish
+
+      # Step 3: Mixed testing (local + git)
+      - name: Test experimental package with beta framework
+        run: |
+          packdev add my-package ./builds/experimental
+          packdev add framework https://github.com/vendor/framework.git#v2.0-beta
+          packdev init
+          npm test
+```
+
+**Use Cases:**
+- 🧪 **Testing different package versions** in automated environments
+- 🏗️ **CI/CD dependency matrix testing** without publishing
+- 🔄 **Automated integration testing** with multiple git branches
+- 📦 **Package compatibility validation** across versions
+- 🚀 **Pipeline package testing** - Test different build variants in same pipeline
+- ⚙️ **Multi-configuration builds** - Build once, test with different dependencies
 
 ## 🔄 Workflow Example
 
@@ -660,7 +790,7 @@ npm run demo-hooks
 
 ### Auto-Commit Flow
 
-When enabled with `--auto-commit`, the pre-commit hook provides an interactive workflow:
+When enabled with `--auto-commit`, the pre-commit hook provides an automated workflow:
 
 ```bash
 # Enable auto-commit flow
@@ -670,29 +800,20 @@ packdev setup-hooks --auto-commit
 git commit -m "feat: add user authentication"
 
 # You'll see:
-# ⚠️  Local file dependencies detected!
-# 
-#   📦 my-shared-lib: file:../shared-lib (dependencies)
-# 
-# 🤖 Do you want to finish development and commit the changes? (y/n): y
-# 
-# 🔄 Running packdev finish...
-# ✅ Dependencies restored
-# 📦 Adding package files...
-# ✅ Package files staged
-# 💾 Committing with message: "feat: add user authentication"
-# ✅ Changes committed
-# 🔄 Running packdev init...
-# ✅ Development environment restored
-# 
-# 🎉 Auto-commit flow completed successfully!
+# ⚠️  Local dependencies detected, auto-restoring...
+# 🔄 Auto-commit: Restoring dependencies and including in your commit...
+# ✅ Dependencies restored to original versions
+# ✅ Updated package.json added to commit
+# ✅ Your commit will include both your changes AND restored dependencies
+# ✅ Dependencies restored and added to your commit
 ```
 
 **Benefits:**
-- 🚀 **Streamlined workflow** - Automatic finish → commit → init cycle
-- 🔒 **Safe by default** - Always asks before proceeding
+- 🚀 **Streamlined workflow** - Automatic dependency restoration during commits
+- 🔒 **Safe by default** - No manual intervention required
 - 💾 **Preserves commit message** - Uses exactly what you typed
 - ⚙️ **Team configurable** - Setting saved in `.packdev.json`
+- 🤖 **Fully automated** - No user prompting required
 
 ### WIP Patterns Recognized
 

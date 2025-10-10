@@ -297,7 +297,7 @@ program
   .option("--disable", "Disable/remove the safety hooks", false)
   .option(
     "--auto-commit",
-    "Enable interactive auto-commit flow in pre-commit hook",
+    "Enable automatic dependency restoration during commits",
     false,
   )
   .action(async (options) => {
@@ -324,7 +324,7 @@ program
           );
           if (options.autoCommit) {
             console.log(
-              "🤖 Auto-commit flow enabled: You'll be prompted to finish and commit when local deps are detected",
+              "🤖 Auto-commit flow enabled: Dependencies will be automatically restored during commits",
             );
           } else {
             console.log("💡 Use 'WIP' in commit messages to bypass the check");
