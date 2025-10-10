@@ -982,32 +982,20 @@ function getCommitMessage() {
       return process.env.TEST_COMMIT_MESSAGE;
     }
 
-    // Method 2: Try to get from COMMIT_EDITMSG (during git commit)
-    const commitMsgFile = path.join(process.cwd(), '.git', 'COMMIT_EDITMSG');
-    if (fs.existsSync(commitMsgFile)) {
-      const content = fs.readFileSync(commitMsgFile, 'utf8').trim();
-      // Filter out comments (lines starting with #)
-      const lines = content.split('\\n').filter(line => !line.startsWith('#'));
-      return lines.join('\\n').trim();
+    // Method 2: Check environment variables that might contain the commit message
+    if (process.env.PACKDEV_COMMIT_MESSAGE_OVERRIDE) {
+      return process.env.PACKDEV_COMMIT_MESSAGE_OVERRIDE;
     }
 
-    // Method 3: Try command line arguments (passed to the hook)
-    const args = process.argv.slice(2);
-    if (args.length > 0) {
-      return args.join(' ');
-    }
-
-    // Method 4: Check common git environment variables
+    // Method 3: Try to get from git environment variables
     if (process.env.GIT_COMMIT_MESSAGE) {
       return process.env.GIT_COMMIT_MESSAGE;
     }
 
-    // Method 5: Try to read from git log (last commit message as fallback)
-    try {
-      const lastCommit = execSync('git log -1 --pretty=%B', { encoding: 'utf8', stdio: 'pipe' });
-      return lastCommit.trim();
-    } catch {
-      // Git command failed, probably no commits yet
+    // Method 4: Try command line arguments (passed to the hook)
+    const args = process.argv.slice(2);
+    if (args.length > 0) {
+      return args.join(' ');
     }
 
     return '';
@@ -1017,55 +1005,59 @@ function getCommitMessage() {
 }
 
 /**
- * Interactive prompt for yes/no question
- * Handles both TTY and non-TTY environments (like Git hooks)
+ * Check if WIP by examining git process command line
  */
-function askYesNo(question) {
-  return new Promise((resolve) => {
-    // Check if we're in a TTY environment (interactive terminal)
-    if (!process.stdin.isTTY) {
-      console.log('⚠️  Non-interactive environment detected (Git hook)');
-      console.log('🤖 Auto-commit flow requires interactive input.');
-      console.log('💡 Use environment variable to control: PACKDEV_AUTO_COMMIT=yes|no');
-      console.log('');
+function isWipFromGitProcess() {
+  try {
+    // Check parent process command line for WIP
+    const parentPid = process.ppid;
+    if (parentPid) {
+      const cmdline = execSync('ps -p ' + parentPid + ' -o command --no-headers', {
+        encoding: 'utf8',
+        stdio: 'pipe'
+      }).trim();
 
-      // Check for environment variable override
-      const envOverride = process.env.PACKDEV_AUTO_COMMIT;
-      if (envOverride) {
-        const shouldProceed = envOverride.toLowerCase() === 'yes' || envOverride.toLowerCase() === 'y';
-        console.log(\`📋 Using environment variable: PACKDEV_AUTO_COMMIT=\${envOverride}\`);
-        console.log(\`🎯 Decision: \${shouldProceed ? 'Proceeding with auto-commit flow' : 'Blocking commit'}\`);
-        resolve(shouldProceed);
-        return;
+      if (cmdline && /git\s+commit.*-m\s*["'].*\bwip\b/i.test(cmdline)) {
+        return true;
       }
-
-      // Default to 'no' in non-interactive environments for safety
-      console.log('🔒 Defaulting to blocking commit for safety in non-interactive mode');
-      console.log('💡 To enable auto-commit in scripts, set: PACKDEV_AUTO_COMMIT=yes');
-      resolve(false);
-      return;
     }
+  } catch (error) {
+    // Ignore errors in process detection
+  }
+  return false;
+}
 
-    // Interactive TTY environment - use readline
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
-    });
+/**
+ * Get commit message for auto-commit flow
+ */
+function getAutoCommitMessage() {
+  // Check for environment variable first
+  const envMessage = process.env.PACKDEV_COMMIT_MESSAGE;
+  if (envMessage) {
+    console.log('📋 Using environment commit message: PACKDEV_COMMIT_MESSAGE');
+    return envMessage;
+  }
 
-    rl.question(\`\${question} (y/n): \`, (answer) => {
-      rl.close();
-      const normalized = answer.toLowerCase().trim();
-      resolve(normalized === 'y' || normalized === 'yes');
-    });
-  });
+  // Try to get the original commit message that was being attempted
+  const commitMessage = getCommitMessage();
+  if (commitMessage && commitMessage !== '--verbose') {
+    return commitMessage;
+  }
+
+  // Default message
+  return 'Auto-commit: restore dependencies and commit changes';
 }
 
 /**
  * Execute auto-commit flow
  */
-async function executeAutoCommitFlow(commitMessage) {
+async function executeAutoCommitFlow() {
   try {
-    logInfo('Starting auto-commit flow...');
+    logInfo('🤖 Starting auto-commit flow...');
+
+    // Get commit message
+    const commitMessage = getAutoCommitMessage();
+    logInfo('📝 Using commit message: "' + commitMessage + '"');
 
     // Find packdev binary - try common locations
     let packdevCmd = 'packdev';
@@ -1080,7 +1072,7 @@ async function executeAutoCommitFlow(commitMessage) {
     let success = false;
     for (const cmd of possiblePaths) {
       try {
-        execSync(\`\${cmd} finish\`, { stdio: 'pipe', timeout: 10000 });
+        execSync(cmd + ' finish', { stdio: 'pipe', timeout: 10000 });
         packdevCmd = cmd;
         success = true;
         break;
@@ -1101,16 +1093,16 @@ async function executeAutoCommitFlow(commitMessage) {
     execSync('git add package.*', { stdio: 'pipe' });
     logSuccess('✅ Package files staged');
 
-    // Step 3: Commit with original message (escape quotes)
-    const escapedMessage = commitMessage.replace(/"/g, '\\\\"');
-    logInfo(\`💾 Committing with message: "\${commitMessage}"\`);
-    execSync(\`git commit -m "\${escapedMessage}"\`, { stdio: 'pipe' });
+    // Step 3: Commit with message (escape quotes) - bypass hooks to prevent recursion
+    const escapedMessage = commitMessage.replace(/"/g, '\\"');
+    logInfo('💾 Committing changes...');
+    execSync('git commit --no-verify -m "' + escapedMessage + '"', { stdio: 'pipe' });
     logSuccess('✅ Changes committed');
 
     // Step 4: Run packdev init
     logInfo('🔄 Running packdev init...');
     try {
-      execSync(\`\${packdevCmd} init\`, { stdio: 'pipe', timeout: 10000 });
+      execSync(packdevCmd + ' init', { stdio: 'pipe', timeout: 10000 });
       logSuccess('✅ Development environment restored');
     } catch (error) {
       logError('❌ Warning: Could not restore development environment');
@@ -1124,12 +1116,12 @@ async function executeAutoCommitFlow(commitMessage) {
     return true;
   } catch (error) {
     console.log('');
-    logError(\`Auto-commit flow failed: \${error.message}\`);
+    logError('Auto-commit flow failed: ' + error.message);
     console.log('');
     logInfo('You can manually:');
     console.log('1. Run: packdev finish');
     console.log('2. Run: git add package.*');
-    console.log(\`3. Run: git commit -m "\${commitMessage}"\`);
+    console.log('3. Run: git commit -m "your message"');
     console.log('4. Run: packdev init');
     console.log('');
     return false;
@@ -1162,11 +1154,11 @@ async function main() {
   }
 
   const commitMessage = getCommitMessage();
-  const isWip = isWipCommit(commitMessage);
+  const isWip = isWipCommit(commitMessage) || isWipFromGitProcess();
 
   if (isVerbose) {
-    logInfo(\`Commit message: "\${commitMessage}"\`);
-    logInfo(\`WIP detected: \${isWip}\`);
+    logInfo('Commit message: "' + commitMessage + '"');
+    logInfo('WIP detected: ' + isWip);
   }
 
   if (isWip) {
@@ -1179,26 +1171,30 @@ async function main() {
   const config = loadPackdevConfig();
   const autoCommitFlowEnabled = config && config.autoCommitFlow === true;
 
-  if (autoCommitFlowEnabled && commitMessage) {
+  if (autoCommitFlowEnabled) {
     console.log('');
     logWarning('Local file dependencies detected!');
     console.log('');
     dependencies.forEach(dep => {
-      console.log(\`  📦 \${dep.name}: \${dep.version} (\${dep.section})\`);
+      console.log('  📦 ' + dep.name + ': ' + dep.version + ' (' + dep.section + ')');
     });
     console.log('');
 
-    try {
-      const shouldProceed = await askYesNo('🤖 Do you want to finish development and commit the changes?');
-
-      if (shouldProceed) {
-        const success = await executeAutoCommitFlow(commitMessage);
+    // Check for environment variable override
+    const envOverride = process.env.PACKDEV_AUTO_COMMIT;
+    if (envOverride && envOverride.toLowerCase() === 'no') {
+      console.log('📋 Using environment variable: PACKDEV_AUTO_COMMIT=' + envOverride);
+      console.log('🎯 Decision: Blocking commit');
+      logInfo('Auto-commit flow disabled by environment variable.');
+    } else {
+      // Auto-commit flow is enabled, execute directly
+      logInfo('🤖 Auto-commit flow enabled - executing automatically...');
+      try {
+        const success = await executeAutoCommitFlow();
         process.exit(success ? 0 : 1);
-      } else {
-        logInfo('Auto-commit flow cancelled.');
+      } catch (error) {
+        logError('Auto-commit flow failed: ' + error.message);
       }
-    } catch (error) {
-      logError(\`Interactive prompt failed: \${error.message}\`);
     }
   }
 
@@ -1217,7 +1213,7 @@ async function main() {
   console.log('2. 🏷️  Add "WIP" to your commit message for work-in-progress commits');
   console.log('3. 🔧 Disable safety checks: packdev setup-hooks --disable');
   if (!autoCommitFlowEnabled) {
-    console.log('4. 🤖 Enable auto-commit flow: packdev setup-hooks --auto-commit');
+    console.log('4. 🤖 Enable auto-commit flow: packdev setup-hooks --auto-commit --force');
   }
   console.log('');
   console.log('Example WIP commit:');
@@ -1246,8 +1242,20 @@ if (require.main === module) {
 
 # Check if the safety check script exists
 if [ -f ".git/hooks/check-local-deps.js" ]; then
-    # Pass any arguments to the check script
-    node .git/hooks/check-local-deps.js "$@"
+    # Ensure we have a controlling terminal for interactive prompts
+    # This is crucial for git hooks to work with user input
+    if [ -t 0 ]; then
+        # We already have a terminal
+        node .git/hooks/check-local-deps.js "$@"
+    else
+        # Try to connect to controlling terminal
+        if [ -e /dev/tty ]; then
+            node .git/hooks/check-local-deps.js "$@" < /dev/tty
+        else
+            # Fallback for systems without /dev/tty
+            node .git/hooks/check-local-deps.js "$@"
+        fi
+    fi
     exit_code=$?
 
     if [ $exit_code -ne 0 ]; then
