@@ -15,8 +15,11 @@ const path = require('path');
 const fs = require('fs');
 
 // Configuration
-const UNIT_TESTS_PATH = './unit/packageManager.test.js';
-const INTEGRATION_TESTS_PATH = './test-demo.js';
+const UNIT_TESTS_PATH = path.join(__dirname, 'unit/packageManager.test.js');
+const INTEGRATION_TESTS_PATH = path.join(__dirname, 'test-demo.js');
+const GIT_AUTOCOMMIT_TESTS_PATH = path.join(__dirname, 'git/autocommit.test.js');
+const GIT_WORKFLOWS_TESTS_PATH = path.join(__dirname, 'git/workflows.test.js');
+const GIT_EDGE_CASES_TESTS_PATH = path.join(__dirname, 'git/edge-cases.test.js');
 const BINARY_PATH = '../dist/index.js';
 
 // Colors for console output
@@ -76,6 +79,10 @@ function parseArguments() {
   return {
     unitOnly: args.includes('--unit-only'),
     integrationOnly: args.includes('--integration-only'),
+    gitOnly: args.includes('--git-only'),
+    gitAutocommitOnly: args.includes('--git-autocommit-only'),
+    gitWorkflowsOnly: args.includes('--git-workflows-only'),
+    gitEdgeCasesOnly: args.includes('--git-edge-cases-only'),
     help: args.includes('--help') || args.includes('-h')
   };
 }
@@ -87,14 +94,20 @@ function showHelp() {
   log('  node run-all-tests.js [options]', 'cyan');
   console.log('');
   log('Options:', 'yellow');
-  log('  --unit-only        Run only unit tests', 'cyan');
-  log('  --integration-only Run only integration tests', 'cyan');
-  log('  --help, -h         Show this help message', 'cyan');
+  log('  --unit-only             Run only unit tests', 'cyan');
+  log('  --integration-only      Run only integration tests', 'cyan');
+  log('  --git-only              Run all git tests', 'cyan');
+  log('  --git-autocommit-only   Run only git autocommit tests', 'cyan');
+  log('  --git-workflows-only    Run only git workflow tests', 'cyan');
+  log('  --git-edge-cases-only   Run only git edge case tests', 'cyan');
+  log('  --help, -h              Show this help message', 'cyan');
   console.log('');
   log('Examples:', 'yellow');
   log('  node run-all-tests.js', 'cyan');
   log('  node run-all-tests.js --unit-only', 'cyan');
   log('  node run-all-tests.js --integration-only', 'cyan');
+  log('  node run-all-tests.js --git-only', 'cyan');
+  log('  node run-all-tests.js --git-autocommit-only', 'cyan');
 }
 
 function checkPrerequisites() {
@@ -103,7 +116,7 @@ function checkPrerequisites() {
   // Check if binary exists
   if (!fs.existsSync(BINARY_PATH)) {
     log('❌ Binary not found. Building project...', 'yellow');
-    const buildResult = execCommand('npm run build', 'Building project', { cwd: '..' });
+    const buildResult = execCommand('npm run build', 'Building project');
     if (!buildResult.success) {
       throw new Error('Failed to build project. Please run "npm run build" manually.');
     }
@@ -123,6 +136,25 @@ function checkPrerequisites() {
     log('✅ Integration tests found', 'green');
   } else {
     log('⚠️  Integration tests not found', 'yellow');
+  }
+
+  // Check if git test files exist
+  if (fs.existsSync(GIT_AUTOCOMMIT_TESTS_PATH)) {
+    log('✅ Git autocommit tests found', 'green');
+  } else {
+    log('⚠️  Git autocommit tests not found', 'yellow');
+  }
+
+  if (fs.existsSync(GIT_WORKFLOWS_TESTS_PATH)) {
+    log('✅ Git workflow tests found', 'green');
+  } else {
+    log('⚠️  Git workflow tests not found', 'yellow');
+  }
+
+  if (fs.existsSync(GIT_EDGE_CASES_TESTS_PATH)) {
+    log('✅ Git edge case tests found', 'green');
+  } else {
+    log('⚠️  Git edge case tests not found', 'yellow');
   }
 
   log('✅ Prerequisites check completed', 'green');
@@ -145,6 +177,72 @@ async function runUnitTests() {
     log('🎉 Unit tests completed successfully!', 'green');
   } else {
     log('💥 Unit tests failed!', 'red');
+  }
+
+  return result;
+}
+
+async function runGitAutocommitTests() {
+  logSection('🔀 Running Git Autocommit Tests');
+
+  if (!fs.existsSync(GIT_AUTOCOMMIT_TESTS_PATH)) {
+    log('⚠️  Git autocommit tests not found, skipping...', 'yellow');
+    return { success: true, skipped: true };
+  }
+
+  const result = execCommand(
+    `node ${GIT_AUTOCOMMIT_TESTS_PATH}`,
+    'Executing git autocommit tests'
+  );
+
+  if (result.success) {
+    log('🎉 Git autocommit tests completed successfully!', 'green');
+  } else {
+    log('💥 Git autocommit tests failed!', 'red');
+  }
+
+  return result;
+}
+
+async function runGitWorkflowTests() {
+  logSection('🌳 Running Git Workflow Tests');
+
+  if (!fs.existsSync(GIT_WORKFLOWS_TESTS_PATH)) {
+    log('⚠️  Git workflow tests not found, skipping...', 'yellow');
+    return { success: true, skipped: true };
+  }
+
+  const result = execCommand(
+    `node ${GIT_WORKFLOWS_TESTS_PATH}`,
+    'Executing git workflow tests'
+  );
+
+  if (result.success) {
+    log('🎉 Git workflow tests completed successfully!', 'green');
+  } else {
+    log('💥 Git workflow tests failed!', 'red');
+  }
+
+  return result;
+}
+
+async function runGitEdgeCaseTests() {
+  logSection('⚠️ Running Git Edge Case Tests');
+
+  if (!fs.existsSync(GIT_EDGE_CASES_TESTS_PATH)) {
+    log('⚠️  Git edge case tests not found, skipping...', 'yellow');
+    return { success: true, skipped: true };
+  }
+
+  const result = execCommand(
+    `node ${GIT_EDGE_CASES_TESTS_PATH}`,
+    'Executing git edge case tests'
+  );
+
+  if (result.success) {
+    log('🎉 Git edge case tests completed successfully!', 'green');
+  } else {
+    log('💥 Git edge case tests failed!', 'red');
   }
 
   return result;
@@ -236,13 +334,33 @@ async function main() {
     const results = {};
 
     // Run unit tests
-    if (!options.integrationOnly) {
+    if (!options.integrationOnly && !options.gitOnly && !options.gitAutocommitOnly &&
+        !options.gitWorkflowsOnly && !options.gitEdgeCasesOnly) {
       results['Unit Tests'] = await runUnitTests();
     }
 
     // Run integration tests
-    if (!options.unitOnly) {
+    if (!options.unitOnly && !options.gitOnly && !options.gitAutocommitOnly &&
+        !options.gitWorkflowsOnly && !options.gitEdgeCasesOnly) {
       results['Integration Tests'] = await runIntegrationTests();
+    }
+
+    // Run git tests
+    if (!options.unitOnly && !options.integrationOnly) {
+      if (options.gitOnly || options.gitAutocommitOnly ||
+          (!options.gitWorkflowsOnly && !options.gitEdgeCasesOnly)) {
+        results['Git Autocommit Tests'] = await runGitAutocommitTests();
+      }
+
+      if (options.gitOnly || options.gitWorkflowsOnly ||
+          (!options.gitAutocommitOnly && !options.gitEdgeCasesOnly)) {
+        results['Git Workflow Tests'] = await runGitWorkflowTests();
+      }
+
+      if (options.gitOnly || options.gitEdgeCasesOnly ||
+          (!options.gitAutocommitOnly && !options.gitWorkflowsOnly)) {
+        results['Git Edge Case Tests'] = await runGitEdgeCaseTests();
+      }
     }
 
     // Generate report

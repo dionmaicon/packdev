@@ -1034,7 +1034,6 @@ function getAutoCommitMessage() {
   // Check for environment variable first
   const envMessage = process.env.PACKDEV_COMMIT_MESSAGE;
   if (envMessage) {
-    console.log('📋 Using environment commit message: PACKDEV_COMMIT_MESSAGE');
     return envMessage;
   }
 
@@ -1049,15 +1048,11 @@ function getAutoCommitMessage() {
 }
 
 /**
- * Execute auto-commit flow
+ * Execute auto-commit flow with dependency restoration
  */
 async function executeAutoCommitFlow() {
   try {
-    logInfo('🤖 Starting auto-commit flow...');
-
-    // Get commit message
-    const commitMessage = getAutoCommitMessage();
-    logInfo('📝 Using commit message: "' + commitMessage + '"');
+    logInfo('🔄 Auto-commit: Restoring dependencies and including in your commit...');
 
     // Find packdev binary - try common locations
     let packdevCmd = 'packdev';
@@ -1067,66 +1062,88 @@ async function executeAutoCommitFlow() {
       'packdev'                 // PATH
     ];
 
-    // Step 1: Run packdev finish
-    logInfo('🔄 Running packdev finish...');
+    // Find working packdev command
     let success = false;
     for (const cmd of possiblePaths) {
       try {
-        execSync(cmd + ' finish', { stdio: 'pipe', timeout: 10000 });
+        execSync(cmd + ' --version', { stdio: 'pipe', timeout: 5000 });
         packdevCmd = cmd;
         success = true;
         break;
       } catch (error) {
-        // Try next command
         continue;
       }
     }
 
     if (!success) {
-      logError('❌ Could not run packdev finish - packdev binary not found');
+      logError('❌ Auto-commit failed: packdev binary not found');
       return false;
     }
-    logSuccess('✅ Dependencies restored');
 
-    // Step 2: Add package files
-    logInfo('📦 Adding package files...');
-    execSync('git add package.*', { stdio: 'pipe' });
-    logSuccess('✅ Package files staged');
-
-    // Step 3: Commit with message (escape quotes) - bypass hooks to prevent recursion
-    const escapedMessage = commitMessage.replace(/"/g, '\\"');
-    logInfo('💾 Committing changes...');
-    execSync('git commit --no-verify -m "' + escapedMessage + '"', { stdio: 'pipe' });
-    logSuccess('✅ Changes committed');
-
-    // Step 4: Run packdev init
-    logInfo('🔄 Running packdev init...');
+    // Step 1: Check if package.json currently has local dependencies
+    let hadLocalDeps = false;
     try {
-      execSync(packdevCmd + ' init', { stdio: 'pipe', timeout: 10000 });
-      logSuccess('✅ Development environment restored');
+      const packageJson = JSON.parse(require('fs').readFileSync('package.json', 'utf8'));
+      for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        if (packageJson[section]) {
+          for (const [name, version] of Object.entries(packageJson[section])) {
+            if (typeof version === 'string' && (version.startsWith('file:') || version.startsWith('./'))) {
+              hadLocalDeps = true;
+              break;
+            }
+          }
+        }
+        if (hadLocalDeps) break;
+      }
     } catch (error) {
-      logError('❌ Warning: Could not restore development environment');
-      logInfo('💡 You may need to run "packdev init" manually later');
+      logError('❌ Failed to check package.json: ' + error.message);
+      return false;
     }
 
-    console.log('');
-    logSuccess('🎉 Auto-commit flow completed successfully!');
-    console.log('');
+    if (!hadLocalDeps) {
+      logInfo('ℹ️  No local dependencies found, nothing to restore');
+      return true;
+    }
 
+    // Step 2: Run packdev finish to restore original dependencies
+    try {
+      execSync(packdevCmd + ' finish', { stdio: 'pipe', timeout: 10000 });
+      logInfo('✅ Dependencies restored to original versions');
+    } catch (error) {
+      logError('❌ Failed to restore dependencies: ' + error.message);
+      return false;
+    }
+
+    // Step 3: Add the updated package.json to the commit (if there are changes)
+    try {
+      execSync('git add package.json', { stdio: 'pipe' });
+      logInfo('✅ Updated package.json added to commit');
+    } catch (error) {
+      logError('❌ Failed to stage package.json: ' + error.message);
+      return false;
+    }
+
+    // Step 4: Check if package-lock.json exists and add it too
+    try {
+      const fs = require('fs');
+      if (fs.existsSync('package-lock.json')) {
+        execSync('git add package-lock.json', { stdio: 'pipe' });
+        logInfo('✅ Updated package-lock.json added to commit');
+      }
+    } catch (error) {
+      // Not critical, continue
+    }
+
+    logSuccess('✅ Your commit will include both your changes AND restored dependencies');
     return true;
   } catch (error) {
-    console.log('');
-    logError('Auto-commit flow failed: ' + error.message);
-    console.log('');
-    logInfo('You can manually:');
-    console.log('1. Run: packdev finish');
-    console.log('2. Run: git add package.*');
-    console.log('3. Run: git commit -m "your message"');
-    console.log('4. Run: packdev init');
-    console.log('');
+    logError('❌ Auto-commit preparation failed: ' + error.message);
     return false;
   }
 }
+
+
+
 
 async function main() {
   // Check for debug/verbose mode
@@ -1149,7 +1166,7 @@ async function main() {
   if (isVerbose) {
     logWarning('Local file dependencies detected:');
     dependencies.forEach(dep => {
-      console.log(\`  📦 \${dep.name}: \${dep.version} (\${dep.section})\`);
+      console.log('  📦 ' + dep.name + ': ' + dep.version + ' (' + dep.section + ')');
     });
   }
 
@@ -1172,54 +1189,32 @@ async function main() {
   const autoCommitFlowEnabled = config && config.autoCommitFlow === true;
 
   if (autoCommitFlowEnabled) {
-    console.log('');
-    logWarning('Local file dependencies detected!');
-    console.log('');
-    dependencies.forEach(dep => {
-      console.log('  📦 ' + dep.name + ': ' + dep.version + ' (' + dep.section + ')');
-    });
-    console.log('');
+    logWarning('Local dependencies detected, auto-restoring...');
 
     // Check for environment variable override
     const envOverride = process.env.PACKDEV_AUTO_COMMIT;
     if (envOverride && envOverride.toLowerCase() === 'no') {
-      console.log('📋 Using environment variable: PACKDEV_AUTO_COMMIT=' + envOverride);
-      console.log('🎯 Decision: Blocking commit');
-      logInfo('Auto-commit flow disabled by environment variable.');
+      logInfo('Auto-commit disabled by environment variable');
     } else {
-      // Auto-commit flow is enabled, execute directly
-      logInfo('🤖 Auto-commit flow enabled - executing automatically...');
+      // Auto-commit flow is enabled, restore dependencies and include in commit
       try {
         const success = await executeAutoCommitFlow();
-        process.exit(success ? 0 : 1);
+        if (success) {
+          logSuccess('✅ Dependencies restored and added to your commit');
+          process.exit(0); // Allow the commit to proceed
+        } else {
+          process.exit(1); // Block the commit
+        }
       } catch (error) {
         logError('Auto-commit flow failed: ' + error.message);
+        process.exit(1);
       }
     }
   }
 
-  // Block the commit - show traditional options
-  console.log('');
-  logError('Commit blocked: Local file dependencies detected!');
-  console.log('');
-  dependencies.forEach(dep => {
-    console.log(\`  📦 \${dep.name}: \${dep.version} (\${dep.section})\`);
-  });
-  console.log('');
-  console.log('🛡️  This safety check prevents accidental commits with local dependencies.');
-  console.log('');
-  console.log('Options to proceed:');
-  console.log('1. 📦 Restore original dependencies: packdev finish');
-  console.log('2. 🏷️  Add "WIP" to your commit message for work-in-progress commits');
-  console.log('3. 🔧 Disable safety checks: packdev setup-hooks --disable');
-  if (!autoCommitFlowEnabled) {
-    console.log('4. 🤖 Enable auto-commit flow: packdev setup-hooks --auto-commit --force');
-  }
-  console.log('');
-  console.log('Example WIP commit:');
-  console.log('  git commit -m "WIP: testing local changes"');
-  console.log('');
-  console.log('💡 Tip: Use --verbose flag to see detailed information');
+  // Block the commit - show minimal message
+  logError('Commit blocked: Local dependencies detected');
+  console.log('Run "packdev finish" or use "WIP:" in commit message to bypass');
   console.log('');
 
   process.exit(1);
@@ -1281,9 +1276,16 @@ fi
     // Setup instructions
     const setupMessage = `
 Created Git safety hooks in .git/hooks/
-The hooks are automatically active and will prevent commits with development dependencies unless:
+${
+  autoCommitFlow
+    ? `Auto-commit flow enabled: Your commits will include both your changes AND restored dependencies.
+- Dependencies are automatically restored before committing
+- Your commit message and changes are preserved
+- Clean dependencies are included in the same commit`
+    : `The hooks are automatically active and will prevent commits with development dependencies unless:
 1. You run 'packdev finish' to restore original dependencies, or
-2. You include 'WIP' in your commit message
+2. You include 'WIP' in your commit message`
+}
 
 The hooks are now ready to use!`;
 
