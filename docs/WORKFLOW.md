@@ -374,6 +374,114 @@ git pull
 packdev init  # Everyone gets the same local dependencies
 ```
 
+## 📊 Detailed Comparison with Alternatives
+
+PackDev is one of several tools for local package development. Here's a detailed comparison to help you choose the right tool.
+
+### PackDev vs npm link
+
+| Aspect | PackDev | npm link |
+|--------|---------|----------|
+| **How it works** | Modifies package.json temporarily | Creates global symlinks |
+| **Setup complexity** | Simple (add + init) | Simple (link in both dirs) |
+| **Global state** | None | Global link directory |
+| **Multi-project** | Isolated per project | Conflicts between projects |
+| **Cleanup** | `packdev finish` | Manual unlink required |
+| **Safety** | Built-in hooks prevent commits | Easy to forget and commit |
+| **Git URLs** | ✅ Supported | ❌ Not supported |
+
+**Use npm link when**: You need quick one-off testing with symlinks
+
+**Use PackDev when**: You want project isolation and built-in safety
+
+### PackDev vs Verdaccio
+
+| Aspect | PackDev | Verdaccio |
+|--------|---------|-----------|
+| **How it works** | package.json swap | Private npm registry server |
+| **Setup** | Zero config | Install + run server |
+| **Infrastructure** | None needed | Requires running server |
+| **Use case** | Local development | Team private registry |
+| **Authentication** | Not needed | Full user/auth system |
+| **Publishing** | No publishing needed | Must publish packages |
+| **CI/CD** | Git URLs + file paths | Full registry features |
+
+**Use Verdaccio when**: You need a full private npm registry with authentication for your team
+
+**Use PackDev when**: You just want to test local changes without running infrastructure
+
+### PackDev vs Yalc
+
+| Aspect | PackDev | Yalc |
+|--------|---------|------|
+| **How it works** | package.json swap | Publish to local store + copy |
+| **Workflow** | init/finish | publish/push/update |
+| **Storage** | No storage needed | Global store (~/.yalc) |
+| **File handling** | Direct file: links | Copies files to .yalc/ |
+| **Git URLs** | ✅ Supported | ❌ Not supported |
+| **Safety hooks** | ✅ Built-in | ⚠️ Manual `yalc check` |
+| **State** | Project-isolated | Global store state |
+
+**Use Yalc when**: You prefer publish/push workflow and package copying
+
+**Use PackDev when**: You want simpler init/finish cycle and git URL support
+
+### Key Differentiators
+
+**PackDev's Unique Features:**
+
+1. **Git URL Support**: Test unreleased branches/commits from git repositories
+   ```bash
+   packdev add ui https://github.com/org/ui.git#experimental
+   ```
+
+2. **Built-in Safety Hooks**: Automatic git hooks prevent accidental commits
+   ```bash
+   packdev setup-hooks --auto-commit
+   ```
+
+3. **Mixed Dependencies**: Combine local paths and git URLs
+   ```bash
+   packdev add local-lib ../lib
+   packdev add remote-ui https://github.com/org/ui.git#dev
+   ```
+
+4. **No Global State**: Each project is completely isolated
+   - No global link directory (unlike npm link)
+   - No global store (unlike Yalc)
+   - No running server (unlike Verdaccio)
+
+5. **Simple Approach**: Direct package.json manipulation
+   - Easy to understand what's happening
+   - No intermediate storage or copying
+   - Transparent to package managers
+
+### When to Use What
+
+**Choose PackDev if:**
+- ✅ You want simple init/finish workflow
+- ✅ You need to test git repository branches
+- ✅ You want automatic safety against accidental commits
+- ✅ You prefer project-isolated configuration
+- ✅ You need CI/CD testing with git URLs
+
+**Choose npm link if:**
+- ✅ You need quick one-off symlink testing
+- ✅ You're comfortable with global state
+- ✅ You don't need safety features
+
+**Choose Verdaccio if:**
+- ✅ You need a full private npm registry
+- ✅ You want team authentication/authorization
+- ✅ You need to cache/proxy npmjs.org
+- ✅ You're okay running server infrastructure
+
+**Choose Yalc if:**
+- ✅ You prefer publish/push workflow
+- ✅ You want package copying instead of file: links
+- ✅ You don't need git URL support
+- ✅ You're okay with global store state
+
 ## 💡 Best Practices
 
 ### 1. Commit Configuration
