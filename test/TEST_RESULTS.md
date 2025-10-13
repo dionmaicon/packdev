@@ -2,7 +2,7 @@
 
 ## 📋 Test Overview
 
-This document summarizes the comprehensive test of packdev's local package development management functionality using a custom fake lodash implementation.
+This document summarizes the comprehensive test of packdev's package development management functionality using a custom fake lodash implementation.
 
 ## 🧪 Test Components
 

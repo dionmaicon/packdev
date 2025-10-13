@@ -1,6 +1,6 @@
 # PackDev Workflow Guide
 
-This guide explains the complete workflow for using `packdev` to manage local package dependencies during development.
+This guide explains the complete workflow for using `packdev` to manage package dependencies during development using local paths or git repositories.
 
 ## 🔄 Core Workflow Cycle
 
@@ -376,7 +376,7 @@ packdev init  # Everyone gets the same local dependencies
 
 ## 📊 Detailed Comparison with Alternatives
 
-PackDev is one of several tools for local package development. Here's a detailed comparison to help you choose the right tool.
+PackDev is one of several tools for package development. Here's a detailed comparison to help you choose the right tool.
 
 ### PackDev vs npm link
 

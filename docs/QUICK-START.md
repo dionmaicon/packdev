@@ -216,4 +216,4 @@ npm run demo-workflow --interactive
 
 ---
 
-**🎉 That's it!** You're ready to use PackDev for local package development. For more advanced workflows and team features, explore the complete documentation above.
+**🎉 That's it!** You're ready to use PackDev for package development with local paths and git repositories. For more advanced workflows and team features, explore the complete documentation above.

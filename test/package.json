@@ -1,7 +1,7 @@
 {
   "name": "packdev-test-suite",
   "version": "1.0.0",
-  "description": "Test suite for packdev local package development management tool",
+  "description": "Test suite for packdev package development management tool",
   "main": "test-demo.js",
   "private": true,
   "scripts": {

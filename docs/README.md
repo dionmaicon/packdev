@@ -1,6 +1,6 @@
 # PackDev Documentation
 
-Welcome to the comprehensive documentation for `packdev` - the TypeScript-based CLI tool for managing local package development dependencies.
+Welcome to the comprehensive documentation for `packdev` - the TypeScript-based CLI tool for managing package dependencies during development using local paths or git repositories.
 
 ## 📚 Documentation Index
 

@@ -72,9 +72,9 @@ npx docsify serve . --port 3000
 
 ### Social Card Template
 ```
-PackDev - Local Package Development Manager
+PackDev - Package Development Manager
 [Your Logo]
-Test npm packages locally without publishing
+Test npm packages using local paths or git repos before publishing
 Stop struggling with npm link forever!
 ```
 

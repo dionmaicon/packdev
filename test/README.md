@@ -1,6 +1,6 @@
 # packdev Test Suite
 
-This directory contains comprehensive tests and demonstrations for the packdev local package development management tool.
+This directory contains comprehensive tests and demonstrations for the packdev package development management tool.
 
 ## 📁 Directory Structure
 

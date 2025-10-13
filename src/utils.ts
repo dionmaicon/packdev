@@ -1,5 +1,5 @@
 /**
- * Utility functions for local package development management
+ * Utility functions for package development management
  */
 
 import * as path from "path";

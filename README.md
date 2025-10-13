@@ -1,15 +1,15 @@
-# PackDev - Local Package Development Manager
+# PackDev - Package Development Manager
 
-A TypeScript-based CLI tool for managing local package dependencies during development. Test your packages locally before publishing, without the complexity of `npm link`.
+A TypeScript-based CLI tool for managing package dependencies during development. Test your packages before publishing using local paths or git repositories, without the complexity of `npm link`.
 
 ## 🎯 Why PackDev?
 
 **The Problem**: You're developing a library and need to test it in your app before publishing. Traditional solutions are painful:
 - `npm link` creates global state and conflicts between projects
 - Publishing beta versions clutters your registry
-- Manual `file:` paths in package.json are easy to accidentally commit
+- Manual `file:` paths or git URLs in package.json are easy to accidentally commit
 
-**The Solution**: PackDev manages local development seamlessly:
+**The Solution**: PackDev manages development dependencies seamlessly:
 ```bash
 packdev add my-library ../my-library    # Configure once
 packdev init                             # Switch to local
@@ -30,7 +30,7 @@ npm install -g packdev
    packdev create-config
    ```
 
-2. **Add local dependencies**:
+2. **Add development dependencies** (local paths or git URLs):
    ```bash
    packdev add my-library ../path/to/my-library
    packdev add ui-components https://github.com/org/ui-components.git#dev-branch
