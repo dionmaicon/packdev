@@ -1,194 +1,37 @@
-name: Deploy PackDev Documentation
+name: Publish to NPM
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - 'docs/**'
-      - 'docsify-site/**'
-      - 'README.md'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "18"
           cache: "npm"
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Create build directory
-        run: mkdir -p _site
+      - name: Build
+        run: npm run build
 
-      - name: Copy Docsify files
-        run: |
-          cp -r docsify-site/* _site/
+      - name: Run tests
+        run: npm test
 
-      - name: Copy documentation files
-        run: |
-          cp -r docs _site/
-          cp README.md _site/
-          cp LICENSE.md _site/ 2>/dev/null || echo "No LICENSE.md found"
-
-      - name: Update GitHub repository URLs in HTML
-        run: |
-          sed -i 's/yourusername\/packdev/${{ github.repository }}/g' _site/index.html
-          sed -i 's/yourusername\/packdev/${{ github.repository }}/g' _site/_sidebar.md
-          sed -i 's/yourusername\/packdev/${{ github.repository }}/g' _site/_navbar.md
-
-      - name: Update site URLs for production
-        run: |
-          REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
-          BASE_URL="https://${{ github.repository_owner }}.github.io/${REPO_NAME}"
-
-          # Update meta tags in index.html
-          sed -i "s|https://yourusername.github.io/packdev/|${BASE_URL}/|g" _site/index.html
-
-          # Update npm package URL (assuming package name matches repo name)
-          sed -i "s/https:\/\/www.npmjs.com\/package\/packdev/https:\/\/www.npmjs.com\/package\/${REPO_NAME}/g" _site/index.html
-          sed -i "s/https:\/\/www.npmjs.com\/package\/packdev/https:\/\/www.npmjs.com\/package\/${REPO_NAME}/g" _site/README.md
-          sed -i "s/https:\/\/www.npmjs.com\/package\/packdev/https:\/\/www.npmjs.com\/package\/${REPO_NAME}/g" _site/_sidebar.md
-          sed -i "s/https:\/\/www.npmjs.com\/package\/packdev/https:\/\/www.npmjs.com\/package\/${REPO_NAME}/g" _site/_navbar.md
-
-      - name: Generate sitemap.xml
-        run: |
-          cat > _site/sitemap.xml << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/</loc>
-              <changefreq>weekly</changefreq>
-              <priority>1.0</priority>
-            </url>
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/#/docs/QUICK-START</loc>
-              <changefreq>weekly</changefreq>
-              <priority>0.9</priority>
-            </url>
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/#/docs/WORKFLOW</loc>
-              <changefreq>monthly</changefreq>
-              <priority>0.8</priority>
-            </url>
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/#/docs/PACKAGING</loc>
-              <changefreq>monthly</changefreq>
-              <priority>0.8</priority>
-            </url>
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/#/docs/YARN-SUPPORT</loc>
-              <changefreq>monthly</changefreq>
-              <priority>0.7</priority>
-            </url>
-            <url>
-              <loc>https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/#/docs/GITHUB-HOOKS</loc>
-              <changefreq>monthly</changefreq>
-              <priority>0.7</priority>
-            </url>
-          </urlset>
-          EOF
-
-      - name: Generate robots.txt
-        run: |
-          cat > _site/robots.txt << 'EOF'
-          User-agent: *
-          Allow: /
-
-          Sitemap: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/sitemap.xml
-          EOF
-
-      - name: Create service worker for offline support
-        run: |
-          cat > _site/sw.js << 'EOF'
-          const CACHE_NAME = 'packdev-docs-v1';
-          const urlsToCache = [
-            '/',
-            '/index.html',
-            '/docs/README.md',
-            '/docs/QUICK-START.md',
-            '/docs/WORKFLOW.md',
-            '/docs/PACKAGING.md',
-            '/docs/YARN-SUPPORT.md',
-            '/docs/GITHUB-HOOKS.md',
-            'https://cdn.jsdelivr.net/npm/docsify@4/lib/themes/dark.css',
-            'https://cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js',
-            'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap'
-          ];
-
-          self.addEventListener('install', event => {
-            event.waitUntil(
-              caches.open(CACHE_NAME)
-                .then(cache => cache.addAll(urlsToCache))
-            );
-          });
-
-          self.addEventListener('fetch', event => {
-            event.respondWith(
-              caches.match(event.request)
-                .then(response => {
-                  return response || fetch(event.request);
-                })
-            );
-          });
-          EOF
-
-      - name: Add CNAME file (if custom domain)
-        run: |
-          # Uncomment and modify if you have a custom domain
-          # echo "docs.yourdomain.com" > _site/CNAME
-
-      - name: Optimize HTML for performance
-        run: |
-          # Add preload hints for critical resources
-          sed -i '/<\/head>/i \
-            <link rel="preload" href="//cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js" as="script">\
-            <link rel="preload" href="//cdn.jsdelivr.net/npm/docsify@4/lib/themes/dark.css" as="style">\
-            <link rel="dns-prefetch" href="//cdn.jsdelivr.net">\
-            <link rel="dns-prefetch" href="//fonts.googleapis.com">\
-            <link rel="dns-prefetch" href="//www.npmjs.com">' _site/index.html
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-  notify:
-    runs-on: ubuntu-latest
-    needs: [build, deploy]
-    if: success()
-    steps:
-      - name: Notification
-        run: |
-          echo "✅ PackDev Documentation deployed successfully!"
-          echo "🌐 Site URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
-          echo "📦 npm package: https://www.npmjs.com/package/${{ github.event.repository.name }}"
+      - name: Publish to NPM
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
