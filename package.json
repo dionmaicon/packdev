@@ -1,6 +1,6 @@
 {
   "name": "packdev",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "PackDev - A TypeScript-based CLI tool for managing package dependencies during development using local paths or git repositories",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
