@@ -88,7 +88,7 @@ Stop struggling with npm link forever!
 
 When deployed, assets will be available at:
 ```
-https://yourusername.github.io/your-repo/assets/filename.ext
+https://dionmaicon.github.io/packdev/assets/filename.ext
 ```
 
 Update the placeholder URLs in `index.html` with your actual repository information.

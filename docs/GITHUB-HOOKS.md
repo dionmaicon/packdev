@@ -432,4 +432,4 @@ The GitHub safety hooks provide an essential safety net for teams using `packdev
 For more information, see:
 - [PACKAGING.md](./PACKAGING.md) - Complete packaging guide
 - [YARN-SUPPORT.md](./YARN-SUPPORT.md) - Yarn-specific instructions
-- [README.md](./README.md) - Main project documentation
+- [README.md](../README.md) - Main project documentation

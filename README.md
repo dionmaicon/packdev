@@ -61,10 +61,10 @@ npm install -g packdev
 | **CI/CD ready** | ✅ | ❌ | ✅ | ⚠️ |
 | **Multi-project safe** | ✅ | ❌ Conflicts | ✅ | ⚠️ Shared store |
 
-**When to use PackDev**: Direct package.json manipulation, git URLs, built-in safety  
-**When to use npm link**: Quick one-off symlink testing  
-**When to use Verdaccio**: Team needs full private npm registry with authentication  
-**When to use Yalc**: Prefer publish/push workflow, need package copying over file: links  
+**When to use PackDev**: Direct package.json manipulation, git URLs, built-in safety
+**When to use npm link**: Quick one-off symlink testing
+**When to use Verdaccio**: Team needs full private npm registry with authentication
+**When to use Yalc**: Prefer publish/push workflow, need package copying over file: links
 
 📖 **[Detailed Comparison →](docs/WORKFLOW.md#-detailed-comparison-with-alternatives)**
 
@@ -125,46 +125,46 @@ jobs:
       matrix:
         ui-variant: [stable, experimental]
         utils-variant: [v1, v2]
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-      
+
       - name: Install PackDev
         run: npm install -g packdev
-      
+
       - name: Configure test matrix
         run: |
           packdev create-config
-          
+
           # Configure UI library variant
           if [ "${{ matrix.ui-variant }}" = "experimental" ]; then
             packdev add ui-library https://github.com/org/ui-library.git#experimental
           else
             packdev add ui-library https://github.com/org/ui-library.git#stable
           fi
-          
+
           # Configure utils library variant
           if [ "${{ matrix.utils-variant }}" = "v2" ]; then
             packdev add utils-library https://github.com/org/utils-library.git#v2-beta
           else
             packdev add utils-library https://github.com/org/utils-library.git#v1.0
           fi
-          
+
           # Apply configuration
           packdev init
-      
+
       - name: Install dependencies
         run: npm install
-      
+
       - name: Run tests
         run: npm test
-        
+
       - name: Report test results
         if: always()
         run: |
@@ -175,7 +175,7 @@ jobs:
 
 This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1, experimental+v2) to ensure compatibility across all combinations.
 
-📖 **[CI/CD Integration Guide →](docs/WORKFLOW.md#cicd-integration)**
+📖 **[CI/CD Integration Guide →](docs/WORKFLOW.md#-advanced-workflows)**
 
 ## 🛡️ Safety Features
 
@@ -185,7 +185,7 @@ This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1,
 - **Status checks**: Always know if you're in dev or production mode
 - **.gitignore recommended**: Keep `.packdev.json` private by default
 
-📖 **[Safety Best Practices →](docs/WORKFLOW.md#safety-best-practices)**
+📖 **[Safety Best Practices →](docs/WORKFLOW.md#-safety-features)**
 
 ## 📖 Documentation
 
@@ -208,7 +208,7 @@ packdev list                   # Show all tracked dependencies
 packdev setup-hooks            # Install git safety hooks
 ```
 
-📖 **[Complete Command Reference →](docs/QUICK-START.md#commands)**
+📖 **[Complete Command Reference →](docs/QUICK-START.md#-essential-commands)**
 
 ## 🤝 Contributing
 
@@ -228,4 +228,4 @@ MIT License - see [LICENSE.md](LICENSE.md) for details
 
 **Made with ❤️ for developers who value simplicity and safety**
 
-📦 [npm](https://www.npmjs.com/package/packdev) | 🐙 [GitHub](https://github.com/yourusername/packdev) | 📖 [Documentation](docs/README.md)
+📦 [npm](https://www.npmjs.com/package/packdev) | 🐙 [GitHub](https://github.com/dionmaicon/packdev) | 📖 [Documentation](docs/README.md)
