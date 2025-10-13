@@ -64,13 +64,12 @@ packdev list
 
 ### 2. Start Development
 ```bash
-packdev init
-npm install  # Now uses local packages and git repositories
+packdev init  # Automatically installs dependencies
 ```
 
 ### 3. Finish Development
 ```bash
-packdev finish
+packdev finish  # Automatically restores and reinstalls dependencies
 git commit -m "implement new features"
 ```
 
@@ -89,24 +88,45 @@ packdev setup-hooks
 | `create-config` | Setup project | `packdev create-config` |
 | `add <pkg> <path>` | Track package | `packdev add axios ../my-axios` |
 | `add <pkg> <git-url>` | Track git repo | `packdev add ui git@github.com:org/ui.git#dev` |
-| `init` | Start development | `packdev init` |
-| `finish` | End development | `packdev finish` |
+| `init` | Start development (auto-installs) | `packdev init` |
+| `finish` | End development (auto-installs) | `packdev finish` |
 | `status` | Check current state | `packdev status` |
 
+**Note**: `init` and `finish` automatically run `npm install` (or `yarn`/`pnpm`). Use `--no-install` flag to skip this.
+
 ## 💡 Common Scenarios
+
+### Branch Switching Without Conflicts
+```bash
+# Working with local dependencies
+packdev init  # Development mode active
+
+# Need to switch branches?
+packdev finish  # Clean package.json instantly
+
+# Switch freely without conflicts
+git checkout main  # ✅ No "uncommitted changes" warnings
+git checkout feature/other  # ✅ Clean switching
+
+# Resume work
+git checkout your-branch
+packdev init  # Back to local development
+```
+
+**Why this helps**: No package.json merge conflicts, clean git status, fast context switching between branches
 
 ### Testing Local and Git Changes
 ```bash
 # Test local changes
 packdev add @myorg/utils ../shared-utils
-packdev init
+packdev init  # Automatically installs dependencies
 # Test your changes locally
 
 # Test git repository features
 packdev add ui-components https://github.com/myorg/ui.git#experiment
-packdev init
+packdev init  # Automatically installs with git dependency
 # Test experimental branch
-packdev finish
+packdev finish  # Automatically restores and reinstalls
 ```
 
 ### Team Collaboration  
@@ -117,14 +137,14 @@ git commit -m "add local dev config"
 
 # Team members use same setup
 git pull
-packdev init
+packdev init  # Automatically installs for team member
 ```
 
 ### Multiple Projects
 ```bash
 # Same local package in multiple projects
-cd project-a && packdev add shared ../shared && packdev init
-cd project-b && packdev add shared ../shared && packdev init
+cd project-a && packdev add shared ../shared && packdev init  # Auto-installs
+cd project-b && packdev add shared ../shared && packdev init  # Auto-installs
 # Both projects now use local ../shared
 ```
 

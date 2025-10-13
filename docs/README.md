@@ -84,11 +84,10 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 ### Daily Development
 ```bash
 # Morning
-packdev init
-npm install
+packdev init  # Automatically installs dependencies
 
 # Evening  
-packdev finish
+packdev finish  # Automatically restores and reinstalls
 git commit -m "implement feature X"
 ```
 📖 **Read**: [Workflow Guide](./WORKFLOW.md) - Daily Development Cycle

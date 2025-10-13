@@ -38,14 +38,12 @@ npm install -g packdev
 
 3. **Switch to development mode**:
    ```bash
-   packdev init
-   npm install
+   packdev init  # Automatically runs npm/yarn/pnpm install
    ```
 
 4. **Restore production versions**:
    ```bash
-   packdev finish
-   npm install
+   packdev finish  # Automatically runs npm/yarn/pnpm install
    ```
 
 📖 **[Full Quick Start Guide →](docs/QUICK-START.md)**
@@ -77,17 +75,40 @@ Develop a library alongside your app:
 ```bash
 # In your app directory
 packdev add my-utils ../my-utils
-packdev init
-npm install
+packdev init  # Automatically installs dependencies
 
 # Make changes to ../my-utils
 # Test immediately in your app
 # Changes reflect instantly (no rebuild needed for JS)
 
-packdev finish  # When ready for production
+packdev finish  # Automatically restores and reinstalls
 ```
 
-### Example 2: Git Auto-Commit Safety Hook
+### Example 2: Clean Git Branch Switching
+
+Avoid merge conflicts and "uncommitted changes" when switching branches:
+
+```bash
+# Working with local dependencies
+packdev init  # Development mode active
+
+# Need to switch branches?
+packdev finish  # Clean package.json instantly
+
+# Switch freely without conflicts
+git checkout main  # ✅ No blocking warnings
+git checkout feature/other-work  # ✅ Clean switching
+
+# Back to your branch
+git checkout feature/your-work
+packdev init  # Resume local development
+```
+
+**Benefits**: No package.json conflicts, clean git status, fast context switching
+
+📖 **[Git Workflows →](docs/WORKFLOW.md#git-branch-switching)**
+
+### Example 3: Git Auto-Commit Safety Hook
 
 Prevent accidentally committing local development configurations:
 
@@ -108,7 +129,7 @@ git commit -m "WIP: testing something"
 
 📖 **[Git Hooks Documentation →](docs/GITHUB-HOOKS.md)**
 
-### Example 3: CI/CD Testing with Multiple Variants
+### Example 4: CI/CD Testing with Multiple Variants
 
 Test your app against different package versions in CI:
 
@@ -159,8 +180,8 @@ jobs:
           # Apply configuration
           packdev init
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (handled by packdev init)
+        run: echo "Dependencies installed by packdev init"
 
       - name: Run tests
         run: npm test

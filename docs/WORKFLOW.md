@@ -33,7 +33,7 @@ packdev add @myorg/utils ../shared/utils
 
 ```bash
 # Switch to local development mode
-packdev init
+packdev init  # Automatically runs npm/yarn/pnpm install
 ```
 
 **What happens**:
@@ -41,6 +41,7 @@ packdev init
 - ✅ Updates `package.json` dependencies from `"lodash": "^4.17.21"` to `"lodash": "file:../my-local-lodash"`
 - ✅ Preserves original versions in `.packdev.json`
 - ✅ Validates that local paths exist
+- ✅ Automatically runs package manager install (use `--no-install` to skip)
 
 **package.json changes**:
 ```diff
@@ -57,10 +58,7 @@ packdev init
 ### 3. Development Work
 
 ```bash
-# Install dependencies with local packages
-npm install  # or yarn install
-
-# Your project now uses local versions
+# Your project now uses local versions (already installed by packdev init)
 # Make changes to both your project and local packages
 # Test, debug, iterate...
 
@@ -72,7 +70,7 @@ git commit -m "WIP: testing new features with local packages"
 
 ```bash
 # Restore original versions
-packdev finish
+packdev finish  # Automatically runs npm/yarn/pnpm install
 ```
 
 **What happens**:
@@ -80,6 +78,7 @@ packdev finish
 - ✅ Restores `package.json` dependencies from `"lodash": "file:../my-local-lodash"` back to `"lodash": "^4.17.21"`
 - ✅ **Keeps `.packdev.json` intact** for future use
 - ✅ Updates `lastModified` timestamp
+- ✅ Automatically runs package manager install (use `--no-install` to skip)
 
 **package.json changes**:
 ```diff
@@ -121,18 +120,17 @@ packdev init
 
 ```bash
 # Morning: Start working on feature
-packdev init
-npm install
+packdev init  # Automatically installs dependencies
 
 # ... development work ...
 
 # Evening: Commit progress
-packdev finish
+packdev finish  # Automatically restores and reinstalls
 git add .
 git commit -m "implement new authentication feature"
 
 # Next morning: Continue work
-packdev init
+packdev init  # Automatically reinstalls with local deps
 # Continue where you left off
 ```
 
@@ -143,7 +141,7 @@ packdev init
 git checkout -b feature/new-ui
 
 # Start local development
-packdev init
+packdev init  # Automatically installs dependencies
 
 # Work with local packages
 # ... development work ...
@@ -153,10 +151,63 @@ git commit -m "WIP: new UI components with local design-system"
 git push origin feature/new-ui
 
 # When ready to merge
-packdev finish
+packdev finish  # Automatically restores and reinstalls
 git add .
 git commit -m "finalize new UI components"
 git push origin feature/new-ui
+```
+
+### Git Branch Switching
+
+A powerful workflow benefit - clean branch switching without conflicts:
+
+```bash
+# Working on feature with local dependencies
+packdev init  # Development mode active
+
+# Need to switch branches urgently
+packdev finish  # Clean package.json automatically
+
+# Now you can switch branches freely
+git checkout main  # ✅ No "uncommitted changes" blocking you
+git checkout hotfix/security-fix  # ✅ Switch anywhere without conflicts
+
+# Back to your feature branch
+git checkout feature/new-ui
+packdev init  # Resume local development instantly
+```
+
+**Benefits:**
+- 🚫 **No merge conflicts** on package.json when switching branches
+- 🚫 **No "uncommitted changes"** warnings from git
+- ⚡ **Fast context switching** between branches
+- 🔄 **Easy experimentation** with different branches
+- 🧹 **Clean git status** before switching
+
+**Common scenarios:**
+```bash
+# Urgent hotfix needed while developing
+packdev finish  # Clean up instantly
+git stash  # Stash your work
+git checkout -b hotfix/urgent-fix
+# Fix the issue...
+git checkout feature/your-feature
+git stash pop
+packdev init  # Resume development
+
+# Review a colleague's PR
+packdev finish  # Clean package.json
+git fetch origin
+git checkout pr-branch  # No conflicts!
+# Review code...
+git checkout your-branch
+packdev init  # Back to work
+
+# Test different feature branches
+packdev finish  # Clean state
+git checkout feature-a && packdev init  # Test feature A
+packdev finish
+git checkout feature-b && packdev init  # Test feature B
 ```
 
 ### Multiple Project Development
@@ -165,12 +216,12 @@ git push origin feature/new-ui
 # Project A - working on shared utilities
 cd project-a
 packdev add @shared/utils ../shared-utils
-packdev init
+packdev init  # Automatically installs
 
 # Project B - using the same shared utilities
 cd ../project-b
 packdev add @shared/utils ../shared-utils
-packdev init
+packdev init  # Automatically installs
 
 # Both projects now use your local @shared/utils
 # Changes in shared-utils affect both projects immediately
@@ -312,9 +363,8 @@ packdev add beta-lib github:myorg/beta-lib#v2.0-beta
 packdev add local-utils ../utils-lib
 packdev add remote-components https://github.com/external/components.git
 
-# Initialize - npm/yarn handles git URLs automatically
-packdev init
-npm install  # Downloads git repos and links local packages
+# Initialize - automatically downloads git repos and links local packages
+packdev init  # Handles both local and git dependencies
 ```
 
 **Git URL Patterns Supported:**
@@ -333,7 +383,7 @@ packdev add shared-types ../shared-types          # Local development
 packdev add ui-library https://github.com/myorg/ui.git#experiment
 packdev add third-party github:vendor/tools#beta
 
-packdev init
+packdev init  # Automatically installs all dependencies
 # Now testing: local changes + experimental UI + beta tools
 ```
 
@@ -343,7 +393,7 @@ packdev init
 # Root package depends on workspace packages
 packdev add @myorg/package-a ./packages/package-a
 packdev add @myorg/package-b ./packages/package-b
-packdev init
+packdev init  # Automatically installs
 
 # All workspace packages are now linked locally
 ```
@@ -357,7 +407,7 @@ packdev init
 # In Package A
 packdev add package-b ../package-b
 packdev add package-c ../package-c
-packdev init
+packdev init  # Automatically installs all in chain
 
 # Changes in Package C immediately affect Package A through B
 ```
@@ -371,7 +421,7 @@ git commit -m "add packdev configuration for shared development"
 
 # Team members can use the same setup
 git pull
-packdev init  # Everyone gets the same local dependencies
+packdev init  # Everyone gets the same setup, auto-installs
 ```
 
 ## 📊 Detailed Comparison with Alternatives
@@ -517,21 +567,35 @@ npm run build  # Only if development mode is inactive
 # In package.json:
 {
   "scripts": {
-    "dev:start": "packdev init && npm install",
+    "dev:start": "packdev init",
     "dev:end": "packdev finish",
     "dev:status": "packdev status"
   }
 }
 ```
 
+### 5. Clean Branch Switching
+
+```bash
+# ✅ Always finish before switching branches
+packdev finish  # Clean package.json
+git checkout other-branch  # No conflicts!
+
+# ✅ This prevents:
+# - "uncommitted changes" warnings
+# - package.json merge conflicts
+# - Accidentally committing local dependencies to wrong branch
+```
+
 ## 🎉 Summary
 
 The PackDev workflow is designed around **configuration persistence** and **safe state transitions**:
 
-- 🔧 **init** = Switch to local development (temporary state)
-- 📦 **finish** = Restore production versions (permanent state)
+- 🔧 **init** = Switch to local development (temporary state) + auto-install
+- 📦 **finish** = Restore production versions (permanent state) + auto-install
 - 📋 **Configuration** = Always preserved for easy restart
 - 🛡️ **Safety** = Hooks prevent accidental commits
 - 🔄 **Repeatable** = Use the same setup over and over
+- ⚡ **Automatic** = Package manager install runs automatically (use `--no-install` to skip)
 
 This allows you to seamlessly switch between local development and production-ready code while maintaining a clean, repeatable workflow.
