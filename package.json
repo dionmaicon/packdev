@@ -56,8 +56,5 @@
   },
   "dependencies": {
     "commander": "^14.0.1"
-  },
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
   }
 }
