@@ -509,6 +509,98 @@ class PackageManagerTests {
     });
   }
 
+  async testReleaseOverride() {
+    await this.runTest('Release override - add stores type as release', async () => {
+      await createPackageJson({ 'lodash': '^4.17.21' });
+      await createLockFile('npm');
+      await runPackdevCommand('create-config');
+
+      const result = await runPackdevCommand('add', [
+        'lodash',
+        '^3.10.1',
+        '--no-install'
+      ]);
+
+      assert(result.code === 0, 'Add with release version should succeed');
+
+      const config = JSON.parse(await fs.readFile('.packdev.json', 'utf8'));
+      const dep = config.dependencies.find(d => d.package === 'lodash');
+
+      assert(dep, 'Dependency should be added to config');
+      assert(dep.location === '^3.10.1', 'Location should be the release version');
+      assert(dep.type === 'release', 'Type should be detected as release');
+      assert(dep.version === '^4.17.21', 'Original version should be stored');
+    });
+
+    await this.runTest('Release override - init updates package.json with release version', async () => {
+      await createPackageJson({ 'lodash': '^4.17.21' });
+      await createLockFile('npm');
+      await runPackdevCommand('create-config');
+
+      await runPackdevCommand('add', ['lodash', '^3.10.1', '--no-install']);
+
+      // Reset package.json to original
+      await createPackageJson({ 'lodash': '^4.17.21' });
+
+      const initResult = await runPackdevCommand('init', ['--no-install']);
+      assert(initResult.code === 0, 'Init with release override should succeed');
+
+      const packageJson = JSON.parse(await fs.readFile('package.json', 'utf8'));
+      assert(packageJson.dependencies['lodash'] === '^3.10.1',
+        'package.json should have the release override version');
+    });
+
+    await this.runTest('Release override - finish restores original version', async () => {
+      await createPackageJson({ 'lodash': '^4.17.21' });
+      await createLockFile('npm');
+      await runPackdevCommand('create-config');
+
+      await runPackdevCommand('add', ['lodash', '^3.10.1', '--no-install']);
+      await runPackdevCommand('init', ['--no-install']);
+
+      // Verify it's in override mode
+      let packageJson = JSON.parse(await fs.readFile('package.json', 'utf8'));
+      assert(packageJson.dependencies['lodash'] === '^3.10.1', 'Should be in release override mode');
+
+      const finishResult = await runPackdevCommand('finish', ['--no-install']);
+      assert(finishResult.code === 0, 'Finish should succeed');
+
+      packageJson = JSON.parse(await fs.readFile('package.json', 'utf8'));
+      assert(packageJson.dependencies['lodash'] === '^4.17.21',
+        'Should restore original version');
+    });
+
+    await this.runTest('Release override - validate reports dev mode as active', async () => {
+      await createPackageJson({ 'lodash': '^4.17.21' });
+      await createLockFile('npm');
+      await runPackdevCommand('create-config');
+
+      await runPackdevCommand('add', ['lodash', '^3.10.1', '--no-install']);
+      await runPackdevCommand('init', ['--no-install']);
+
+      const statusResult = await runPackdevCommand('status');
+      assert(statusResult.code === 0, 'Status should succeed');
+      assert(statusResult.stdout.includes('Active'),
+        'Status should show Active when release override is applied');
+    });
+
+    await this.runTest('Release override - add guards against saving active release as original', async () => {
+      await createPackageJson({ 'lodash': '^4.17.21' });
+      await createLockFile('npm');
+      await runPackdevCommand('create-config');
+
+      // Set up an active release override
+      await runPackdevCommand('add', ['lodash', '^3.10.1', '--no-install']);
+      await runPackdevCommand('init', ['--no-install']);
+
+      // Now try to add a new override without --original-version
+      // package.json currently has ^3.10.1 (the release override)
+      // It should fail because it can't determine the original version
+      const result = await runPackdevCommand('add', ['lodash', '^2.0.0', '--no-install']);
+      assert(result.code !== 0, 'Should fail when package.json has active release override');
+    });
+  }
+
   async runAllTests() {
     log('🚀 Starting PackDev Package Manager Unit Tests', 'cyan');
     log('=====================================', 'cyan');
@@ -526,6 +618,7 @@ class PackageManagerTests {
       await this.testGitUrlDetection();
       await this.testMixedDependencies();
       await this.testErrorHandling();
+      await this.testReleaseOverride();
 
       log('\n🎉 All PackDev Package Manager Tests Completed!', 'green');
       log(`✅ Passed: ${this.testsPassed}/${this.totalTests}`, 'green');

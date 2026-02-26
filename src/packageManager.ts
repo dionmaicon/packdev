@@ -7,7 +7,7 @@ export interface PackdevDependency {
   package: string;
   location: string;
   version: string;
-  type?: "local" | "git";
+  type?: "local" | "git" | "release";
 }
 
 export interface PackdevConfig {
@@ -215,13 +215,44 @@ export function parseGitUrl(gitUrl: string): GitReference | null {
   return { url, ref, protocol };
 }
 
-function detectDependencyType(location: string): "local" | "git" {
-  return isGitUrl(location) ? "git" : "local";
+// Semver/range pattern: matches version strings like ^1.0.0, ~2.3.0, 1.0.0, >=1.0.0, etc.
+// Does NOT match local paths (starting with . or /) or git URLs
+const semverRangePattern =
+  /^[\^~]?\d+\.\d+\.\d+|^[><=!]+\s*\d+\.\d+\.\d+|^\d+\.\d+\.\d+/;
+
+function isReleaseVersion(location: string): boolean {
+  if (isGitUrl(location)) return false;
+  if (
+    location.startsWith(".") ||
+    location.startsWith("/") ||
+    location.startsWith("file:")
+  )
+    return false;
+  return semverRangePattern.test(location);
+}
+
+function detectDependencyType(location: string): "local" | "git" | "release" {
+  if (isGitUrl(location)) return "git";
+  if (isReleaseVersion(location)) return "release";
+  return "local";
+}
+
+// Check if a package.json version value is an active release override
+// by comparing it against the stored override location
+function isActiveReleaseOverride(
+  currentVersion: string,
+  dependency: PackdevDependency,
+): boolean {
+  return (
+    dependency.type === "release" && currentVersion === dependency.location
+  );
 }
 
 function resolveLocation(location: string): string {
   if (isGitUrl(location)) {
     return location; // Use git URL directly for npm/yarn to handle
+  } else if (isReleaseVersion(location)) {
+    return location; // Use semver version string directly for npm/yarn to handle
   } else {
     return resolveLocalPath(location); // Use file: path for local
   }
@@ -336,7 +367,7 @@ export async function initializeProject(
     for (const dependency of config.dependencies) {
       const { package: packageName, location } = dependency;
 
-      // For local dependencies, check if path exists
+      // For local dependencies, check if path exists (skip for git and release)
       if (dependency.type === "local" && !(await fileExists(location))) {
         console.warn(`⚠️  Local package not found: ${location}`);
         continue;
@@ -347,12 +378,14 @@ export async function initializeProject(
 
       // Replace in dependencies
       if (packageJson.dependencies && packageJson.dependencies[packageName]) {
-        // Update the config with the current version if it's not a local/git path
+        // Update the config with the current version if it's not already an override
+        const depVer = packageJson.dependencies[packageName];
         if (
-          !isLocalPath(packageJson.dependencies[packageName]) &&
-          !isGitUrl(packageJson.dependencies[packageName])
+          !isLocalPath(depVer) &&
+          !isGitUrl(depVer) &&
+          !isActiveReleaseOverride(depVer, dependency)
         ) {
-          dependency.version = packageJson.dependencies[packageName];
+          dependency.version = depVer;
         }
         packageJson.dependencies[packageName] = resolvedLocation;
         wasReplaced = true;
@@ -363,11 +396,13 @@ export async function initializeProject(
         packageJson.devDependencies &&
         packageJson.devDependencies[packageName]
       ) {
+        const devDepVer = packageJson.devDependencies[packageName];
         if (
-          !isLocalPath(packageJson.devDependencies[packageName]) &&
-          !isGitUrl(packageJson.devDependencies[packageName])
+          !isLocalPath(devDepVer) &&
+          !isGitUrl(devDepVer) &&
+          !isActiveReleaseOverride(devDepVer, dependency)
         ) {
-          dependency.version = packageJson.devDependencies[packageName];
+          dependency.version = devDepVer;
         }
         packageJson.devDependencies[packageName] = resolvedLocation;
         wasReplaced = true;
@@ -378,11 +413,13 @@ export async function initializeProject(
         packageJson.peerDependencies &&
         packageJson.peerDependencies[packageName]
       ) {
+        const peerDepVer = packageJson.peerDependencies[packageName];
         if (
-          !isLocalPath(packageJson.peerDependencies[packageName]) &&
-          !isGitUrl(packageJson.peerDependencies[packageName])
+          !isLocalPath(peerDepVer) &&
+          !isGitUrl(peerDepVer) &&
+          !isActiveReleaseOverride(peerDepVer, dependency)
         ) {
-          dependency.version = packageJson.peerDependencies[packageName];
+          dependency.version = peerDepVer;
         }
         packageJson.peerDependencies[packageName] = resolvedLocation;
         wasReplaced = true;
@@ -463,10 +500,11 @@ export async function finishProject(
 
       // Restore in dependencies
       if (packageJson.dependencies && packageJson.dependencies[packageName]) {
-        // Restore if it's currently using a local path or git URL
+        const depVer = packageJson.dependencies[packageName];
         if (
-          isLocalPath(packageJson.dependencies[packageName]) ||
-          isGitUrl(packageJson.dependencies[packageName])
+          isLocalPath(depVer) ||
+          isGitUrl(depVer) ||
+          isActiveReleaseOverride(depVer, dependency)
         ) {
           packageJson.dependencies[packageName] = version;
           wasRestored = true;
@@ -478,9 +516,11 @@ export async function finishProject(
         packageJson.devDependencies &&
         packageJson.devDependencies[packageName]
       ) {
+        const devDepVer = packageJson.devDependencies[packageName];
         if (
-          isLocalPath(packageJson.devDependencies[packageName]) ||
-          isGitUrl(packageJson.devDependencies[packageName])
+          isLocalPath(devDepVer) ||
+          isGitUrl(devDepVer) ||
+          isActiveReleaseOverride(devDepVer, dependency)
         ) {
           packageJson.devDependencies[packageName] = version;
           wasRestored = true;
@@ -492,9 +532,11 @@ export async function finishProject(
         packageJson.peerDependencies &&
         packageJson.peerDependencies[packageName]
       ) {
+        const peerDepVer = packageJson.peerDependencies[packageName];
         if (
-          isLocalPath(packageJson.peerDependencies[packageName]) ||
-          isGitUrl(packageJson.peerDependencies[packageName])
+          isLocalPath(peerDepVer) ||
+          isGitUrl(peerDepVer) ||
+          isActiveReleaseOverride(peerDepVer, dependency)
         ) {
           packageJson.peerDependencies[packageName] = version;
           wasRestored = true;
@@ -579,11 +621,18 @@ export async function addLocalDependency(
         };
       }
 
-      // Don't save local file paths or git URLs as versions
-      if (isLocalPath(version) || isGitUrl(version)) {
+      // Don't save local file paths, git URLs, or active release overrides as the original version
+      const existingOverride = config.dependencies.find(
+        (dep) => dep.package === packageName,
+      );
+      const isActiveRelease =
+        existingOverride &&
+        isActiveReleaseOverride(version, existingOverride);
+
+      if (isLocalPath(version) || isGitUrl(version) || isActiveRelease) {
         return {
           success: false,
-          error: `Package '${packageName}' already uses a local path or git URL (${version}). Cannot determine original version. Use --original-version to specify it manually.`,
+          error: `Package '${packageName}' already uses a local path, git URL, or release override (${version}). Cannot determine original version. Use --original-version to specify it manually.`,
         };
       }
     }
@@ -761,21 +810,26 @@ export async function validateProject(
     // Load package.json to check if in dev mode
     const packageJson = await loadPackageJson();
     if (packageJson && config) {
-      // Check if any dependencies are using local paths
+      // Check if any dependencies are using local paths, git URLs, or release overrides
       for (const dependency of config.dependencies) {
         const packageName = dependency.package;
 
-        const depVersion = packageJson.dependencies?.[packageName];
-        const devDepVersion = packageJson.devDependencies?.[packageName];
-        const peerDepVersion = packageJson.peerDependencies?.[packageName];
+        const depVersion = packageJson.dependencies?.[packageName] ?? "";
+        const devDepVersion =
+          packageJson.devDependencies?.[packageName] ?? "";
+        const peerDepVersion =
+          packageJson.peerDependencies?.[packageName] ?? "";
 
         if (
-          isLocalPath(depVersion || "") ||
-          isLocalPath(devDepVersion || "") ||
-          isLocalPath(peerDepVersion || "") ||
-          isGitUrl(depVersion || "") ||
-          isGitUrl(devDepVersion || "") ||
-          isGitUrl(peerDepVersion || "")
+          isLocalPath(depVersion) ||
+          isLocalPath(devDepVersion) ||
+          isLocalPath(peerDepVersion) ||
+          isGitUrl(depVersion) ||
+          isGitUrl(devDepVersion) ||
+          isGitUrl(peerDepVersion) ||
+          isActiveReleaseOverride(depVersion, dependency) ||
+          isActiveReleaseOverride(devDepVersion, dependency) ||
+          isActiveReleaseOverride(peerDepVersion, dependency)
         ) {
           result.isInDevMode = true;
           break;
@@ -925,7 +979,17 @@ function loadPackdevConfig() {
 }
 
 /**
- * Check if package.json contains local file dependencies
+ * Check if a version string is an active release override based on packdev config
+ */
+function isActiveReleaseOverride(version, packdevConfig) {
+  if (!packdevConfig || !packdevConfig.dependencies) return false;
+  return packdevConfig.dependencies.some(
+    (dep) => dep.type === 'release' && dep.location === version
+  );
+}
+
+/**
+ * Check if package.json contains local file dependencies or active release overrides
  */
 function hasLocalFileDependencies() {
   try {
@@ -935,6 +999,7 @@ function hasLocalFileDependencies() {
     }
 
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const packdevConfig = loadPackdevConfig();
     const localDeps = [];
 
     // Check all dependency sections
@@ -944,7 +1009,11 @@ function hasLocalFileDependencies() {
       const deps = packageJson[section];
       if (deps && typeof deps === 'object') {
         for (const [name, version] of Object.entries(deps)) {
-          if (typeof version === 'string' && (version.startsWith('file:') || version.startsWith('./'))) {
+          if (typeof version === 'string' && (
+            version.startsWith('file:') ||
+            version.startsWith('./') ||
+            isActiveReleaseOverride(version, packdevConfig)
+          )) {
             localDeps.push({ name, version, section });
           }
         }

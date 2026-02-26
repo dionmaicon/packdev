@@ -132,6 +132,20 @@ temp/
 .packdev.json.backup
 *.packdev-backup
 
+# ==========================================
+# AI / Editor Tools (per-developer)
+# ==========================================
+
+# CrowMemory (AI persistent memory — local to each developer)
+.crow-memory-prompt-pro.md
+crow_activity_*.md
+
+# Zed editor settings
+.zed/
+
+# Claude Code settings
+.claude/
+
 # Local development test directories
 test-hooks/
 test-data/

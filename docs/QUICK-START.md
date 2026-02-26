@@ -43,31 +43,37 @@ packdev --help
 cd my-react-app  # The app that uses packages you want to develop
 ```
 
-### Step 2: Create PackDev Configuration
-```bash
-packdev create-config
-```
+### Step 2: Add Dependencies
+PackDev supports three override types — no need to create a config first, `add` handles that automatically:
 
-### Step 3: Add Dependencies (Local or Git)
 ```bash
-# Add local packages you want to work on
+# Local path — use a package from your filesystem
 packdev add react-components ../my-react-components
 packdev add utils ../my-utils-library
 
-# Add git repositories (specific branches/tags)
+# Git URL — use a specific branch or tag
 packdev add ui-library https://github.com/myorg/ui-library.git#feature-branch
 packdev add beta-tools github:vendor/beta-tools#v2.0-beta
+
+# Release version — override with a different published npm version
+packdev add lodash ^3.10.1
+packdev add typescript 4.9.5
 
 # Check what you've added
 packdev list
 ```
 
-### 2. Start Development
+If packdev can't detect the original version automatically (e.g. the package is already overridden), use `--original-version`:
+```bash
+packdev add lodash ^3.10.1 --original-version ^4.17.21
+```
+
+### Step 3: Start Development
 ```bash
 packdev init  # Automatically installs dependencies
 ```
 
-### 3. Finish Development
+### Step 4: Finish Development
 ```bash
 packdev finish  # Automatically restores and reinstalls dependencies
 git commit -m "implement new features"
@@ -85,12 +91,15 @@ packdev setup-hooks
 
 | Command | Purpose | Example |
 |---------|---------|---------|
-| `create-config` | Setup project | `packdev create-config` |
-| `add <pkg> <path>` | Track package | `packdev add axios ../my-axios` |
+| `create-config` | Initialize config (optional) | `packdev create-config` |
+| `add <pkg> <path>` | Track local package | `packdev add axios ../my-axios` |
 | `add <pkg> <git-url>` | Track git repo | `packdev add ui git@github.com:org/ui.git#dev` |
+| `add <pkg> <semver>` | Override with release version | `packdev add lodash ^3.10.1` |
+| `add <pkg> <location> --original-version <ver>` | Specify original version manually | `packdev add lodash ^3.10.1 --original-version ^4.17.21` |
 | `init` | Start development (auto-installs) | `packdev init` |
 | `finish` | End development (auto-installs) | `packdev finish` |
 | `status` | Check current state | `packdev status` |
+| `list` | Show all tracked dependencies | `packdev list` |
 
 **Note**: `init` and `finish` automatically run `npm install` (or `yarn`/`pnpm`). Use `--no-install` flag to skip this.
 
@@ -129,15 +138,17 @@ packdev init  # Automatically installs with git dependency
 packdev finish  # Automatically restores and reinstalls
 ```
 
-### Team Collaboration  
-```bash
-# Share config with team
-git add .packdev.json
-git commit -m "add local dev config"
+### Team Collaboration
+`.packdev.json` is per-developer (add it to `.gitignore`) since paths are local to each machine. Each team member sets up their own overrides:
 
-# Team members use same setup
-git pull
-packdev init  # Automatically installs for team member
+```bash
+# Developer A
+packdev add my-lib ../my-lib
+packdev init
+
+# Developer B (different local path, same package)
+packdev add my-lib /home/devb/projects/my-lib
+packdev init
 ```
 
 ### Multiple Projects
@@ -152,9 +163,11 @@ cd project-b && packdev add shared ../shared && packdev init  # Auto-installs
 
 ### "Config not found"
 ```bash
-# Create configuration first
-packdev create-config
+# Just use add — it creates the config automatically
 packdev add your-package ../path/to/package
+
+# Or explicitly initialize first
+packdev create-config
 ```
 
 ### "Local path does not exist" 
@@ -236,4 +249,4 @@ npm run demo-workflow --interactive
 
 ---
 
-**🎉 That's it!** You're ready to use PackDev for package development with local paths and git repositories. For more advanced workflows and team features, explore the complete documentation above.
+**🎉 That's it!** You're ready to use PackDev for package development with local paths, git repositories, and release version overrides. For more advanced workflows and team features, explore the complete documentation above.

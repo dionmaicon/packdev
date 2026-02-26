@@ -25,23 +25,19 @@ npm install -g packdev
 
 ## 🚀 Quick Start
 
-1. **Create configuration** in your app directory:
-   ```bash
-   packdev create-config
-   ```
-
-2. **Add development dependencies** (local paths or git URLs):
+1. **Add development dependencies** (local paths, git URLs, or release versions):
    ```bash
    packdev add my-library ../path/to/my-library
    packdev add ui-components https://github.com/org/ui-components.git#dev-branch
+   packdev add lodash ^3.10.1
    ```
 
-3. **Switch to development mode**:
+2. **Switch to development mode**:
    ```bash
    packdev init  # Automatically runs npm/yarn/pnpm install
    ```
 
-4. **Restore production versions**:
+3. **Restore production versions**:
    ```bash
    packdev finish  # Automatically runs npm/yarn/pnpm install
    ```
@@ -82,6 +78,27 @@ packdev init  # Automatically installs dependencies
 # Changes reflect instantly (no rebuild needed for JS)
 
 packdev finish  # Automatically restores and reinstalls
+```
+
+### Example 2: Testing a Specific Release Version
+
+Test your app against a different published version without touching your package.json permanently:
+
+```bash
+# Override lodash to an older version for compatibility testing
+packdev add lodash ^3.10.1
+packdev init  # Installs lodash@^3.10.1
+
+# Run your tests
+npm test
+
+packdev finish  # Restores original lodash version
+```
+
+Use `--original-version` if the package is already overridden or not yet in your package.json:
+
+```bash
+packdev add lodash ^3.10.1 --original-version ^4.17.21
 ```
 
 ### Example 2: Clean Git Branch Switching
@@ -163,18 +180,18 @@ jobs:
         run: |
           packdev create-config
 
-          # Configure UI library variant
+          # Configure UI library variant (git branches)
           if [ "${{ matrix.ui-variant }}" = "experimental" ]; then
             packdev add ui-library https://github.com/org/ui-library.git#experimental
           else
             packdev add ui-library https://github.com/org/ui-library.git#stable
           fi
 
-          # Configure utils library variant
+          # Configure utils library variant (published release versions)
           if [ "${{ matrix.utils-variant }}" = "v2" ]; then
-            packdev add utils-library https://github.com/org/utils-library.git#v2-beta
+            packdev add utils-library ^2.0.0
           else
-            packdev add utils-library https://github.com/org/utils-library.git#v1.0
+            packdev add utils-library ^1.0.0
           fi
 
           # Apply configuration
@@ -204,7 +221,7 @@ This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1,
 - **Path validation**: Ensures local paths and git URLs exist
 - **Git hooks**: Prevent accidental commits of development configs
 - **Status checks**: Always know if you're in dev or production mode
-- **.gitignore recommended**: Keep `.packdev.json` private by default
+- **Per-developer config**: `.packdev.json` lives on your machine — add it to `.gitignore` since paths are local to each developer
 
 📖 **[Safety Best Practices →](docs/WORKFLOW.md#-safety-features)**
 
@@ -219,14 +236,17 @@ This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1,
 ## 🔧 Commands Reference
 
 ```bash
-packdev create-config          # Initialize .packdev.json
-packdev add <pkg> <location>   # Add local or git dependency
-packdev remove <pkg>           # Remove tracked dependency
-packdev init                   # Switch to development mode
-packdev finish                 # Restore production versions
-packdev status                 # Check current mode
-packdev list                   # Show all tracked dependencies
-packdev setup-hooks            # Install git safety hooks
+packdev create-config                        # Initialize .packdev.json (optional — add does this automatically)
+packdev add <pkg> <location>                 # Add local path dependency
+packdev add <pkg> <git-url>                  # Add git URL dependency
+packdev add <pkg> <semver>                   # Add release version override (e.g. ^3.10.1)
+packdev add <pkg> <location> --original-version <ver>  # Specify original version manually
+packdev remove <pkg>                         # Remove tracked dependency
+packdev init                                 # Switch to development mode
+packdev finish                               # Restore production versions
+packdev status                               # Check current mode
+packdev list                                 # Show all tracked dependencies
+packdev setup-hooks                          # Install git safety hooks
 ```
 
 📖 **[Complete Command Reference →](docs/QUICK-START.md#-essential-commands)**
