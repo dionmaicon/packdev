@@ -25,9 +25,13 @@ RUN printf '#!/bin/sh\nexec node /packdev/dist/index.js "$@"\n' > /usr/local/bin
 COPY test/docker/watch-integration.sh /usr/local/bin/watch-integration.sh
 COPY test/docker/git-integration.sh /usr/local/bin/git-integration.sh
 COPY test/docker/pm-integration.sh /usr/local/bin/pm-integration.sh
+COPY test/docker/finish-integration.sh /usr/local/bin/finish-integration.sh
+COPY test/docker/storm-integration.sh /usr/local/bin/storm-integration.sh
 RUN chmod +x /usr/local/bin/watch-integration.sh \
     /usr/local/bin/git-integration.sh \
-    /usr/local/bin/pm-integration.sh
+    /usr/local/bin/pm-integration.sh \
+    /usr/local/bin/finish-integration.sh \
+    /usr/local/bin/storm-integration.sh
 
 WORKDIR /work
 # Default entrypoint; run.sh overrides it per test with --entrypoint.
