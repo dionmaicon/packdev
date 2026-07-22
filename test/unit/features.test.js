@@ -271,6 +271,26 @@ class FeatureTests {
     });
   }
 
+  // --- git dependencies -----------------------------------------------------
+
+  async testGitFileUrlClassified() {
+    await this.run('add classifies a git+file URL as a git dependency', async () => {
+      const dir = this.tmp('gitfile');
+      writeJson(path.join(dir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { gitlib: '^1.0.0' } });
+      writeJson(path.join(dir, 'package-lock.json'), { name: 'app', lockfileVersion: 2 });
+      await runPackdev(dir, ['create-config']);
+      const url = 'git+file:///tmp/does-not-need-to-exist/remote.git';
+      const add = await runPackdev(dir, ['add', 'gitlib', url, '--original-version', '^1.0.0', '--no-install', '--json']);
+      const addJson = parseJson(add.stdout, 'add');
+      assert.strictEqual(addJson.success, true, `add failed: ${addJson.error}`);
+      const list = parseJson((await runPackdev(dir, ['list', '--json'])).stdout, 'list');
+      const dep = list.dependencies.find((d) => d.package === 'gitlib');
+      assert.ok(dep, 'gitlib should be tracked');
+      assert.strictEqual(dep.type, 'git', 'git+file URL must be classified as git, not a local path');
+      assert.strictEqual(dep.location, url);
+    });
+  }
+
   // --- watch ----------------------------------------------------------------
 
   async testWatchOnce() {
@@ -347,6 +367,7 @@ class FeatureTests {
       await this.testInitIdempotent();
       await this.testLinkFromWorkspaceChild();
       await this.testLinkNoMatch();
+      await this.testGitFileUrlClassified();
       await this.testWatchOnce();
       await this.testRestoreNoBackup();
       await this.testRestoreRecoversAndClears();

@@ -112,7 +112,7 @@ interface PackageManagerInfo {
 interface GitReference {
   url: string;
   ref: string | undefined;
-  protocol: "https" | "ssh" | "git";
+  protocol: "https" | "ssh" | "git" | "file";
 }
 
 // Utility functions
@@ -209,6 +209,7 @@ function isGitUrl(location: string): boolean {
   const gitPatterns = [
     /^git\+https?:\/\/.+\.git(#.+)?$/,
     /^git\+ssh:\/\/.+\.git(#.+)?$/,
+    /^git\+file:\/\/.+\.git(#.+)?$/,
     /^git@[^:]+:.+\.git(#.+)?$/,
     /^https?:\/\/.+\.git(#.+)?$/,
     /^github:[^/]+\/[^#]+(#.+)?$/,
@@ -224,7 +225,7 @@ export function parseGitUrl(gitUrl: string): GitReference | null {
 
   let url = gitUrl;
   let ref: string | undefined;
-  let protocol: "https" | "ssh" | "git";
+  let protocol: "https" | "ssh" | "git" | "file";
 
   // Extract ref (branch/tag/commit) if present
   const hashIndex = gitUrl.indexOf("#");
@@ -238,6 +239,8 @@ export function parseGitUrl(gitUrl: string): GitReference | null {
     protocol = "https";
   } else if (url.startsWith("git+ssh://") || url.startsWith("git@")) {
     protocol = "ssh";
+  } else if (url.startsWith("git+file://")) {
+    protocol = "file";
   } else if (url.startsWith("github:")) {
     protocol = "https";
     const parts = url.replace("github:", "").split("/");
