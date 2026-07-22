@@ -156,31 +156,33 @@ async function executeInstall(
   const { manager } = packageManagerInfo;
 
   try {
-    console.log(`\n🔄 Running ${manager} install...`);
+    console.error(`\n🔄 Running ${manager} install...`);
 
     return new Promise((resolve) => {
+      // Route the child's stdout to our stderr so `--json` mode keeps stdout
+      // reserved for the single machine-readable result line.
       const child = spawn(manager, ["install"], {
-        stdio: "inherit",
+        stdio: ["inherit", process.stderr, process.stderr],
         shell: true,
       });
 
       child.on("close", (code) => {
         if (code === 0) {
-          console.log(`✅ ${manager} install completed successfully!`);
+          console.error(`✅ ${manager} install completed successfully!`);
           resolve(true);
         } else {
-          console.log(`❌ ${manager} install failed with exit code ${code}`);
+          console.error(`❌ ${manager} install failed with exit code ${code}`);
           resolve(false);
         }
       });
 
       child.on("error", (error) => {
-        console.log(`❌ Failed to run ${manager} install:`, error.message);
+        console.error(`❌ Failed to run ${manager} install:`, error.message);
         resolve(false);
       });
     });
   } catch (error) {
-    console.log(`❌ Failed to execute ${manager} install:`, error);
+    console.error(`❌ Failed to execute ${manager} install:`, error);
     return false;
   }
 }
@@ -191,14 +193,14 @@ async function promptForInstall(
 ): Promise<boolean> {
   const { manager } = packageManagerInfo;
 
-  console.log(`\n📦 Dependencies have been updated in package.json`);
+  console.error(`\n📦 Dependencies have been updated in package.json`);
 
   if (!autoInstall) {
-    console.log(`💡 Run '${manager} install' to update your node_modules\n`);
+    console.error(`💡 Run '${manager} install' to update your node_modules\n`);
     return false;
   }
 
-  console.log(`🔄 Running ${manager} install to update node_modules...`);
+  console.error(`🔄 Running ${manager} install to update node_modules...`);
   return await executeInstall(packageManagerInfo);
 }
 

@@ -376,23 +376,62 @@ export async function discoverSiblingPackages(
 }
 
 /**
- * Resolve a package name to a local directory by checking workspaces first,
- * then sibling directories. Returns all matches found (empty, one, or many).
+ * Walk up from `startDir` to find the monorepo root: the nearest ancestor
+ * whose package.json declares "workspaces", or that contains a
+ * pnpm-workspace.yaml. Returns null if none is found (not a monorepo, or the
+ * caller is already at/above the root).
+ */
+export async function findWorkspaceRoot(
+  startDir: string = ".",
+): Promise<string | null> {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const pkg = await readJsonFile<{
+      workspaces?: string[] | { packages?: string[] };
+    }>(path.join(dir, "package.json"));
+    if (pkg?.workspaces) return dir;
+    if (await fileExists(path.join(dir, "pnpm-workspace.yaml"))) return dir;
+
+    const parentDir = path.dirname(dir);
+    if (parentDir === dir) return null;
+    dir = parentDir;
+  }
+}
+
+/**
+ * Resolve a package name to a local directory. Searches, in order: the
+ * workspaces declared at the monorepo root (walking up from `rootDir` so this
+ * works from inside a workspace child), the workspaces declared at `rootDir`
+ * itself, then sibling directories. Returns all matches found (empty, one, or
+ * many).
  */
 export async function resolveLocalPackage(
   packageName: string,
   rootDir: string = ".",
 ): Promise<WorkspacePackage[]> {
-  const workspaceMatches = (
-    await discoverWorkspacePackages(rootDir)
-  ).filter((pkg) => pkg.name === packageName);
-  if (workspaceMatches.length > 0) {
-    return workspaceMatches;
+  const seenDirs = new Set<string>();
+  const matches: WorkspacePackage[] = [];
+  const collect = (pkgs: WorkspacePackage[]) => {
+    for (const pkg of pkgs) {
+      if (pkg.name !== packageName) continue;
+      const key = path.resolve(pkg.dir);
+      if (seenDirs.has(key)) continue;
+      seenDirs.add(key);
+      matches.push(pkg);
+    }
+  };
+
+  const workspaceRoot = await findWorkspaceRoot(rootDir);
+  if (workspaceRoot && path.resolve(workspaceRoot) !== path.resolve(rootDir)) {
+    collect(await discoverWorkspacePackages(workspaceRoot));
+  }
+  collect(await discoverWorkspacePackages(rootDir));
+  if (matches.length > 0) {
+    return matches;
   }
 
-  return (await discoverSiblingPackages(rootDir)).filter(
-    (pkg) => pkg.name === packageName,
-  );
+  collect(await discoverSiblingPackages(rootDir));
+  return matches;
 }
 
 // Array and object utilities
