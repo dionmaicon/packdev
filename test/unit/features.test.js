@@ -291,7 +291,58 @@ class FeatureTests {
     });
   }
 
+  // --- remove ---------------------------------------------------------------
+
+  async testRemoveDependency() {
+    await this.run('remove drops a tracked dependency', async () => {
+      const dir = this.tmp('remove');
+      fs.mkdirSync(path.join(dir, 'lib'));
+      writeJson(path.join(dir, 'lib/package.json'), { name: 'lib', version: '1.0.0' });
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: { lib: '^1.0.0' } });
+      writeJson(path.join(dir, 'package-lock.json'), { name: 'h', lockfileVersion: 2 });
+      await runPackdev(dir, ['create-config']);
+      await runPackdev(dir, ['add', 'lib', './lib', '--no-install']);
+      const r = await runPackdev(dir, ['remove', 'lib', '--json']);
+      assert.strictEqual(r.code, 0);
+      assert.strictEqual(parseJson(r.stdout, 'remove').success, true);
+      const list = parseJson((await runPackdev(dir, ['list', '--json'])).stdout, 'list');
+      assert.strictEqual(list.dependencies.length, 0, 'dependency should be gone after remove');
+    });
+  }
+
+  async testRemoveNonexistent() {
+    await this.run('remove reports a clear error for an unknown dependency', async () => {
+      const dir = this.tmp('remove-missing');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeJson(path.join(dir, 'package-lock.json'), { name: 'h', lockfileVersion: 2 });
+      await runPackdev(dir, ['create-config']);
+      const r = await runPackdev(dir, ['remove', 'ghost', '--json']);
+      assert.notStrictEqual(r.code, 0, 'should exit non-zero');
+      const json = parseJson(r.stdout, 'remove');
+      assert.strictEqual(json.success, false);
+      assert.match(json.error, /not found/i);
+    });
+  }
+
   // --- watch ----------------------------------------------------------------
+
+  async testWatchBuildFailed() {
+    await this.run('watch --once reports build-failed when a build errors', async () => {
+      const dir = this.tmp('watch-fail');
+      fs.mkdirSync(path.join(dir, 'lib'));
+      writeJson(path.join(dir, 'lib/package.json'), {
+        name: 'lib', version: '1.0.0', scripts: { build: 'node -e "process.exit(1)"' },
+      });
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: { lib: '^1.0.0' } });
+      writeJson(path.join(dir, 'package-lock.json'), { name: 'h', lockfileVersion: 2 });
+      await runPackdev(dir, ['create-config']);
+      await runPackdev(dir, ['add', 'lib', './lib', '--no-install']);
+      const r = await runPackdev(dir, ['watch', '--once', '--json']);
+      const events = r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      assert.ok(events.some((e) => e.event === 'build-failed'), 'should emit a build-failed event');
+      assert.ok(!events.some((e) => e.event === 'build-success'), 'must not report success for a failing build');
+    });
+  }
 
   async testWatchOnce() {
     await this.run('watch --once builds each target once and exits', async () => {
@@ -390,6 +441,9 @@ class FeatureTests {
       await this.testLinkFromWorkspaceChild();
       await this.testLinkNoMatch();
       await this.testGitFileUrlClassified();
+      await this.testRemoveDependency();
+      await this.testRemoveNonexistent();
+      await this.testWatchBuildFailed();
       await this.testWatchOnce();
       await this.testRestoreNoBackup();
       await this.testRestoreRecoversAndClears();
