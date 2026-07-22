@@ -16,6 +16,7 @@ const fs = require('fs');
 
 // Configuration
 const UNIT_TESTS_PATH = path.join(__dirname, 'unit/packageManager.test.js');
+const FEATURE_TESTS_PATH = path.join(__dirname, 'unit/features.test.js');
 const INTEGRATION_TESTS_PATH = path.join(__dirname, 'test-demo.js');
 const GIT_AUTOCOMMIT_TESTS_PATH = path.join(__dirname, 'git/autocommit.test.js');
 const GIT_WORKFLOWS_TESTS_PATH = path.join(__dirname, 'git/workflows.test.js');
@@ -173,13 +174,23 @@ async function runUnitTests() {
     'Executing unit tests'
   );
 
-  if (result.success) {
-    log('🎉 Unit tests completed successfully!', 'green');
-  } else {
+  if (!result.success) {
     log('💥 Unit tests failed!', 'red');
+    return result;
   }
 
-  return result;
+  const featureResult = execCommand(
+    `node ${FEATURE_TESTS_PATH}`,
+    'Executing feature tests'
+  );
+
+  if (featureResult.success) {
+    log('🎉 Unit tests completed successfully!', 'green');
+  } else {
+    log('💥 Feature tests failed!', 'red');
+  }
+
+  return featureResult;
 }
 
 async function runGitAutocommitTests() {
