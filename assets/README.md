@@ -2,6 +2,28 @@
 
 This directory contains static assets for the PackDev documentation site.
 
+## 🎬 Terminal demo (`demo.gif`)
+
+`demo.gif` is the terminal demo in the top-level README. It is generated from
+`demo.tape` with [VHS](https://github.com/charmbracelet/vhs) — a scripted,
+reproducible terminal recorder — so it can be regenerated deterministically
+instead of screen-recorded.
+
+**Regenerate** (needs `vhs`, `ttyd`, and `ffmpeg` on PATH):
+
+```bash
+# Install VHS — https://github.com/charmbracelet/vhs#installation
+#   macOS:  brew install vhs
+#   Go:     go install github.com/charmbracelet/vhs@latest
+
+npm run build          # the tape runs the local dist build of packdev
+vhs assets/demo.tape   # writes assets/demo.gif
+```
+
+Edit `demo.tape` to change commands, timing, theme, or size. It points `packdev`
+at `dist/index.js` (no global install or publish needed) and uses `--no-install`
+to stay fast and offline; drop that flag to show the real install step.
+
 ## 📁 Required Assets
 
 ### Favicon Files

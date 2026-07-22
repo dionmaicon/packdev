@@ -8,6 +8,8 @@
 
 A TypeScript-based CLI tool for managing package dependencies during development. Test your packages before publishing using local paths or git repositories, without the complexity of `npm link`.
 
+![PackDev demo](assets/demo.gif)
+
 ## 🎯 Why PackDev?
 
 **The Problem**: You're developing a library and need to test it in your app before publishing. Traditional solutions are painful:
