@@ -381,6 +381,18 @@ async function clearBackup(): Promise<void> {
   }
 }
 
+// Record a stale-backup finding on a validation result. A backup is only stale
+// when it exists outside dev mode (a backup during dev mode is the expected
+// restore escape hatch, cleared by `finish`).
+function markStaleBackup(result: ValidationResult, isStale: boolean): void {
+  result.hasStaleBackup = isStale;
+  if (isStale) {
+    result.issues.push(
+      `Stale backup detected (${BACKUP_FILE}) — a previous session may have been interrupted. Run 'packdev restore' to recover the original package.json.`,
+    );
+  }
+}
+
 /**
  * Restore package.json from the crash-safety backup created during init.
  * Used to recover a half-mutated package.json after an interrupted init/finish.
@@ -1000,20 +1012,24 @@ export async function validateProject(
     // Check package.json
     result.packageJsonExists = await fileExists("package.json");
 
-    result.hasStaleBackup = await hasBackup();
-    if (result.hasStaleBackup) {
-      result.issues.push(
-        `Stale backup detected (${BACKUP_FILE}) — a previous session may have been interrupted. Run 'packdev restore' to recover the original package.json.`,
-      );
-    }
+    // A backup file is expected while in dev mode (it's the restore escape
+    // hatch, cleared by `finish`). It is only *stale* — i.e. crash residue —
+    // when it exists but the project is NOT in dev mode. Flag that after
+    // dev-mode detection below.
+    const backupExists = await hasBackup();
 
     if (!result.packageJsonExists) {
       result.isValid = false;
       result.issues.push("package.json not found");
+      // A missing package.json with a backup present is itself crash residue.
+      markStaleBackup(result, backupExists);
       return result;
     }
 
     if (!result.configExists) {
+      // No config means the project can't be in dev mode, so any backup here is
+      // orphaned crash residue.
+      markStaleBackup(result, backupExists);
       return result; // Valid but no config
     }
 
@@ -1065,6 +1081,10 @@ export async function validateProject(
         }
       }
     }
+
+    // A backup is expected while in dev mode; it is only stale when it exists
+    // outside dev mode (a previous init/finish was interrupted).
+    markStaleBackup(result, backupExists && !result.isInDevMode);
   } catch (error) {
     result.isValid = false;
     result.issues.push(

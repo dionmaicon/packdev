@@ -343,13 +343,35 @@ class FeatureTests {
   }
 
   async testStaleBackupDetected() {
-    await this.run('status flags a stale backup', async () => {
+    await this.run('status flags a stale backup (backup present, not in dev mode)', async () => {
       const dir = this.tmp('stale');
       writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
       writeJson(path.join(dir, '.packdev.backup.json'), { timestamp: 'x', packageJson: {} });
       const r = await runPackdev(dir, ['status', '--json']);
       const json = parseJson(r.stdout, 'status');
       assert.strictEqual(json.hasStaleBackup, true);
+    });
+  }
+
+  async testCleanInitNoStaleWarning() {
+    // Regression: init keeps a backup as the restore escape hatch while in dev
+    // mode. That backup must NOT be reported as "stale" during normal dev work.
+    await this.run('clean init does not raise a false stale-backup warning', async () => {
+      const dir = this.tmp('nostale');
+      fs.mkdirSync(path.join(dir, 'lib'));
+      writeJson(path.join(dir, 'lib/package.json'), { name: 'lib', version: '1.0.0' });
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: { lib: '^1.0.0' } });
+      writeJson(path.join(dir, 'package-lock.json'), { name: 'h', lockfileVersion: 2 });
+      await runPackdev(dir, ['create-config']);
+      await runPackdev(dir, ['add', 'lib', './lib', '--no-install']);
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: { lib: '^1.0.0' } });
+      await runPackdev(dir, ['init', '--no-install']);
+      // Backup should exist (escape hatch) but not be flagged stale in dev mode.
+      assert.ok(fs.existsSync(path.join(dir, '.packdev.backup.json')), 'init should leave a backup');
+      const json = parseJson((await runPackdev(dir, ['status', '--json'])).stdout, 'status');
+      assert.strictEqual(json.isInDevMode, true, 'should be in dev mode after init');
+      assert.strictEqual(json.hasStaleBackup, false, 'backup in dev mode must not be flagged stale');
+      assert.strictEqual(json.isValid, true, 'a normal dev session must stay valid');
     });
   }
 
@@ -372,6 +394,7 @@ class FeatureTests {
       await this.testRestoreNoBackup();
       await this.testRestoreRecoversAndClears();
       await this.testStaleBackupDetected();
+      await this.testCleanInitNoStaleWarning();
 
       log(`\n🎉 Feature tests complete: ${this.passed}/${this.total}`, 'green');
     } catch (error) {
