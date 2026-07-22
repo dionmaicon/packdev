@@ -107,7 +107,7 @@ Use `--original-version` if the package is already overridden or not yet in your
 packdev add lodash ^3.10.1 --original-version ^4.17.21
 ```
 
-### Example 2: Clean Git Branch Switching
+### Example 3: Clean Git Branch Switching
 
 Avoid merge conflicts and "uncommitted changes" when switching branches:
 
@@ -131,7 +131,7 @@ packdev init  # Resume local development
 
 📖 **[Git Workflows →](docs/WORKFLOW.md#git-branch-switching)**
 
-### Example 3: Git Auto-Commit Safety Hook
+### Example 4: Git Auto-Commit Safety Hook
 
 Prevent accidentally committing local development configurations:
 
@@ -152,7 +152,7 @@ git commit -m "WIP: testing something"
 
 📖 **[Git Hooks Documentation →](docs/GITHUB-HOOKS.md)**
 
-### Example 4: CI/CD Testing with Multiple Variants
+### Example 5: CI/CD Testing with Multiple Variants
 
 Test your app against different package versions in CI:
 
@@ -215,6 +215,43 @@ This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1,
 
 📖 **[CI/CD Integration Guide →](docs/WORKFLOW.md#-advanced-workflows)**
 
+### Example 6: Monorepo — Auto-Link and Live Rebuild
+
+Working in a monorepo (npm/pnpm/yarn workspaces)? Let PackDev find the package for you and rebuild it as you edit:
+
+```bash
+# In your app package, no path needed — packdev locates the workspace member
+packdev link ui-library
+packdev init
+
+# Rebuild ui-library automatically on every source change
+packdev watch  # 👀 detects the build script, rebuilds on save
+```
+
+`packdev link` searches workspace members and sibling directories, so you don't hand-write `../../packages/ui-library`. `packdev watch` picks up each linked package's `build` script (override per package via the `watch` block in `.packdev.json`).
+
+### Example 7: Agent-Friendly Scripting (JSON + Exit Codes)
+
+Every command speaks JSON and returns stable exit codes, so scripts and coding agents can act on results without scraping prose:
+
+```bash
+# Machine-readable output on stdout, human logs on stderr
+packdev status --json
+# {"command":"status","isInDevMode":true,"dependencies":[...],"isValid":true}
+
+packdev add my-lib ../my-lib --json --dry-run  # preview, write nothing
+
+# Branch on exit codes
+packdev init --json
+case $? in
+  0) echo "dev mode active" ;;
+  2) echo "no .packdev.json — run packdev create-config" ;;
+  3) echo "no package.json in cwd" ;;
+esac
+```
+
+Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.json not found. Add `--dry-run` to any of `init`/`finish`/`add`/`link` to preview changes safely.
+
 ## 🛡️ Safety Features
 
 - **Auto-backup**: Original package.json preserved before changes
@@ -241,13 +278,18 @@ packdev add <pkg> <location>                 # Add local path dependency
 packdev add <pkg> <git-url>                  # Add git URL dependency
 packdev add <pkg> <semver>                   # Add release version override (e.g. ^3.10.1)
 packdev add <pkg> <location> --original-version <ver>  # Specify original version manually
+packdev link <pkg>                           # Auto-detect a workspace/sibling package's path and add it
 packdev remove <pkg>                         # Remove tracked dependency
 packdev init                                 # Switch to development mode
 packdev finish                               # Restore production versions
+packdev watch                                # Rebuild linked local deps on change (--once to build and exit)
 packdev status                               # Check current mode
 packdev list                                 # Show all tracked dependencies
+packdev restore                              # Recover package.json from backup after a crash
 packdev setup-hooks                          # Install git safety hooks
 ```
+
+**Flags**: `--json` (global — machine-readable output + stable exit codes); `--dry-run` and `--no-install` on `init`/`finish`/`add`/`link` (preview without writing / skip the package-manager install).
 
 📖 **[Complete Command Reference →](docs/QUICK-START.md#-essential-commands)**
 
