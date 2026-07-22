@@ -15,8 +15,11 @@ trap cleanup EXIT
 echo "🐳 Building integration image..."
 docker build -f "$ROOT/test/docker/Dockerfile" -t "$IMAGE" "$ROOT"
 
-echo "🐳 [1/2] watch integration test (live rebuild -> consumer)..."
+echo "🐳 [1/3] watch integration test (live rebuild -> consumer)..."
 docker run --rm --entrypoint /usr/local/bin/watch-integration.sh "$IMAGE"
 
-echo "🐳 [2/2] git-URL dependency integration test (install from git remote)..."
+echo "🐳 [2/3] git-URL dependency integration test (install from git remote)..."
 docker run --rm --entrypoint /usr/local/bin/git-integration.sh "$IMAGE"
+
+echo "🐳 [3/3] multi-package-manager integration test (pnpm walk-up + yarn)..."
+docker run --rm --entrypoint /usr/local/bin/pm-integration.sh "$IMAGE"

@@ -3,8 +3,10 @@
 # isolated, disposable container.
 FROM node:20-alpine
 
-# git is needed for the git-URL dependency integration test.
-RUN apk add --no-cache git
+# git is needed for the git-URL dependency integration test; pnpm for the
+# multi-package-manager integration test (yarn ships with the base image).
+RUN apk add --no-cache git \
+    && npm install -g pnpm@9
 
 WORKDIR /packdev
 
@@ -22,7 +24,10 @@ RUN printf '#!/bin/sh\nexec node /packdev/dist/index.js "$@"\n' > /usr/local/bin
 
 COPY test/docker/watch-integration.sh /usr/local/bin/watch-integration.sh
 COPY test/docker/git-integration.sh /usr/local/bin/git-integration.sh
-RUN chmod +x /usr/local/bin/watch-integration.sh /usr/local/bin/git-integration.sh
+COPY test/docker/pm-integration.sh /usr/local/bin/pm-integration.sh
+RUN chmod +x /usr/local/bin/watch-integration.sh \
+    /usr/local/bin/git-integration.sh \
+    /usr/local/bin/pm-integration.sh
 
 WORKDIR /work
 # Default entrypoint; run.sh overrides it per test with --entrypoint.
