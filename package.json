@@ -18,6 +18,7 @@
     "test:unit": "cd test && node unit/packageManager.test.js",
     "test:integration": "cd test && node run-all-tests.js --integration-only",
     "test:unit-only": "cd test && node run-all-tests.js --unit-only",
+    "test:git": "cd test && node run-all-tests.js --git-only",
     "test:docker": "bash test/docker/run.sh",
     "test-demo": "cd test && npm test",
     "typecheck": "tsc --noEmit",

@@ -61,5 +61,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Configure git for hook tests
+        run: |
+          git config --global user.name "packdev CI"
+          git config --global user.email "ci@packdev.test"
+
+      - name: Run git hook tests
+        run: npm run test:git
+
       - name: Run Docker integration tests
         run: npm run test:docker

@@ -1542,19 +1542,19 @@ if (require.main === module) {
 
 # Check if the safety check script exists
 if [ -f ".git/hooks/check-local-deps.js" ]; then
-    # Ensure we have a controlling terminal for interactive prompts
-    # This is crucial for git hooks to work with user input
+    # Prefer a controlling terminal when one is usable, but never let its
+    # absence block the commit: in CI, IDEs, and other non-interactive
+    # contexts /dev/tty may exist yet fail to open, so test that it can
+    # actually be opened before redirecting from it.
     if [ -t 0 ]; then
-        # We already have a terminal
+        # stdin is already a terminal
         node .git/hooks/check-local-deps.js "$@"
+    elif ( : < /dev/tty ) 2>/dev/null; then
+        # /dev/tty exists and can be opened
+        node .git/hooks/check-local-deps.js "$@" < /dev/tty
     else
-        # Try to connect to controlling terminal
-        if [ -e /dev/tty ]; then
-            node .git/hooks/check-local-deps.js "$@" < /dev/tty
-        else
-            # Fallback for systems without /dev/tty
-            node .git/hooks/check-local-deps.js "$@"
-        fi
+        # No usable terminal — run non-interactively
+        node .git/hooks/check-local-deps.js "$@"
     fi
     exit_code=$?
 
