@@ -1,5 +1,11 @@
 # PackDev - Package Development Manager
 
+[![npm version](https://img.shields.io/npm/v/packdev.svg)](https://www.npmjs.com/package/packdev)
+[![npm downloads](https://img.shields.io/npm/dm/packdev.svg)](https://www.npmjs.com/package/packdev)
+[![CI](https://github.com/dionmaicon/packdev/actions/workflows/ci.yml/badge.svg)](https://github.com/dionmaicon/packdev/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![node](https://img.shields.io/node/v/packdev.svg)](package.json)
+
 A TypeScript-based CLI tool for managing package dependencies during development. Test your packages before publishing using local paths or git repositories, without the complexity of `npm link`.
 
 ## 🎯 Why PackDev?
@@ -173,32 +179,26 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Install PackDev
-        run: npm install -g packdev
-
       - name: Configure test matrix
         run: |
-          packdev create-config
+          npx packdev@latest create-config
 
           # Configure UI library variant (git branches)
           if [ "${{ matrix.ui-variant }}" = "experimental" ]; then
-            packdev add ui-library https://github.com/org/ui-library.git#experimental
+            npx packdev@latest add ui-library https://github.com/org/ui-library.git#experimental
           else
-            packdev add ui-library https://github.com/org/ui-library.git#stable
+            npx packdev@latest add ui-library https://github.com/org/ui-library.git#stable
           fi
 
           # Configure utils library variant (published release versions)
           if [ "${{ matrix.utils-variant }}" = "v2" ]; then
-            packdev add utils-library ^2.0.0
+            npx packdev@latest add utils-library ^2.0.0
           else
-            packdev add utils-library ^1.0.0
+            npx packdev@latest add utils-library ^1.0.0
           fi
 
-          # Apply configuration
-          packdev init
-
-      - name: Install dependencies (handled by packdev init)
-        run: echo "Dependencies installed by packdev init"
+          # Applies the config and installs dependencies
+          npx packdev@latest init
 
       - name: Run tests
         run: npm test

@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { spawn } from "child_process";
+import { resolveLocalPackage } from "./utils";
 
 // Types for configuration and package management
 export interface PackdevDependency {
@@ -16,6 +17,9 @@ export interface PackdevConfig {
   created: string;
   lastModified?: string;
   autoCommitFlow?: boolean;
+  // Per-dependency watch/build override for `packdev watch`, e.g.
+  // { "my-utils": { "build": "npm run build", "ignore": ["dist"] } }
+  watch?: Record<string, { build?: string; ignore?: string[] }>;
 }
 
 export interface PackageJson {
@@ -55,6 +59,11 @@ export interface AddDependencyResult {
   version?: string;
 }
 
+export interface LinkDependencyResult extends AddDependencyResult {
+  location?: string;
+  candidates?: string[];
+}
+
 export interface RemoveDependencyResult {
   success: boolean;
   error?: string;
@@ -71,6 +80,7 @@ export interface ValidationResult {
   configExists: boolean;
   packageJsonExists: boolean;
   isInDevMode: boolean;
+  hasStaleBackup: boolean;
   dependencies: PackdevDependency[];
   issues: string[];
 }
@@ -79,6 +89,19 @@ export interface SetupHooksResult {
   success: boolean;
   error?: string;
   message?: string;
+}
+
+export interface RestoreResult {
+  success: boolean;
+  error?: string;
+  restored: boolean;
+}
+
+const BACKUP_FILE = ".packdev.backup.json";
+
+interface PackageJsonBackup {
+  timestamp: string;
+  packageJson: PackageJson;
 }
 
 interface PackageManagerInfo {
@@ -103,14 +126,27 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 async function detectPackageManager(): Promise<PackageManagerInfo> {
-  // Check for lock files to determine package manager
-  if (await fileExists("pnpm-lock.yaml")) {
-    return { manager: "pnpm", lockFile: "pnpm-lock.yaml" };
+  // Search upward from cwd so this still resolves correctly when run inside
+  // a monorepo workspace child, where the lockfile lives at the repo root
+  // rather than next to the child's package.json.
+  let dir = process.cwd();
+  for (;;) {
+    if (await fileExists(path.join(dir, "pnpm-lock.yaml"))) {
+      return { manager: "pnpm", lockFile: "pnpm-lock.yaml" };
+    }
+    if (await fileExists(path.join(dir, "yarn.lock"))) {
+      return { manager: "yarn", lockFile: "yarn.lock" };
+    }
+    if (await fileExists(path.join(dir, "package-lock.json"))) {
+      return { manager: "npm", lockFile: "package-lock.json" };
+    }
+
+    const parentDir = path.dirname(dir);
+    if (parentDir === dir) break;
+    dir = parentDir;
   }
-  if (await fileExists("yarn.lock")) {
-    return { manager: "yarn", lockFile: "yarn.lock" };
-  }
-  // Default to npm (package-lock.json may or may not exist)
+
+  // Default to npm if no lockfile was found anywhere up the tree.
   return { manager: "npm", lockFile: "package-lock.json" };
 }
 
@@ -306,12 +342,87 @@ export async function loadPackageJson(): Promise<PackageJson | null> {
 }
 
 export async function savePackageJson(packageJson: PackageJson): Promise<void> {
-  await writeJsonFile("package.json", packageJson);
+  await writeJsonFileAtomic("package.json", packageJson);
+}
+
+async function writeJsonFileAtomic<T>(
+  filePath: string,
+  data: T,
+): Promise<void> {
+  const tmpPath = `${filePath}.tmp`;
+  const content = JSON.stringify(data, null, 2);
+  await fs.writeFile(tmpPath, content, "utf-8");
+  await fs.rename(tmpPath, filePath);
+}
+
+async function hasBackup(): Promise<boolean> {
+  return fileExists(BACKUP_FILE);
+}
+
+async function createBackupIfMissing(packageJson: PackageJson): Promise<void> {
+  if (await hasBackup()) {
+    return;
+  }
+  const backup: PackageJsonBackup = {
+    timestamp: new Date().toISOString(),
+    packageJson,
+  };
+  await writeJsonFileAtomic(BACKUP_FILE, backup);
+}
+
+async function clearBackup(): Promise<void> {
+  if (await fileExists(BACKUP_FILE)) {
+    await fs.unlink(BACKUP_FILE);
+  }
+}
+
+/**
+ * Restore package.json from the crash-safety backup created during init.
+ * Used to recover a half-mutated package.json after an interrupted init/finish.
+ */
+export async function restoreProject(): Promise<RestoreResult> {
+  try {
+    if (!(await hasBackup())) {
+      return {
+        success: true,
+        restored: false,
+        error: "No backup found, nothing to restore",
+      };
+    }
+
+    const backup = await readJsonFile<PackageJsonBackup>(BACKUP_FILE);
+    if (!backup) {
+      return {
+        success: false,
+        restored: false,
+        error: `Failed to read backup file ${BACKUP_FILE}`,
+      };
+    }
+
+    await writeJsonFileAtomic("package.json", backup.packageJson);
+    await clearBackup();
+
+    return { success: true, restored: true };
+  } catch (error) {
+    return {
+      success: false,
+      restored: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    };
+  }
+}
+
+/**
+ * Check whether a stale backup exists (e.g. from an interrupted session).
+ */
+export async function hasStaleBackup(): Promise<boolean> {
+  return hasBackup();
 }
 
 export async function initializeProject(
   configPath: string = ".packdev.json",
   autoInstall: boolean = true,
+  dryRun: boolean = false,
 ): Promise<InitResult> {
   try {
     // Check if config file exists
@@ -363,6 +474,11 @@ export async function initializeProject(
 
     let replacedCount = 0;
 
+    // Pristine snapshot for crash-safety backup, taken before any mutation.
+    const originalPackageJson: PackageJson = JSON.parse(
+      JSON.stringify(packageJson),
+    );
+
     // Replace versions with resolved locations (local or git)
     for (const dependency of config.dependencies) {
       const { package: packageName, location } = dependency;
@@ -374,7 +490,7 @@ export async function initializeProject(
       }
 
       const resolvedLocation = resolveLocation(location);
-      let wasReplaced = false;
+      let wasChanged = false;
 
       // Replace in dependencies
       if (packageJson.dependencies && packageJson.dependencies[packageName]) {
@@ -387,8 +503,8 @@ export async function initializeProject(
         ) {
           dependency.version = depVer;
         }
+        if (depVer !== resolvedLocation) wasChanged = true;
         packageJson.dependencies[packageName] = resolvedLocation;
-        wasReplaced = true;
       }
 
       // Replace in devDependencies
@@ -404,8 +520,8 @@ export async function initializeProject(
         ) {
           dependency.version = devDepVer;
         }
+        if (devDepVer !== resolvedLocation) wasChanged = true;
         packageJson.devDependencies[packageName] = resolvedLocation;
-        wasReplaced = true;
       }
 
       // Replace in peerDependencies
@@ -421,11 +537,14 @@ export async function initializeProject(
         ) {
           dependency.version = peerDepVer;
         }
+        if (peerDepVer !== resolvedLocation) wasChanged = true;
         packageJson.peerDependencies[packageName] = resolvedLocation;
-        wasReplaced = true;
       }
 
-      if (wasReplaced) {
+      // Idempotency: only count/report dependencies whose value actually
+      // changed. Re-running init when already in dev mode is then a safe
+      // no-op (replacedCount 0) instead of double-reporting.
+      if (wasChanged) {
         replacedCount++;
         replacedPackages.push({
           name: packageName,
@@ -434,6 +553,18 @@ export async function initializeProject(
         });
       }
     }
+
+    if (dryRun) {
+      return {
+        success: true,
+        replacedCount,
+        replacedPackages,
+      };
+    }
+
+    // Snapshot pristine package.json before mutating, so a crash mid-init
+    // (or mid-install) can always be recovered with `packdev restore`.
+    await createBackupIfMissing(originalPackageJson);
 
     // Save updated config and package.json
     await saveConfig(configPath, config);
@@ -461,6 +592,7 @@ export async function initializeProject(
 export async function finishProject(
   configPath: string = ".packdev.json",
   autoInstall: boolean = true,
+  dryRun: boolean = false,
 ): Promise<FinishResult> {
   try {
     // Load config
@@ -553,8 +685,19 @@ export async function finishProject(
       }
     }
 
+    if (dryRun) {
+      return {
+        success: true,
+        restoredCount,
+        restoredPackages,
+      };
+    }
+
     // Save updated package.json
     await savePackageJson(packageJson);
+
+    // Dev session is closing cleanly; the crash-safety backup is no longer needed.
+    await clearBackup();
 
     // Auto-run install after restoring original versions
     const packageManagerInfo = await detectPackageManager();
@@ -581,6 +724,7 @@ export async function addLocalDependency(
   configPath: string = ".packdev.json",
   explicitVersion?: string,
   autoInstall: boolean = true,
+  dryRun: boolean = false,
 ): Promise<AddDependencyResult> {
   try {
     const dependencyType = detectDependencyType(location);
@@ -651,6 +795,13 @@ export async function addLocalDependency(
       type: dependencyType,
     });
 
+    if (dryRun) {
+      return {
+        success: true,
+        version,
+      };
+    }
+
     // Save config
     await saveConfig(configPath, config);
 
@@ -697,6 +848,58 @@ export async function addLocalDependency(
       success: true,
       version,
     };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    };
+  }
+}
+
+/**
+ * Auto-detect a local package's path by name (workspace member or sibling
+ * directory) and add it, without requiring the caller to know the path.
+ */
+export async function linkPackage(
+  packageName: string,
+  configPath: string = ".packdev.json",
+  explicitVersion?: string,
+  autoInstall: boolean = true,
+  dryRun: boolean = false,
+): Promise<LinkDependencyResult> {
+  try {
+    const matches = await resolveLocalPackage(packageName);
+
+    if (matches.length === 0) {
+      return {
+        success: false,
+        error: `No local package named '${packageName}' found in workspaces or sibling directories. Use 'packdev add ${packageName} <path>' to specify the path manually.`,
+      };
+    }
+
+    if (matches.length > 1) {
+      return {
+        success: false,
+        error: `Multiple packages named '${packageName}' found. Use 'packdev add ${packageName} <path>' to pick one.`,
+        candidates: matches.map((m) => m.dir),
+      };
+    }
+
+    const location = path.relative(process.cwd(), matches[0]!.dir) || ".";
+    const relativeLocation = location.startsWith(".")
+      ? location
+      : `./${location}`;
+
+    const result = await addLocalDependency(
+      packageName,
+      relativeLocation,
+      configPath,
+      explicitVersion,
+      autoInstall,
+      dryRun,
+    );
+
+    return { ...result, location: relativeLocation };
   } catch (error) {
     return {
       success: false,
@@ -780,6 +983,7 @@ export async function validateProject(
     configExists: false,
     packageJsonExists: false,
     isInDevMode: false,
+    hasStaleBackup: false,
     dependencies: [],
     issues: [],
   };
@@ -790,6 +994,13 @@ export async function validateProject(
 
     // Check package.json
     result.packageJsonExists = await fileExists("package.json");
+
+    result.hasStaleBackup = await hasBackup();
+    if (result.hasStaleBackup) {
+      result.issues.push(
+        `Stale backup detected (${BACKUP_FILE}) — a previous session may have been interrupted. Run 'packdev restore' to recover the original package.json.`,
+      );
+    }
 
     if (!result.packageJsonExists) {
       result.isValid = false;
@@ -875,7 +1086,7 @@ export async function setupGitHooks(
 
     // Save autoCommitFlow preference to config if not disabling
     if (!disable) {
-      let config = await loadConfig(configPath);
+      const config = await loadConfig(configPath);
       if (config) {
         // Only set autoCommitFlow if explicitly true, otherwise preserve existing value
         if (autoCommitFlow === true) {
@@ -1086,7 +1297,7 @@ function isWipFromGitProcess() {
         stdio: 'pipe'
       }).trim();
 
-      if (cmdline && /git\s+commit.*-m\s*["'].*\bwip\b/i.test(cmdline)) {
+      if (cmdline && /git\\s+commit.*-m\\s*["'].*\\bwip\\b/i.test(cmdline)) {
         return true;
       }
     }

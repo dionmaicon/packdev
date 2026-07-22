@@ -61,7 +61,7 @@ export function validatePackageName(name: string): boolean {
 }
 
 export function formatPackageName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9@\-._~\/]/g, "-");
+  return name.toLowerCase().replace(/[^a-z0-9@\-._~/]/g, "-");
 }
 
 export function extractPackageScope(name: string): {
@@ -245,6 +245,156 @@ export function isDevelopmentDependency(version: string): boolean {
   );
 }
 
+// Workspace / monorepo discovery utilities
+export interface WorkspacePackage {
+  name: string;
+  dir: string;
+}
+
+async function readPnpmWorkspaceGlobs(rootDir: string): Promise<string[]> {
+  const filePath = path.join(rootDir, "pnpm-workspace.yaml");
+  if (!(await fileExists(filePath))) {
+    return [];
+  }
+
+  const content = await fs.readFile(filePath, "utf-8");
+  const lines = content.split(/\r?\n/);
+  const globs: string[] = [];
+  let inPackages = false;
+
+  for (const line of lines) {
+    if (/^packages:\s*$/.test(line.trim())) {
+      inPackages = true;
+      continue;
+    }
+    if (!inPackages) continue;
+
+    const match = line.match(/^\s*-\s*['"]?([^'"]+)['"]?\s*$/);
+    if (match && match[1]) {
+      globs.push(match[1]);
+    } else if (line.trim() !== "") {
+      inPackages = false;
+    }
+  }
+
+  return globs;
+}
+
+// Expands a single-level glob like "packages/*" into concrete directories.
+// Patterns without "*" are treated as a literal directory.
+async function expandWorkspaceGlob(
+  rootDir: string,
+  pattern: string,
+): Promise<string[]> {
+  const starIndex = pattern.indexOf("*");
+  if (starIndex === -1) {
+    return [path.join(rootDir, pattern)];
+  }
+
+  const baseDir = path.join(rootDir, pattern.slice(0, starIndex));
+  if (!(await isDirectory(baseDir))) {
+    return [];
+  }
+
+  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(baseDir, entry.name));
+}
+
+/**
+ * Discover named packages declared via npm/yarn "workspaces" in package.json
+ * or a pnpm-workspace.yaml file at the given root.
+ */
+export async function discoverWorkspacePackages(
+  rootDir: string = ".",
+): Promise<WorkspacePackage[]> {
+  const results: WorkspacePackage[] = [];
+  const seenDirs = new Set<string>();
+
+  let globs: string[] = [];
+  const rootPkg = await readJsonFile<{
+    workspaces?: string[] | { packages?: string[] };
+  }>(path.join(rootDir, "package.json"));
+
+  if (rootPkg?.workspaces) {
+    globs = Array.isArray(rootPkg.workspaces)
+      ? rootPkg.workspaces
+      : rootPkg.workspaces.packages || [];
+  }
+
+  if (globs.length === 0) {
+    globs = await readPnpmWorkspaceGlobs(rootDir);
+  }
+
+  for (const pattern of globs) {
+    const dirs = await expandWorkspaceGlob(rootDir, pattern);
+    for (const dir of dirs) {
+      if (seenDirs.has(dir)) continue;
+      const pkg = await readJsonFile<PackageInfo>(
+        path.join(dir, "package.json"),
+      );
+      if (pkg?.name) {
+        seenDirs.add(dir);
+        results.push({ name: pkg.name, dir });
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Discover named packages in sibling directories of the given root
+ * (e.g. `../my-utils` next to the current project).
+ */
+export async function discoverSiblingPackages(
+  rootDir: string = ".",
+): Promise<WorkspacePackage[]> {
+  const parentDir = path.resolve(rootDir, "..");
+  const results: WorkspacePackage[] = [];
+
+  if (!(await isDirectory(parentDir))) {
+    return results;
+  }
+
+  const entries = await fs.readdir(parentDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(parentDir, entry.name);
+    if (path.resolve(dir) === path.resolve(rootDir)) continue;
+
+    const pkg = await readJsonFile<PackageInfo>(
+      path.join(dir, "package.json"),
+    );
+    if (pkg?.name) {
+      results.push({ name: pkg.name, dir });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Resolve a package name to a local directory by checking workspaces first,
+ * then sibling directories. Returns all matches found (empty, one, or many).
+ */
+export async function resolveLocalPackage(
+  packageName: string,
+  rootDir: string = ".",
+): Promise<WorkspacePackage[]> {
+  const workspaceMatches = (
+    await discoverWorkspacePackages(rootDir)
+  ).filter((pkg) => pkg.name === packageName);
+  if (workspaceMatches.length > 0) {
+    return workspaceMatches;
+  }
+
+  return (await discoverSiblingPackages(rootDir)).filter(
+    (pkg) => pkg.name === packageName,
+  );
+}
+
 // Array and object utilities
 export function groupBy<T, K extends string | number | symbol>(
   array: T[],
@@ -349,7 +499,7 @@ export function deepMerge<T extends Record<string, any>>(
   const result = { ...target } as any;
 
   for (const key in source) {
-    if (source.hasOwnProperty(key)) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
       const sourceValue = source[key];
       const targetValue = result[key];
 

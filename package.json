@@ -20,7 +20,7 @@
     "test:unit-only": "cd test && node run-all-tests.js --unit-only",
     "test-demo": "cd test && npm test",
     "typecheck": "tsc --noEmit",
-    "lint": "echo \"No linter configured yet\"",
+    "lint": "eslint src",
     "prepare": "npm run build",
     "pack": "node scripts/pack.js",
     "pack:bash": "scripts/pack.sh",
@@ -38,8 +38,16 @@
     "package",
     "tools"
   ],
-  "author": "",
+  "author": "Dion",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dionmaicon/packdev.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dionmaicon/packdev/issues"
+  },
+  "homepage": "https://github.com/dionmaicon/packdev#readme",
   "files": [
     "dist/**/*.js",
     "dist/**/*.d.ts",
@@ -48,13 +56,16 @@
     "LICENSE.md"
   ],
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/commander": "^2.12.0",
     "@types/node": "^24.5.2",
+    "eslint": "^9.39.5",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
     "commander": "^14.0.1"
