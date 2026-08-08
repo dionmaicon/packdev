@@ -254,6 +254,27 @@ esac
 
 Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.json not found. Add `--dry-run` to any of `init`/`finish`/`add`/`link` to preview changes safely.
 
+### Example 8: API Compatibility Checking
+
+Before upgrading a dependency (or letting an LLM assume an API exists), check what's actually there — cheap static checks first, expensive real ones only on the survivors:
+
+```bash
+# 1. Static, no install: which versions have every symbol my app imports?
+packdev api-diff is-odd --range ">=0.1.0 <4.0.0" --json
+# {"minimumCompatibleVersion":"0.1.0","recommendedVersion":"3.0.1", ...}
+
+# 2. Real install + real test run, only on the range that passed step 1:
+packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
+# {"minimumCompatibleVersion":"2.0.0","recommendedVersion":"3.0.1", ...}
+# apiCompatible (step 1) and PASSED (step 2) are different claims — shape match ≠ behavior match
+
+# 3. Suspect instanceof/DI weirdness from a hoisting mismatch?
+packdev dupes is-odd --json
+# {"duplicate":false,"resolutions":[{"path":"node_modules/is-odd","version":"3.0.1"}]}
+```
+
+📖 **[Full API Compatibility Guide →](docs/API-COMPATIBILITY.md)** — decision table, every flag, real captured output, exit codes, and agent/scripting notes.
+
 ## 🛡️ Safety Features
 
 - **Auto-backup**: Original package.json preserved before changes
@@ -268,6 +289,7 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 
 - **[Quick Start Guide](docs/QUICK-START.md)** - Get up and running in 5 minutes
 - **[Workflow & Best Practices](docs/WORKFLOW.md)** - Team collaboration, CI/CD, safety
+- **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, flags, real output, agent notes
 - **[Git Hooks](docs/GITHUB-HOOKS.md)** - Auto-commit protection and safety checks
 - **[Packaging Guide](docs/PACKAGING.md)** - Building, testing, and distributing
 - **[Yarn Support](docs/YARN-SUPPORT.md)** - Using PackDev with Yarn
@@ -289,11 +311,17 @@ packdev status                               # Check current mode
 packdev list                                 # Show all tracked dependencies
 packdev restore                              # Recover package.json from backup after a crash
 packdev setup-hooks                          # Install git safety hooks
+
+# API compatibility — what's actually there, before you or an LLM assume it
+packdev api <pkg>                            # Show the export map of the installed version (--introspect for pure-JS fallback)
+packdev api-diff <pkg> --range <semver>      # Which published versions satisfy what your app imports (static, no install)
+packdev compat <pkg> --test <cmd>            # Does your real test suite pass against a candidate version (sandboxed install)
+packdev dupes <pkg>                          # Find every distinct copy of a package resolved in the tree
 ```
 
 **Flags**: `--json` (global — machine-readable output + stable exit codes); `--dry-run` and `--no-install` on `init`/`finish`/`add`/`link` (preview without writing / skip the package-manager install).
 
-📖 **[Complete Command Reference →](docs/QUICK-START.md#-essential-commands)**
+📖 **[Complete Command Reference →](docs/QUICK-START.md#-essential-commands)** · 📖 **[API Compatibility Guide →](docs/API-COMPATIBILITY.md)**
 
 ## 🤝 Contributing
 

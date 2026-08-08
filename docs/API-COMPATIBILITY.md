@@ -1,0 +1,180 @@
+# API Compatibility Guide
+
+Four commands that answer "what's actually there" at increasing levels of confidence and cost — `api`, `api-diff`, `compat`, and `dupes`. They exist because LLMs and humans alike hallucinate methods that don't exist in the version actually resolved in a project (classic multi-package monorepo situation, e.g. NestJS's `@nestjs/*` family pinned to different versions across apps), and that isn't caught until CI or runtime.
+
+## 🧭 Which command do I need?
+
+| Question | Command |
+|---|---|
+| What can I call on the version I have installed right now? | `packdev api <pkg>` |
+| Which published versions have every symbol my app actually imports? (fast, no install) | `packdev api-diff <pkg> --range <semver>` |
+| Does my real test suite actually pass against a candidate version? (slower, real install) | `packdev compat <pkg> --test <cmd>` |
+| Is a weird `instanceof`/DI bug caused by two copies of the same package in the tree? | `packdev dupes <pkg>` |
+
+**Start with `api-diff` before reaching for `compat`.** `api-diff` never installs anything — it downloads a tarball, reads its `.d.ts`, and diffs it against what your app actually imports — so checking a 10-version range costs about the same as checking one. `compat` does a real install + real test run per version, which is correct but slow. Use `api-diff` to narrow a range down first, then `compat` to actually confirm the survivors.
+
+### `apiCompatible` and `PASSED`/`FAILED` are never the same claim
+
+`api-diff`'s `apiCompatible` means "the exported shape matches" — pure static analysis. `compat`'s `PASSED`/`FAILED` means "the real test suite actually ran and passed" — real behavior. **A version can be `apiCompatible: true` and still `FAILED`** — same function signature, different runtime behavior (a classic breaking change that doesn't show up in types). Neither command claims what the other checks; don't conflate them. Minimal illustration (same target version, both commands run against it):
+
+```json
+// api-diff — same export shape as before, looks fine statically
+{ "version": "1.0.0", "apiCompatible": true, "missingSymbols": [] }
+
+// compat — the real test suite actually caught a behavior change
+{ "version": "1.0.0", "status": "FAILED" }
+```
+
+## 📦 `packdev api <pkg>`
+
+Shows the export map of whatever version of `<pkg>` is currently resolved in `node_modules` — functions, classes, interfaces, types, with signatures.
+
+```bash
+packdev api commander --json
+```
+```json
+{
+  "command": "api", "package": "commander", "version": "14.0.1",
+  "resolvedPath": "/…/node_modules/commander", "hasTypes": true,
+  "exports": [
+    { "name": "createCommand", "kind": "function", "signature": "(name?: string): Command", "subpath": "." },
+    { "name": "CommanderError", "kind": "class", "signature": "CommanderError", "subpath": "." },
+    { "name": "Command", "kind": "class", "signature": "Command", "subpath": "." }
+  ]
+}
+```
+
+| Flag | Purpose |
+|---|---|
+| `--introspect` | Fall back to executing the package and reflecting its **runtime** shape, but only when no static types were found anywhere. See below. |
+| `--introspect-timeout-ms <n>` | Timeout for `--introspect` (default `5000`). |
+
+**Resolution order**: conditional `"exports"` map → `"types"`/`"typings"` fields → `main` with `.js`→`.d.ts` swapped → a sibling `@types/<pkg>` package. If `"exports"` declares subpaths beyond the root (`./testing`, `./utils`, ...), those are resolved too and each entry is tagged `"subpath"` (`"."` for the root). A package published for both CJS and ESM (dual entry points) will legitimately show near-duplicate entries with different `subpath` values — that's real, not a bug.
+
+`export = X` (TypeScript's CommonJS export-assignment syntax, common in older `@types/*` packages) is resolved and reported as `"default"`, matching how `import X from "pkg"` is recorded elsewhere in this tool family.
+
+**`hasTypes: false`** means no static declarations were found anywhere (a valid, honest outcome for a pure-JS package, not an error). Optionally recover partial information with `--introspect`:
+
+```bash
+packdev api pure-js-lib --introspect --json
+```
+```json
+{
+  "hasTypes": false, "exports": [],
+  "runtimeIntrospection": {
+    "exports": [
+      { "name": "Widget", "kind": "class", "signature": "(0 args)", "members": ["render", "destroy"] },
+      { "name": "createWidget", "kind": "function", "signature": "(1 args)" }
+    ]
+  }
+}
+```
+
+`--introspect` **executes the installed package's real code** in an isolated, timeout-bounded child process to walk its prototype chain (a plain `Object.keys()` on a class instance misses methods — they live on `.prototype`). It's opt-in only, never automatic, and clearly separated from static output (`runtimeIntrospection` is `null` unless the flag is passed and static resolution found nothing) — don't reach for it by default against untrusted packages.
+
+**Exit codes**: `0` success (including `hasTypes: false`), `4` package not installed anywhere up the `node_modules` tree.
+
+## 🔍 `packdev api-diff <pkg> --range <semver>`
+
+Scans your app's real imports of `<pkg>`, then checks every published version in `--range` against that usage — entirely statically, no install, no `node_modules` mutation.
+
+```bash
+packdev api-diff is-odd --range ">=0.1.0 <4.0.0" --app . --json
+```
+```json
+{
+  "command": "api-diff", "package": "is-odd", "range": ">=0.1.0 <4.0.0",
+  "usedSymbols": ["default"], "hasDynamicUsage": false,
+  "minimumCompatibleVersion": "0.1.0", "recommendedVersion": "3.0.1",
+  "versions": [
+    { "version": "0.1.0", "apiCompatible": true, "missingSymbols": [], "exportCount": 1, "typesSource": "types-package" },
+    { "version": "3.0.1", "apiCompatible": true, "missingSymbols": [], "exportCount": 1, "typesSource": "types-package" }
+  ]
+}
+```
+
+| Flag | Purpose |
+|---|---|
+| `--range <semver>` | **Required.** Version range to check, e.g. `">=1.0.0 <3.0.0"`. |
+| `--app <dir>` | App directory to scan for imports (default `.`). |
+| `--registry <url>` | npm registry URL (default `https://registry.npmjs.org`). |
+| `--include-prerelease` | Include prerelease versions (excluded by default). |
+| `--include-deprecated` | Include deprecated versions (excluded by default). |
+
+- `hasDynamicUsage: true` means the app uses a namespace import (`import * as x`) or a bare `require(pkg)` somewhere — those can't be statically resolved to specific symbols, so the usage check is only a partial guarantee for that app. It's surfaced, not silently ignored.
+- `typesSource` tells you where the types came from for that version: `"bundled"` (shipped with the package), `"types-package"` (fetched `@types/<pkg>` separately), or `"none"` (no types found anywhere — `missingSymbols` will include everything the app imports, since nothing could be verified).
+- `usedSymbols: []` (app never imports the package) makes every version trivially `apiCompatible: true` — nothing to miss.
+
+**Exit codes**: `0` success, `1` generic error (invalid range, registry unreachable, etc.).
+
+## 🧪 `packdev compat <pkg> --test <cmd>`
+
+For each candidate version: copies your app into an isolated sandbox, pins the version, runs a real install, runs your real test command, records the result, discards the sandbox. Never touches the real project.
+
+```bash
+packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
+```
+```json
+{
+  "command": "compat", "package": "is-odd",
+  "minimumCompatibleVersion": "2.0.0", "recommendedVersion": "3.0.1", "nonMonotonic": false,
+  "versions": [
+    { "version": "2.0.0", "status": "PASSED", "exitCode": 0, "durationMs": 920,
+      "lockfileHash": "9dc1ee7f…", "lockfileSnapshotPath": "/tmp/packdev-compat-snapshots-.../is-odd-2.0.0-npm-package-lock.json" },
+    { "version": "3.0.1", "status": "PASSED", "exitCode": 0, "durationMs": 630,
+      "lockfileHash": "394e9906…", "lockfileSnapshotPath": "/tmp/packdev-compat-snapshots-.../is-odd-3.0.1-npm-package-lock.json" }
+  ],
+  "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1
+}
+```
+
+| Flag | Purpose |
+|---|---|
+| `--test <cmd>` | **Required.** Command to run in each sandbox, e.g. `"npm test"`. |
+| `--range <semver>` / `--versions <list>` | Mutually exclusive — a registry range, or an explicit comma-separated list. |
+| `--app <dir>`, `--registry <url>`, `--include-prerelease`, `--include-deprecated` | Same meaning as `api-diff`. |
+| `--bisect` | Binary-search the pass/fail boundary instead of testing every version (fewer runs). Re-confirms the boundary once to catch flakiness/non-monotonicity, falling back to a full linear scan if the confirmation disagrees — never trusts a fast-but-wrong answer. |
+| `--group <pkgs>` | Comma-separated peer packages to pin to the **same** version as `<pkg>` in every run (NestJS's `@nestjs/*` family, or any set that must move in lockstep). Without this, only `<pkg>` moves — its declared peers stay wherever your `package.json` already has them, which usually isn't a combination anyone actually ships. |
+| `--snapshot-dir <dir>` | Save a hashed copy of each version's resolved lockfile — the target version pins exactly, but its *own* dependencies still resolve by range, so the same target version can mean a different dependency tree across two runs. Point repeated runs at the same directory to build a diffable history. |
+| `--concurrency <n>` | Test up to `n` versions in parallel (linear scan only — `--bisect`'s binary search is inherently sequential, this is a documented no-op there). |
+| `--prefer-offline` | Pass `--prefer-offline` through to the sandbox's package manager install. |
+
+- `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem).
+- `nonMonotonic: true` (linear scan only) means a fail sits between two passes in version order — the assumption `--bisect` relies on doesn't hold for this package; test individually or accept the slower full scan.
+- Exact reproduction: `snapshotDir` + `lockfileSnapshotPath` per version are always present (auto-generated if `--snapshot-dir` wasn't passed) — diff two runs' snapshot files for the same version to see exactly what changed.
+
+**Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.).
+
+## 🧬 `packdev dupes <pkg>`
+
+Walks the real `node_modules` tree (not the declared dependency graph) for every distinct place `<pkg>` actually resolves — the thing that breaks `instanceof` checks and DI singletons when hoisting goes wrong.
+
+```bash
+packdev dupes commander --json
+# {"command":"dupes","package":"commander","duplicate":false,"resolutions":[{"path":"node_modules/commander","version":"14.0.1"}]}
+```
+
+Three honest outcomes, all exit `0` — this is a diagnostic, not a pass/fail check:
+
+| `resolutions` | `duplicate` | Meaning |
+|---|---|---|
+| One entry | `false` | Single resolution — nothing to worry about. |
+| 2+ entries, different versions | `true` | Real duplication — `instanceof`/DI singletons may break across the copies. |
+| `[]` | `false` | Not installed anywhere in the tree (not an error). |
+
+`--root <dir>` sets the search root (default `.`).
+
+## Exit codes (all four commands)
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` resolutions). |
+| `1` | Generic error — see the `error` field in `--json` output for the actual message. |
+| `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
+
+## 🤖 Agent/scripting notes
+
+- Always pass `--json` — every report includes a `command` field, so combined/piped output from multiple invocations stays disambiguable without re-parsing prose.
+- Budget-conscious ordering: run `api-diff` first (cheap, no install) to narrow a version range down to plausible candidates, then `compat` (expensive, real installs) only on the survivors — don't run `compat --range` across a wide range as a first move.
+- `success: false` + a human-readable `error` string appears in every command's JSON on failure, in addition to the exit code — branch on either, but the exit code is the stable contract across versions.
+- `--introspect` executes third-party code. Treat it the same as running the package's own code directly — don't enable it by default in an automated pipeline against untrusted packages.

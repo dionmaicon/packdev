@@ -14,6 +14,10 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 - **[Packaging Guide](./PACKAGING.md)** - Building, packaging, and distribution
 - **[Yarn Support](./YARN-SUPPORT.md)** - Comprehensive Yarn package manager guide
 
+### 🔬 API Compatibility
+
+- **[API Compatibility Guide](./API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, full flag reference, agent/scripting notes
+
 ### 🛡️ Safety & Security
 
 - **[GitHub Hooks](./GITHUB-HOOKS.md)** - Pre-commit safety hooks to prevent accidental commits
@@ -26,6 +30,7 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 |--------------|----------------|
 | **Get started quickly** | [Main README](../README.md) |
 | **Understand the workflow** | [Workflow Guide](./WORKFLOW.md) |
+| **Check API compatibility across versions** | [API Compatibility Guide](./API-COMPATIBILITY.md) |
 | **Package for distribution** | [Packaging Guide](./PACKAGING.md) |
 | **Use with Yarn** | [Yarn Support](./YARN-SUPPORT.md) |
 | **Prevent commit mistakes** | [GitHub Hooks](./GITHUB-HOOKS.md) |
@@ -40,6 +45,7 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 3. Set up [GitHub Hooks](./GITHUB-HOOKS.md) for safety
 
 **🔧 Experienced Users**
+- [API Compatibility Guide](./API-COMPATIBILITY.md) - Checking version compatibility before upgrading, catching hallucinated APIs
 - [Packaging Guide](./PACKAGING.md) - Distribution and advanced packaging
 - [Yarn Support](./YARN-SUPPORT.md) - Yarn-specific workflows and optimizations
 
@@ -60,6 +66,12 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 - **Contains**: Init/finish cycles, configuration persistence, team collaboration
 - **Audience**: All users, especially teams
 - **Key Topics**: Configuration persistence, safety features, advanced workflows
+
+### [API Compatibility Guide](./API-COMPATIBILITY.md) (180 lines)
+- **Purpose**: Checking API/behavioral compatibility across published versions before upgrading
+- **Contains**: `api`/`api-diff`/`compat`/`dupes` command reference, decision table, real captured output, exit codes
+- **Audience**: All users, especially those scripting or using coding agents
+- **Key Topics**: Static vs runtime compatibility checks, lockfile drift auditing, peer-group version pinning
 
 ### [Packaging Guide](./PACKAGING.md) (316+ lines)
 - **Purpose**: Building and distributing packages
@@ -158,6 +170,7 @@ yarn add file:./package.tgz
 | `packdev remove` | [Main README](../README.md) | [Workflow Guide](./WORKFLOW.md) |
 | `packdev setup-hooks` | [GitHub Hooks](./GITHUB-HOOKS.md) | [Main README](../README.md) |
 | `packdev status` | [Main README](../README.md) | [Workflow Guide](./WORKFLOW.md) |
+| `packdev api` / `api-diff` / `compat` / `dupes` | [API Compatibility Guide](./API-COMPATIBILITY.md) | [Main README](../README.md) |
 
 ### Quick References
 
@@ -210,15 +223,16 @@ When updating documentation:
 
 ## 📊 Documentation Stats
 
-- **Total Documents**: 5 comprehensive guides
-- **Total Lines**: 1,900+ lines of documentation
-- **Coverage**: Complete workflow, packaging, safety, and package manager support
+- **Total Documents**: 6 comprehensive guides
+- **Total Lines**: 2,080+ lines of documentation
+- **Coverage**: Complete workflow, packaging, safety, package manager support, and API compatibility
 - **Maintenance**: Actively maintained and tested
 
 ## 🎉 Quick Links
 
 - 🏠 **[Project Home](../README.md)** - Start here
 - 🔄 **[Workflow](./WORKFLOW.md)** - Learn the development cycle  
+- 🔬 **[API Compatibility](./API-COMPATIBILITY.md)** - Check versions before upgrading
 - 📦 **[Packaging](./PACKAGING.md)** - Distribute your package
 - 🧶 **[Yarn](./YARN-SUPPORT.md)** - Yarn-specific guide
 - 🛡️ **[Safety](./GITHUB-HOOKS.md)** - Prevent mistakes
