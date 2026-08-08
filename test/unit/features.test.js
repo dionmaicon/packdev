@@ -447,6 +447,41 @@ class FeatureTests {
     });
   }
 
+  async testApiIncludesSubpathExports() {
+    await this.run('api includes exports from subpaths declared in the "exports" map', async () => {
+      const dir = this.tmp('api-subpath-exports');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'fake-lib',
+        {
+          name: 'fake-lib',
+          version: '1.0.0',
+          exports: {
+            '.': { types: './index.d.ts', default: './index.js' },
+            './testing': { types: './testing.d.ts', default: './testing.js' },
+          },
+        },
+        {
+          'index.js': 'module.exports = {};',
+          'index.d.ts': 'export function formatDate(input: string): string;',
+          'testing.js': 'module.exports = {};',
+          'testing.d.ts': 'export function mockThing(): void;',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'fake-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, true);
+      const root = json.exports.find((e) => e.name === 'formatDate');
+      const sub = json.exports.find((e) => e.name === 'mockThing');
+      assert.ok(root, 'expected formatDate from the root export');
+      assert.strictEqual(root.subpath, '.');
+      assert.ok(sub, 'expected mockThing from the ./testing subpath export');
+      assert.strictEqual(sub.subpath, './testing');
+    });
+  }
+
   async testApiNoTypesAvailable() {
     await this.run('api reports hasTypes:false for a pure-JS package', async () => {
       const dir = this.tmp('api-no-types');
@@ -748,6 +783,45 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'api-diff');
       assert.strictEqual(json.versions[0].typesSource, 'none');
+    });
+  }
+
+  async testApiDiffCountsSubpathExportsAsUsage() {
+    await this.run('api-diff resolves symbols imported from a package subpath, not just the root export', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib',
+          version: '1.0.0',
+          exports: {
+            '.': { types: './index.d.ts', default: './index.js' },
+            './testing': { types: './testing.d.ts', default: './testing.js' },
+          },
+        }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+        'testing.js': 'module.exports = {};',
+        'testing.d.ts': 'export function mockThing(): void;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-subpath-usage');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { mockThing } from "fake-lib/testing";\nmockThing();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.usedSymbols, ['mockThing']);
+      assert.strictEqual(
+        json.versions[0].apiCompatible,
+        true,
+        'mockThing is exported from the ./testing subpath and should not show up as missing',
+      );
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
     });
   }
 
@@ -1420,6 +1494,7 @@ class FeatureTests {
       await this.testApiHumanOutput();
       await this.testApiJsonShape();
       await this.testApiExportsMapResolution();
+      await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
       await this.testApiPackageNotInstalled();
       await this.testApiHoistedResolution();
@@ -1432,6 +1507,7 @@ class FeatureTests {
       await this.testApiDiffCleansUpTempDirs();
       await this.testApiDiffFallsBackToTypesPackage();
       await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
+      await this.testApiDiffCountsSubpathExportsAsUsage();
       await this.testCompatPassFailPerVersion();
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatCleansUpSandboxOnSuccess();

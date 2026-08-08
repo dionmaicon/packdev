@@ -29,6 +29,10 @@ export interface ExportedSymbol {
   signature: string;
 }
 
+export interface ExportedSymbolWithSubpath extends ExportedSymbol {
+  subpath: string;
+}
+
 /**
  * Walk up from `fromDir` through `node_modules/<pkgName>` directories,
  * mirroring Node's own resolution algorithm so hoisted packages (installed
@@ -135,6 +139,71 @@ export async function resolveEntryPoint(
   }
 
   return { jsPath, typesPath };
+}
+
+// Every subpath key in a package.json "exports" map besides the root "."
+// entry, e.g. "./testing", "./utils" — packages commonly ship types for
+// these separately from the main entry point (framework testing helpers,
+// alternate builds), and resolveEntryPoint above only ever resolves ".".
+export function listExportsSubpaths(packageInfo: PackageInfo): string[] {
+  const exportsField = packageInfo.exports;
+  if (
+    !exportsField ||
+    typeof exportsField !== "object" ||
+    Array.isArray(exportsField)
+  ) {
+    return [];
+  }
+  return Object.keys(exportsField as Record<string, unknown>).filter(
+    (key) => key.startsWith("./") && key !== "./package.json",
+  );
+}
+
+async function resolveSubpathTypesPath(
+  pkgDir: string,
+  packageInfo: PackageInfo,
+  subpath: string,
+): Promise<string | null> {
+  const exportsField = packageInfo.exports as Record<string, unknown>;
+  const condition = findTypesCondition(exportsField[subpath]);
+  if (!condition) return null;
+  const absolute = path.join(pkgDir, condition);
+  return (await fileExists(absolute)) ? absolute : null;
+}
+
+/**
+ * Resolve the full export map for a package: the root "." entry (via
+ * resolveEntryPoint's existing conditional-exports/types/typings/main-swap/
+ * @types fallback chain) plus every subpath declared in its "exports" map,
+ * merged into one list tagged with the subpath each symbol came from.
+ * `hasTypes` is true when the root or any subpath resolved to a real .d.ts
+ * file, regardless of whether that file happened to export zero symbols.
+ */
+export async function resolvePackageExportMap(
+  pkgDir: string,
+  packageInfo: PackageInfo,
+): Promise<{ hasTypes: boolean; exports: ExportedSymbolWithSubpath[] }> {
+  const exports: ExportedSymbolWithSubpath[] = [];
+  let hasTypes = false;
+
+  const root = await resolveEntryPoint(pkgDir, packageInfo);
+  if (root.typesPath) {
+    hasTypes = true;
+    for (const symbol of extractExportMap(root.typesPath)) {
+      exports.push({ ...symbol, subpath: "." });
+    }
+  }
+
+  for (const subpath of listExportsSubpaths(packageInfo)) {
+    const typesPath = await resolveSubpathTypesPath(pkgDir, packageInfo, subpath);
+    if (!typesPath) continue;
+    hasTypes = true;
+    for (const symbol of extractExportMap(typesPath)) {
+      exports.push({ ...symbol, subpath });
+    }
+  }
+
+  return { hasTypes, exports };
 }
 
 function classifySymbol(symbol: ts.Symbol): ExportKind {

@@ -10,7 +10,7 @@
 
 import * as path from "path";
 import { readJsonFile, type PackageInfo } from "./utils";
-import { resolveEntryPoint, extractExportMap } from "./api";
+import { resolvePackageExportMap, type ExportedSymbolWithSubpath } from "./api";
 import { scanImportedSymbols } from "./appScan";
 import {
   fetchPackageMetadata,
@@ -49,26 +49,28 @@ export interface ApiDiffOptions {
   includeDeprecated?: boolean;
 }
 
-interface ResolvedTypes {
-  typesPath: string | null;
+interface ResolvedExports {
+  exports: ExportedSymbolWithSubpath[];
   typesSource: TypesSource;
   extraCleanupDir?: string;
 }
 
-// Bundled types win when present. Otherwise, since the tarball was extracted
-// into an isolated temp dir with no node_modules tree, the local @types
-// sibling-lookup fallback used by Phase 1's resolveEntryPoint has nothing to
-// search — so fetch @types/<pkg> from the same registry instead.
-async function resolveTypesForVersion(
+// Bundled types (root export plus any subpath exports, e.g. pkg/testing) win
+// when present. Otherwise, since the tarball was extracted into an isolated
+// temp dir with no node_modules tree, the local @types sibling-lookup
+// fallback used by resolvePackageExportMap's root resolution has nothing to
+// search — so fetch @types/<pkg> from the same registry instead, and merge
+// its own root+subpath exports the same way.
+async function resolveExportsForVersion(
   pkgName: string,
   version: string,
   packageDir: string,
   packageInfo: PackageInfo,
   registryUrl: string,
-): Promise<ResolvedTypes> {
-  const bundled = await resolveEntryPoint(packageDir, packageInfo);
-  if (bundled.typesPath) {
-    return { typesPath: bundled.typesPath, typesSource: "bundled" };
+): Promise<ResolvedExports> {
+  const bundled = await resolvePackageExportMap(packageDir, packageInfo);
+  if (bundled.hasTypes) {
+    return { exports: bundled.exports, typesSource: "bundled" };
   }
 
   const typesMatch = await resolveTypesPackageTarball(
@@ -77,7 +79,7 @@ async function resolveTypesForVersion(
     registryUrl,
   );
   if (!typesMatch) {
-    return { typesPath: null, typesSource: "none" };
+    return { exports: [], typesSource: "none" };
   }
 
   const typesBuffer = await downloadTarball(typesMatch.tarball);
@@ -89,17 +91,17 @@ async function resolveTypesForVersion(
   );
   if (!typesPkgInfo) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { typesPath: null, typesSource: "none" };
+    return { exports: [], typesSource: "none" };
   }
 
-  const resolved = await resolveEntryPoint(typesPkgDir, typesPkgInfo);
-  if (!resolved.typesPath) {
+  const resolved = await resolvePackageExportMap(typesPkgDir, typesPkgInfo);
+  if (!resolved.hasTypes) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { typesPath: null, typesSource: "none" };
+    return { exports: [], typesSource: "none" };
   }
 
   return {
-    typesPath: resolved.typesPath,
+    exports: resolved.exports,
     typesSource: "types-package",
     extraCleanupDir: typesCleanupDir,
   };
@@ -130,7 +132,7 @@ async function diffOneVersion(
       );
     }
 
-    const resolved = await resolveTypesForVersion(
+    const resolved = await resolveExportsForVersion(
       pkgName,
       version,
       packageDir,
@@ -139,10 +141,7 @@ async function diffOneVersion(
     );
     extraCleanupDir = resolved.extraCleanupDir;
 
-    const exportsList = resolved.typesPath
-      ? extractExportMap(resolved.typesPath)
-      : [];
-    const exportedNames = new Set(exportsList.map((e) => e.name));
+    const exportedNames = new Set(resolved.exports.map((e) => e.name));
 
     const missingSymbols = [...usedSymbols].filter(
       (symbol) => !exportedNames.has(symbol),
@@ -150,7 +149,7 @@ async function diffOneVersion(
 
     return {
       missingSymbols,
-      exportCount: exportsList.length,
+      exportCount: resolved.exports.length,
       typesSource: resolved.typesSource,
     };
   } finally {

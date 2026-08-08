@@ -15,10 +15,9 @@ import {
 } from "./packageManager";
 import {
   resolveInstalledPackage,
-  resolveEntryPoint,
-  extractExportMap,
+  resolvePackageExportMap,
   getInstalledVersion,
-  type ExportedSymbol,
+  type ExportedSymbolWithSubpath,
 } from "./api";
 import { readJsonFile, groupBy, type PackageInfo } from "./utils";
 import { runApiDiff } from "./apiDiff";
@@ -65,7 +64,7 @@ function log(message: string): void {
   }
 }
 
-const EXPORT_KIND_LABELS: Record<ExportedSymbol["kind"], string> = {
+const EXPORT_KIND_LABELS: Record<ExportedSymbolWithSubpath["kind"], string> = {
   function: "Functions",
   class: "Classes",
   interface: "Interfaces",
@@ -75,17 +74,18 @@ const EXPORT_KIND_LABELS: Record<ExportedSymbol["kind"], string> = {
   const: "Constants",
 };
 
-function printExportsByKind(exportsList: ExportedSymbol[]): void {
+function printExportsByKind(exportsList: ExportedSymbolWithSubpath[]): void {
   const grouped = groupBy(exportsList, (item) => item.kind);
   for (const kind of Object.keys(
     EXPORT_KIND_LABELS,
-  ) as ExportedSymbol["kind"][]) {
+  ) as ExportedSymbolWithSubpath["kind"][]) {
     const items = grouped[kind];
     if (!items || items.length === 0) continue;
     console.log(`\n${EXPORT_KIND_LABELS[kind]}`);
     for (const item of items) {
       const suffix = item.signature ? `: ${item.signature}` : "";
-      console.log(`  ${item.name}${suffix}`);
+      const subpathTag = item.subpath !== "." ? ` [${item.subpath}]` : "";
+      console.log(`  ${item.name}${suffix}${subpathTag}`);
     }
   }
 }
@@ -407,12 +407,12 @@ program
         process.exit(EXIT_CODE.GENERIC_ERROR);
       }
 
-      const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+      const { hasTypes, exports: exportsList } = await resolvePackageExportMap(
+        pkgDir,
+        packageInfo,
+      );
       const version =
         (await getInstalledVersion(pkgDir)) || packageInfo.version;
-      const exportsList: ExportedSymbol[] = typesPath
-        ? extractExportMap(typesPath)
-        : [];
 
       output(
         {
@@ -420,12 +420,12 @@ program
           package: packageName,
           version,
           resolvedPath: pkgDir,
-          hasTypes: !!typesPath,
+          hasTypes,
           exports: exportsList,
         },
         () => {
           console.log(`📦 ${packageName}@${version} (resolved: ${pkgDir})`);
-          if (!typesPath) {
+          if (!hasTypes) {
             console.log(
               "\n⚠️  No type declarations found for this package (pure JS, or types could not be resolved).",
             );
