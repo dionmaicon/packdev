@@ -13,6 +13,15 @@ import {
   setupGitHooks,
   restoreProject,
 } from "./packageManager";
+import {
+  resolveInstalledPackage,
+  resolveEntryPoint,
+  extractExportMap,
+  getInstalledVersion,
+  type ExportedSymbol,
+} from "./api";
+import { readJsonFile, groupBy, type PackageInfo } from "./utils";
+import { runApiDiff } from "./apiDiff";
 
 const program = new Command();
 
@@ -43,6 +52,31 @@ function log(message: string): void {
   }
 }
 
+const EXPORT_KIND_LABELS: Record<ExportedSymbol["kind"], string> = {
+  function: "Functions",
+  class: "Classes",
+  interface: "Interfaces",
+  type: "Types",
+  enum: "Enums",
+  namespace: "Namespaces",
+  const: "Constants",
+};
+
+function printExportsByKind(exportsList: ExportedSymbol[]): void {
+  const grouped = groupBy(exportsList, (item) => item.kind);
+  for (const kind of Object.keys(
+    EXPORT_KIND_LABELS,
+  ) as ExportedSymbol["kind"][]) {
+    const items = grouped[kind];
+    if (!items || items.length === 0) continue;
+    console.log(`\n${EXPORT_KIND_LABELS[kind]}`);
+    for (const item of items) {
+      const suffix = item.signature ? `: ${item.signature}` : "";
+      console.log(`  ${item.name}${suffix}`);
+    }
+  }
+}
+
 // Stable exit codes so scripts/agents can branch on failure kind instead of
 // parsing prose. 0 always means success or a safe no-op.
 const EXIT_CODE = {
@@ -50,10 +84,14 @@ const EXIT_CODE = {
   GENERIC_ERROR: 1,
   CONFIG_NOT_FOUND: 2,
   PACKAGE_JSON_NOT_FOUND: 3,
+  PACKAGE_NOT_INSTALLED: 4,
 } as const;
 
 function exitCodeFor(error?: string): number {
   if (!error) return EXIT_CODE.GENERIC_ERROR;
+  if (/is not installed/i.test(error)) {
+    return EXIT_CODE.PACKAGE_NOT_INSTALLED;
+  }
   if (/configuration file .* not found/i.test(error)) {
     return EXIT_CODE.CONFIG_NOT_FOUND;
   }
@@ -321,6 +359,160 @@ program
       output(
         { command: "link", success: false, error: String(error) },
         () => console.error("❌ Error linking dependency:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
+    }
+  });
+
+program
+  .command("api")
+  .description(
+    "Show the export map of a package's currently-installed version",
+  )
+  .argument("<package>", "Package name to inspect")
+  .action(async (packageName: string) => {
+    try {
+      const pkgDir = await resolveInstalledPackage(packageName, process.cwd());
+      if (!pkgDir) {
+        const error = `Package "${packageName}" is not installed (searched node_modules up from ${process.cwd()})`;
+        output(
+          { command: "api", package: packageName, success: false, error },
+          () => console.error(`❌ ${error}`),
+        );
+        process.exit(exitCodeFor(error));
+      }
+
+      const packageInfo = await readJsonFile<PackageInfo>(
+        `${pkgDir}/package.json`,
+      );
+      if (!packageInfo) {
+        const error = `Invalid package.json in: ${pkgDir}`;
+        output(
+          { command: "api", package: packageName, success: false, error },
+          () => console.error(`❌ ${error}`),
+        );
+        process.exit(EXIT_CODE.GENERIC_ERROR);
+      }
+
+      const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+      const version =
+        (await getInstalledVersion(pkgDir)) || packageInfo.version;
+      const exportsList: ExportedSymbol[] = typesPath
+        ? extractExportMap(typesPath)
+        : [];
+
+      output(
+        {
+          command: "api",
+          package: packageName,
+          version,
+          resolvedPath: pkgDir,
+          hasTypes: !!typesPath,
+          exports: exportsList,
+        },
+        () => {
+          console.log(`📦 ${packageName}@${version} (resolved: ${pkgDir})`);
+          if (!typesPath) {
+            console.log(
+              "\n⚠️  No type declarations found for this package (pure JS, or types could not be resolved).",
+            );
+            return;
+          }
+          if (exportsList.length === 0) {
+            console.log("\n(no exported symbols found)");
+            return;
+          }
+          printExportsByKind(exportsList);
+        },
+      );
+    } catch (error) {
+      output(
+        {
+          command: "api",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error inspecting package:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
+    }
+  });
+
+program
+  .command("api-diff")
+  .description(
+    "Check which published versions of a package satisfy what the app actually imports from it (static, no install)",
+  )
+  .argument("<package>", "Package name to check")
+  .requiredOption(
+    "--range <semver>",
+    'Version range to check, e.g. ">=1.0.0 <3.0.0"',
+  )
+  .option("--app <dir>", "App directory to scan for usage", ".")
+  .option("--registry <url>", "npm registry URL", "https://registry.npmjs.org")
+  .option("--include-prerelease", "Include prerelease versions", false)
+  .option("--include-deprecated", "Include deprecated versions", false)
+  .action(async (packageName: string, options) => {
+    try {
+      const report = await runApiDiff(packageName, {
+        range: options.range,
+        appDir: options.app,
+        registryUrl: options.registry,
+        includePrerelease: !!options.includePrerelease,
+        includeDeprecated: !!options.includeDeprecated,
+      });
+
+      output({ command: "api-diff", ...report }, () => {
+        console.log(`📦 ${report.package} — range ${report.range}`);
+        console.log(
+          `🔎 Used symbols: ${report.usedSymbols.length > 0 ? report.usedSymbols.join(", ") : "(none found)"}`,
+        );
+        if (report.hasDynamicUsage) {
+          console.log(
+            "⚠️  Dynamic usage detected (namespace import or bare require) — usage could not be fully verified statically.",
+          );
+        }
+
+        console.log("");
+        for (const v of report.versions) {
+          const mark = v.apiCompatible ? "✅" : "❌";
+          const detail = v.apiCompatible
+            ? ""
+            : ` (missing: ${v.missingSymbols.join(", ")})`;
+          const typesNote =
+            v.typesSource === "none"
+              ? " [no type declarations found — bundled or via @types]"
+              : v.typesSource === "types-package"
+                ? " [types via @types package]"
+                : "";
+          console.log(`  ${mark} ${v.version}${detail}${typesNote}`);
+        }
+
+        console.log("");
+        if (report.minimumCompatibleVersion) {
+          console.log(
+            `💡 Minimum compatible version: ${report.minimumCompatibleVersion}`,
+          );
+        }
+        if (report.recommendedVersion) {
+          console.log(`💡 Recommended version: ${report.recommendedVersion}`);
+        }
+        if (!report.minimumCompatibleVersion) {
+          console.log(
+            "⚠️  No version in range satisfies the app's current usage.",
+          );
+        }
+      });
+    } catch (error) {
+      output(
+        {
+          command: "api-diff",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error running api-diff:", error),
       );
       process.exit(EXIT_CODE.GENERIC_ERROR);
     }

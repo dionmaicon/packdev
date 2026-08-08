@@ -15,7 +15,9 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const http = require('http');
 const { spawn } = require('child_process');
+const tar = require('tar');
 
 const BINARY_PATH = path.join(__dirname, '../../dist/index.js');
 
@@ -58,6 +60,85 @@ function makeTmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `packdev-${prefix}-`));
 }
 
+// Write a fake installed package under `<baseDir>/node_modules/<pkgName>`,
+// with the given package.json contents plus a map of relative-path -> file
+// content (e.g. { 'index.d.ts': 'export function foo(): void;' }).
+function writeNodeModulesPackage(baseDir, pkgName, pkgJson, files = {}) {
+  const pkgDir = path.join(baseDir, 'node_modules', pkgName);
+  fs.mkdirSync(pkgDir, { recursive: true });
+  writeJson(path.join(pkgDir, 'package.json'), pkgJson);
+  for (const [relPath, content] of Object.entries(files)) {
+    const filePath = path.join(pkgDir, relPath);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content);
+  }
+  return pkgDir;
+}
+
+// Pack `files` (relative-path -> content) into an in-memory .tgz buffer
+// rooted at "package/", the same layout every npm tarball uses.
+async function buildFakeTarball(files) {
+  const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'packdev-fixture-'));
+  const pkgDir = path.join(srcDir, 'package');
+  fs.mkdirSync(pkgDir, { recursive: true });
+  for (const [relPath, content] of Object.entries(files)) {
+    const filePath = path.join(pkgDir, relPath);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content);
+  }
+  const tgzPath = path.join(srcDir, 'package.tgz');
+  await tar.c({ gzip: true, cwd: srcDir, file: tgzPath }, ['package']);
+  const buffer = fs.readFileSync(tgzPath);
+  fs.rmSync(srcDir, { recursive: true, force: true });
+  return buffer;
+}
+
+// Fake npm registry serving package docs + tarballs for `packages`
+// ({ [pkgName]: { [version]: { tarballBuffer, deprecated? } } }), so a single
+// server can serve both a package and its @types/<pkg> counterpart. No real
+// network calls. Unregistered package names correctly 404, matching real
+// registry behavior for "no @types package published".
+function startFakeRegistry(packages) {
+  return new Promise((resolve) => {
+    let port;
+    const server = http.createServer((req, res) => {
+      const url = decodeURIComponent(req.url);
+
+      const pkgName = Object.keys(packages).find((name) => url === `/${name}`);
+      if (pkgName) {
+        const versionsMap = packages[pkgName];
+        const versions = {};
+        for (const [version, info] of Object.entries(versionsMap)) {
+          versions[version] = {
+            version,
+            dist: {
+              tarball: `http://127.0.0.1:${port}/tarballs/${encodeURIComponent(pkgName)}/${version}.tgz`,
+            },
+            ...(info.deprecated ? { deprecated: info.deprecated } : {}),
+          };
+        }
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ name: pkgName, versions }));
+        return;
+      }
+
+      const match = url.match(/^\/tarballs\/(.+)\/(.+)\.tgz$/);
+      const info = match && packages[match[1]] && packages[match[1]][match[2]];
+      if (info) {
+        res.setHeader('content-type', 'application/octet-stream');
+        res.end(info.tarballBuffer);
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve(server);
+    });
+  });
+}
+
 // A minimal build script (as a package.json "build" entry) that writes a marker
 // file, avoiding shell-quoting pitfalls by using fromCharCode.
 const MARKER = 'built.txt';
@@ -69,12 +150,23 @@ class FeatureTests {
     this.passed = 0;
     this.total = 0;
     this.dirs = [];
+    this.servers = [];
   }
 
   tmp(prefix) {
     const dir = makeTmpDir(prefix);
     this.dirs.push(dir);
     return dir;
+  }
+
+  async registry(pkgName, versionsMap) {
+    return this.registryMulti({ [pkgName]: versionsMap });
+  }
+
+  async registryMulti(packages) {
+    const server = await startFakeRegistry(packages);
+    this.servers.push(server);
+    return `http://127.0.0.1:${server.address().port}`;
   }
 
   async run(name, fn) {
@@ -271,6 +363,324 @@ class FeatureTests {
     });
   }
 
+  // --- api (export map of an installed package) -----------------------------
+
+  async testApiHumanOutput() {
+    await this.run('api prints the export map of the installed version', async () => {
+      const dir = this.tmp('api-human');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'fake-lib',
+        { name: 'fake-lib', version: '1.5.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = {};',
+          'index.d.ts': [
+            'export function formatDate(input: string, fmt?: string): string;',
+            'export declare class AuthService {}',
+            'export interface AuthState { loggedIn: boolean; }',
+          ].join('\n'),
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'fake-lib']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      assert.match(r.stdout, /fake-lib@1\.5\.0/);
+      assert.match(r.stdout, /formatDate/);
+      assert.match(r.stdout, /AuthService/);
+      assert.match(r.stdout, /AuthState/);
+    });
+  }
+
+  async testApiJsonShape() {
+    await this.run('api --json emits the documented shape', async () => {
+      const dir = this.tmp('api-json');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'fake-lib',
+        { name: 'fake-lib', version: '1.5.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = {};',
+          'index.d.ts': 'export function formatDate(input: string, fmt?: string): string;',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'fake-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.command, 'api');
+      assert.strictEqual(json.package, 'fake-lib');
+      assert.strictEqual(json.version, '1.5.0');
+      assert.strictEqual(json.hasTypes, true);
+      assert.ok(Array.isArray(json.exports));
+      const formatDate = json.exports.find((e) => e.name === 'formatDate');
+      assert.ok(formatDate, 'expected formatDate in exports');
+      assert.strictEqual(formatDate.kind, 'function');
+    });
+  }
+
+  async testApiExportsMapResolution() {
+    await this.run('api resolves types via a conditional "exports" map', async () => {
+      const dir = this.tmp('api-exports-map');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'exports-lib',
+        {
+          name: 'exports-lib',
+          version: '2.0.0',
+          exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+        },
+        {
+          'dist/index.js': 'module.exports = {};',
+          'dist/index.d.ts': 'export function foo(): void;',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'exports-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, true);
+      assert.ok(json.exports.some((e) => e.name === 'foo'), 'expected foo in exports');
+    });
+  }
+
+  async testApiNoTypesAvailable() {
+    await this.run('api reports hasTypes:false for a pure-JS package', async () => {
+      const dir = this.tmp('api-no-types');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'plain-js',
+        { name: 'plain-js', version: '0.1.0', main: 'index.js' },
+        { 'index.js': 'module.exports = {};' },
+      );
+      const r = await runPackdev(dir, ['api', 'plain-js', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, false);
+      assert.deepStrictEqual(json.exports, []);
+    });
+  }
+
+  async testApiPackageNotInstalled() {
+    await this.run('api exits 4 when the package is not installed', async () => {
+      const dir = this.tmp('api-not-installed');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      const r = await runPackdev(dir, ['api', 'missing-pkg', '--json']);
+      assert.strictEqual(r.code, 4, `expected exit 4, got ${r.code}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.success, false);
+      assert.match(json.error, /is not installed/i);
+    });
+  }
+
+  async testApiHoistedResolution() {
+    await this.run('api resolves a package hoisted to a parent node_modules', async () => {
+      const dir = this.tmp('api-hoisted');
+      const appDir = path.join(dir, 'apps/app-a');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(dir, 'package.json'), { name: 'root', version: '1.0.0', workspaces: ['apps/*'] });
+      writeJson(path.join(appDir, 'package.json'), { name: 'app-a', version: '1.0.0' });
+      const hoistedDir = writeNodeModulesPackage(
+        dir,
+        'hoisted-lib',
+        { name: 'hoisted-lib', version: '3.0.0', main: 'index.js', types: 'index.d.ts' },
+        { 'index.js': 'module.exports = {};', 'index.d.ts': 'export function bar(): void;' },
+      );
+      const r = await runPackdev(appDir, ['api', 'hoisted-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.resolvedPath, hoistedDir);
+      assert.ok(json.exports.some((e) => e.name === 'bar'), 'expected bar in exports');
+    });
+  }
+
+  // --- api-diff (static version-range check against app usage) --------------
+
+  async testApiDiffRangeEnumerationAndDiff() {
+    await this.run('api-diff finds the minimum/recommended version satisfying app usage', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function other(): void;',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function other(): void;\nexport function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('api-diff-app');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "fake-lib";\nformatDate("x");\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib',
+        '--range', '>=1.0.0 <3.0.0',
+        '--app', appDir,
+        '--registry', registryUrl,
+        '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.usedSymbols, ['formatDate']);
+      assert.strictEqual(json.minimumCompatibleVersion, '2.0.0');
+      assert.strictEqual(json.recommendedVersion, '2.0.0');
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      assert.strictEqual(v1Result.apiCompatible, false);
+      assert.deepStrictEqual(v1Result.missingSymbols, ['formatDate']);
+    });
+  }
+
+  async testApiDiffExcludesPrereleaseByDefault() {
+    await this.run('api-diff excludes prerelease versions unless --include-prerelease', async () => {
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '2.0.0': { tarballBuffer: v2 },
+        '3.0.0-beta.1': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('api-diff-prerelease');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), '');
+
+      const withoutFlag = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <4.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      const withoutJson = parseJson(withoutFlag.stdout, 'api-diff');
+      assert.ok(!withoutJson.versions.some((v) => v.version === '3.0.0-beta.1'), 'prerelease should be excluded by default');
+
+      const withFlag = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <4.0.0', '--app', appDir, '--registry', registryUrl, '--include-prerelease', '--json',
+      ]);
+      const withJson = parseJson(withFlag.stdout, 'api-diff');
+      assert.ok(withJson.versions.some((v) => v.version === '3.0.0-beta.1'), 'prerelease should be included with --include-prerelease');
+    });
+  }
+
+  async testApiDiffFlagsDynamicUsage() {
+    await this.run('api-diff flags a namespace import as unverifiable dynamic usage', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-dynamic');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import * as lib from "fake-lib";\nlib.formatDate("x");\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.hasDynamicUsage, true);
+
+      const human = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl,
+      ]);
+      assert.match(human.stdout, /could not be fully verified/i);
+    });
+  }
+
+  async testApiDiffNoUsageMeansEveryVersionCompatible() {
+    await this.run('api-diff reports every version compatible when the app never imports the package', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-nousage');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'export const x = 1;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.usedSymbols, []);
+      assert.ok(json.versions.every((v) => v.apiCompatible === true), 'every version should be compatible when nothing is used');
+    });
+  }
+
+  async testApiDiffCleansUpTempDirs() {
+    await this.run('api-diff leaves no packdev-api-diff-* temp dirs behind', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-cleanup');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "fake-lib";\nformatDate("x");\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+
+      const leftover = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('packdev-tarball-extract-'));
+      assert.deepStrictEqual(leftover, [], `expected no leftover temp dirs, found: ${leftover.join(', ')}`);
+    });
+  }
+
+  async testApiDiffFallsBackToTypesPackage() {
+    await this.run('api-diff resolves types via @types/<pkg> when the tarball has no bundled types', async () => {
+      const libV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'plain-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const typesV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: '@types/plain-lib', version: '1.0.5', main: 'index.d.ts' }),
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registryMulti({
+        'plain-lib': { '1.0.0': { tarballBuffer: libV1 } },
+        '@types/plain-lib': { '1.0.5': { tarballBuffer: typesV1 } },
+      });
+
+      const appDir = this.tmp('api-diff-types-fallback');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "plain-lib";\nformatDate("x");\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'plain-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      const v1 = json.versions.find((v) => v.version === '1.0.0');
+      assert.strictEqual(v1.typesSource, 'types-package');
+      assert.strictEqual(v1.apiCompatible, true);
+      assert.deepStrictEqual(v1.missingSymbols, []);
+    });
+  }
+
+  async testApiDiffTypesSourceNoneWhenNoTypesAnywhere() {
+    await this.run('api-diff reports typesSource:none when neither bundled nor @types types exist', async () => {
+      const libV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'no-types-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('no-types-lib', { '1.0.0': { tarballBuffer: libV1 } });
+
+      const appDir = this.tmp('api-diff-no-types-anywhere');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), '');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'no-types-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].typesSource, 'none');
+    });
+  }
+
   // --- git dependencies -----------------------------------------------------
 
   async testGitFileUrlClassified() {
@@ -440,6 +850,19 @@ class FeatureTests {
       await this.testInitIdempotent();
       await this.testLinkFromWorkspaceChild();
       await this.testLinkNoMatch();
+      await this.testApiHumanOutput();
+      await this.testApiJsonShape();
+      await this.testApiExportsMapResolution();
+      await this.testApiNoTypesAvailable();
+      await this.testApiPackageNotInstalled();
+      await this.testApiHoistedResolution();
+      await this.testApiDiffRangeEnumerationAndDiff();
+      await this.testApiDiffExcludesPrereleaseByDefault();
+      await this.testApiDiffFlagsDynamicUsage();
+      await this.testApiDiffNoUsageMeansEveryVersionCompatible();
+      await this.testApiDiffCleansUpTempDirs();
+      await this.testApiDiffFallsBackToTypesPackage();
+      await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();
@@ -458,6 +881,13 @@ class FeatureTests {
       for (const dir of this.dirs) {
         try {
           fs.rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+      for (const server of this.servers) {
+        try {
+          server.close();
         } catch {
           // ignore cleanup errors
         }

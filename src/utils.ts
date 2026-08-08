@@ -13,7 +13,10 @@ export interface PackageInfo {
   author?: string;
   license?: string;
   main?: string;
+  module?: string;
   types?: string;
+  typings?: string;
+  exports?: unknown;
 }
 
 export interface DependencyInfo {
