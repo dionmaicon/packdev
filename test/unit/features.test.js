@@ -115,6 +115,10 @@ function startFakeRegistry(packages) {
               tarball: `http://127.0.0.1:${port}/tarballs/${encodeURIComponent(pkgName)}/${version}.tgz`,
             },
             ...(info.deprecated ? { deprecated: info.deprecated } : {}),
+            // npm decides whether to run lifecycle scripts from this
+            // packument manifest, not by inspecting the extracted tarball —
+            // omitting `scripts` here silently skips postinstall etc.
+            ...(info.scripts ? { scripts: info.scripts } : {}),
           };
         }
         res.setHeader('content-type', 'application/json');
@@ -681,6 +685,160 @@ class FeatureTests {
     });
   }
 
+  // --- compat (runtime matrix: sandboxed install + test per version) -------
+
+  async testCompatPassFailPerVersion() {
+    await this.run('compat installs+tests each version in its own sandbox and picks the recommended one', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { formatDate: () => "ok" };',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('compat-app');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(typeof require("fake-lib").formatDate === "function" ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib',
+        '--versions', '1.0.0,2.0.0',
+        '--app', appDir,
+        '--registry', registryUrl,
+        '--test', 'node check.js',
+        '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v1Result.status, 'FAILED');
+      assert.strictEqual(v2Result.status, 'PASSED');
+      assert.strictEqual(json.recommendedVersion, '2.0.0');
+    });
+  }
+
+  async testCompatDistinguishesInstallFailure() {
+    await this.run('compat reports INSTALL_FAILED distinctly from a test failure', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          scripts: { postinstall: 'node -e "process.exit(1)"' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1, scripts: { postinstall: 'node -e "process.exit(1)"' } },
+      });
+
+      const appDir = this.tmp('compat-installfail');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'INSTALL_FAILED');
+    });
+  }
+
+  async testCompatCleansUpSandboxOnSuccess() {
+    await this.run('compat leaves no packdev-compat-sandbox-* dirs behind after a normal run', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-cleanup');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+
+      const leftover = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('packdev-compat-sandbox-'));
+      assert.deepStrictEqual(leftover, [], `expected no leftover sandbox dirs, found: ${leftover.join(', ')}`);
+    });
+  }
+
+  async testCompatCleansUpSandboxOnSigint() {
+    await this.run('compat removes the in-flight sandbox on SIGINT', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          scripts: { postinstall: 'sleep 5' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1, scripts: { postinstall: 'sleep 5' } },
+      });
+
+      const appDir = this.tmp('compat-sigint');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const before = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('packdev-compat-sandbox-')));
+
+      const child = spawn('node', [
+        BINARY_PATH, 'compat', 'fake-lib',
+        '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js',
+      ], { cwd: appDir, stdio: 'pipe' });
+
+      let sandboxAppeared = false;
+      for (let i = 0; i < 50; i++) {
+        const dirs = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('packdev-compat-sandbox-') && !before.has(n));
+        if (dirs.length > 0) { sandboxAppeared = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(sandboxAppeared, 'expected a sandbox directory to appear before timeout');
+
+      child.kill('SIGINT');
+      await new Promise((resolve) => child.on('close', resolve));
+
+      const leftover = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('packdev-compat-sandbox-') && !before.has(n));
+      assert.deepStrictEqual(leftover, [], `expected no leftover sandbox dirs after SIGINT, found: ${leftover.join(', ')}`);
+    });
+  }
+
+  async testCompatDoesNotMutateRealApp() {
+    await this.run('compat never mutates the real app package.json, only its sandbox copy', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-untouched');
+      const pkgJsonPath = path.join(appDir, 'package.json');
+      writeJson(pkgJsonPath, { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+      const before = fs.readFileSync(pkgJsonPath, 'utf-8');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+
+      const after = fs.readFileSync(pkgJsonPath, 'utf-8');
+      assert.strictEqual(after, before, 'app package.json must be byte-identical after compat run');
+    });
+  }
+
   // --- git dependencies -----------------------------------------------------
 
   async testGitFileUrlClassified() {
@@ -863,6 +1021,11 @@ class FeatureTests {
       await this.testApiDiffCleansUpTempDirs();
       await this.testApiDiffFallsBackToTypesPackage();
       await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
+      await this.testCompatPassFailPerVersion();
+      await this.testCompatDistinguishesInstallFailure();
+      await this.testCompatCleansUpSandboxOnSuccess();
+      await this.testCompatCleansUpSandboxOnSigint();
+      await this.testCompatDoesNotMutateRealApp();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

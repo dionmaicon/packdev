@@ -22,6 +22,7 @@ import {
 } from "./api";
 import { readJsonFile, groupBy, type PackageInfo } from "./utils";
 import { runApiDiff } from "./apiDiff";
+import { runCompat } from "./compat";
 
 const program = new Command();
 
@@ -513,6 +514,98 @@ program
           error: String(error),
         },
         () => console.error("❌ Error running api-diff:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
+    }
+  });
+
+program
+  .command("compat")
+  .description(
+    "Runtime compatibility matrix: install each candidate version in an isolated sandbox and run the app's test command",
+  )
+  .argument("<package>", "Package name to check")
+  .requiredOption(
+    "--test <cmd>",
+    'Command to run in each sandboxed version, e.g. "npm test"',
+  )
+  .option(
+    "--range <semver>",
+    "Version range to test (mutually exclusive with --versions)",
+  )
+  .option(
+    "--versions <list>",
+    "Comma-separated explicit versions to test (mutually exclusive with --range)",
+  )
+  .option("--app <dir>", "App directory to test", ".")
+  .option(
+    "--registry <url>",
+    "npm registry URL (also passed to the sandbox install)",
+    "https://registry.npmjs.org",
+  )
+  .option("--include-prerelease", "Include prerelease versions with --range", false)
+  .option("--include-deprecated", "Include deprecated versions with --range", false)
+  .action(async (packageName: string, options) => {
+    try {
+      if (!options.range && !options.versions) {
+        throw new Error("Either --range or --versions must be provided");
+      }
+      if (options.range && options.versions) {
+        throw new Error("--range and --versions are mutually exclusive");
+      }
+
+      const report = await runCompat(packageName, {
+        range: options.range,
+        versions: options.versions
+          ? String(options.versions)
+              .split(",")
+              .map((v: string) => v.trim())
+              .filter(Boolean)
+          : undefined,
+        appDir: options.app,
+        testCommand: options.test,
+        registryUrl: options.registry,
+        includePrerelease: !!options.includePrerelease,
+        includeDeprecated: !!options.includeDeprecated,
+      });
+
+      output({ command: "compat", ...report }, () => {
+        console.log(`📦 ${report.package} — runtime compatibility`);
+        console.log("");
+
+        for (const v of report.versions) {
+          const mark =
+            v.status === "PASSED" ? "✅" : v.status === "FAILED" ? "❌" : "⚠️ ";
+          console.log(`  ${mark} ${v.version} (${v.status}, ${v.durationMs}ms)`);
+        }
+
+        console.log("");
+        if (report.minimumCompatibleVersion) {
+          console.log(
+            `💡 Minimum compatible version: ${report.minimumCompatibleVersion}`,
+          );
+        }
+        if (report.recommendedVersion) {
+          console.log(`💡 Recommended version: ${report.recommendedVersion}`);
+        }
+        if (!report.minimumCompatibleVersion) {
+          console.log("⚠️  No version in range passed the test command.");
+        }
+        if (report.nonMonotonic) {
+          console.log(
+            "⚠️  Pass/fail isn't contiguous — consider testing individual versions manually; full --bisect support isn't built yet.",
+          );
+        }
+      });
+    } catch (error) {
+      output(
+        {
+          command: "compat",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error running compat:", error),
       );
       process.exit(EXIT_CODE.GENERIC_ERROR);
     }

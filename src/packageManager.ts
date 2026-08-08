@@ -104,7 +104,7 @@ interface PackageJsonBackup {
   packageJson: PackageJson;
 }
 
-interface PackageManagerInfo {
+export interface PackageManagerInfo {
   manager: "npm" | "yarn" | "pnpm";
   lockFile: string;
 }
@@ -125,11 +125,13 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function detectPackageManager(): Promise<PackageManagerInfo> {
-  // Search upward from cwd so this still resolves correctly when run inside
-  // a monorepo workspace child, where the lockfile lives at the repo root
-  // rather than next to the child's package.json.
-  let dir = process.cwd();
+export async function detectPackageManager(
+  startDir: string = process.cwd(),
+): Promise<PackageManagerInfo> {
+  // Search upward from startDir so this still resolves correctly when run
+  // inside a monorepo workspace child, where the lockfile lives at the repo
+  // root rather than next to the child's package.json.
+  let dir = startDir;
   for (;;) {
     if (await fileExists(path.join(dir, "pnpm-lock.yaml"))) {
       return { manager: "pnpm", lockFile: "pnpm-lock.yaml" };
