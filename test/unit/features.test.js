@@ -1000,6 +1000,68 @@ class FeatureTests {
     });
   }
 
+  // --- dupes (duplicate package instances in the tree) ----------------------
+
+  async testDupesFindsDuplicate() {
+    await this.run('dupes finds a package resolved at two different depths', async () => {
+      const dir = this.tmp('dupes-duplicate');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+      writeNodeModulesPackage(path.join(dir, 'node_modules', 'some-dep'), 'left-pad', { name: 'left-pad', version: '1.1.2' });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, true);
+      assert.strictEqual(json.resolutions.length, 2);
+      const versions = json.resolutions.map((res) => res.version).sort();
+      assert.deepStrictEqual(versions, ['1.1.2', '1.3.0']);
+    });
+  }
+
+  async testDupesSingleResolution() {
+    await this.run('dupes reports a single resolution as not duplicate', async () => {
+      const dir = this.tmp('dupes-single');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, false);
+      assert.strictEqual(json.resolutions.length, 1);
+    });
+  }
+
+  async testDupesNotInstalled() {
+    await this.run('dupes reports an empty result when the package is nowhere in the tree', async () => {
+      const dir = this.tmp('dupes-none');
+      fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, false);
+      assert.deepStrictEqual(json.resolutions, []);
+    });
+  }
+
+  async testDupesSymlinkCycleSafety() {
+    await this.run('dupes does not hang on a symlink cycle in node_modules', async () => {
+      const dir = this.tmp('dupes-symlink');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+      writeNodeModulesPackage(path.join(dir, 'node_modules', 'some-dep'), 'left-pad', { name: 'left-pad', version: '1.1.2' });
+
+      // Symlink some-dep's node_modules back to the root node_modules,
+      // simulating a pnpm-style hoisting cycle.
+      const cyclePath = path.join(dir, 'node_modules', 'some-dep', 'node_modules', 'cycle-back');
+      fs.symlinkSync(path.join(dir, 'node_modules'), cyclePath, 'dir');
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0 (no hang/crash), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.resolutions.length, 2, 'should still find both real resolutions despite the cycle');
+    });
+  }
+
   // --- git dependencies -----------------------------------------------------
 
   async testGitFileUrlClassified() {
@@ -1191,6 +1253,10 @@ class FeatureTests {
       await this.testCompatBisectEverythingPasses();
       await this.testCompatBisectNothingPasses();
       await this.testCompatBisectFallsBackOnFlakyBoundary();
+      await this.testDupesFindsDuplicate();
+      await this.testDupesSingleResolution();
+      await this.testDupesNotInstalled();
+      await this.testDupesSymlinkCycleSafety();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

@@ -28,6 +28,7 @@ import {
   type CompatReport,
   type CompatBisectReport,
 } from "./compat";
+import { findDuplicateResolutions } from "./dupes";
 
 const program = new Command();
 
@@ -637,6 +638,59 @@ program
           error: String(error),
         },
         () => console.error("❌ Error running compat:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
+    }
+  });
+
+program
+  .command("dupes")
+  .description(
+    "Find every distinct copy of a package resolved in the dependency tree",
+  )
+  .argument("<package>", "Package name to check")
+  .option("--root <dir>", "Directory to search from", ".")
+  .action(async (packageName: string, options) => {
+    try {
+      const resolutions = await findDuplicateResolutions(
+        packageName,
+        options.root,
+      );
+      const distinctVersions = new Set(resolutions.map((r) => r.version));
+      const duplicate = resolutions.length > 1 && distinctVersions.size > 1;
+
+      output(
+        { command: "dupes", package: packageName, duplicate, resolutions },
+        () => {
+          console.log(`📦 ${packageName}`);
+          if (resolutions.length === 0) {
+            console.log("  (not found anywhere in the tree)");
+            return;
+          }
+          for (const r of resolutions) {
+            console.log(`  ${r.path}  (${r.version})`);
+          }
+          console.log("");
+          if (duplicate) {
+            console.log(
+              `⚠️  ${distinctVersions.size} distinct versions found — instanceof/DI singletons may break across copies`,
+            );
+          } else if (resolutions.length === 1) {
+            console.log("✅ single resolution");
+          } else {
+            console.log("✅ all resolutions are the same version");
+          }
+        },
+      );
+    } catch (error) {
+      output(
+        {
+          command: "dupes",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error checking for duplicates:", error),
       );
       process.exit(EXIT_CODE.GENERIC_ERROR);
     }
