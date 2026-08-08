@@ -604,6 +604,10 @@ program
     "--group <packages>",
     "Comma-separated package names to pin to the same version as <package> in every sandboxed run",
   )
+  .option(
+    "--snapshot-dir <dir>",
+    "Directory to save a resolved-lockfile snapshot per tested version, for reproducibility auditing across runs",
+  )
   .action(async (packageName: string, options) => {
     try {
       if (!options.range && !options.versions) {
@@ -632,6 +636,7 @@ program
               .map((v: string) => v.trim())
               .filter(Boolean)
           : undefined,
+        snapshotDir: options.snapshotDir,
       };
 
       const report: CompatReport | CompatBisectReport = options.bisect
@@ -648,12 +653,16 @@ program
             `🔍 Bisected: ${report.testedVersionCount}/${report.totalVersionCount} versions tested`,
           );
         }
+        console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
         console.log("");
 
         for (const v of report.versions) {
           const mark =
             v.status === "PASSED" ? "✅" : v.status === "FAILED" ? "❌" : "⚠️ ";
-          console.log(`  ${mark} ${v.version} (${v.status}, ${v.durationMs}ms)`);
+          const hashSuffix = v.lockfileHash
+            ? `, lockfile ${v.lockfileHash.slice(0, 8)}`
+            : "";
+          console.log(`  ${mark} ${v.version} (${v.status}, ${v.durationMs}ms${hashSuffix})`);
         }
 
         console.log("");

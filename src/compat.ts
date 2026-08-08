@@ -14,6 +14,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { spawn } from "child_process";
+import { createHash } from "crypto";
 import * as semver from "semver";
 import { readJsonFile, writeJsonFile } from "./utils";
 import {
@@ -31,6 +32,8 @@ export interface CompatVersionResult {
   exitCode: number | null;
   durationMs: number;
   output?: string | undefined;
+  lockfileHash: string | null;
+  lockfileSnapshotPath: string | null;
 }
 
 export interface CompatReport {
@@ -40,6 +43,7 @@ export interface CompatReport {
   nonMonotonic: boolean;
   versions: CompatVersionResult[];
   group?: string[] | undefined;
+  snapshotDir: string;
 }
 
 export interface CompatOptions {
@@ -51,6 +55,7 @@ export interface CompatOptions {
   includePrerelease?: boolean | undefined;
   includeDeprecated?: boolean | undefined;
   group?: string[] | undefined;
+  snapshotDir?: string | undefined;
 }
 
 export type DependencySection =
@@ -260,6 +265,47 @@ export function runTestCommand(
   return runCommand(testCommand, [], sandboxDir);
 }
 
+/**
+ * Read whatever lockfile the sandbox's install actually produced, hash it,
+ * and copy it into `snapshotDir` — named by version+manager, not by run, so
+ * pointing repeated runs at the same --snapshot-dir accumulates a diffable
+ * history per version instead of silently overwriting drift away. A missing
+ * lockfile (install produced none) is a valid, reportable outcome, not an
+ * error — mirrors the project's hasTypes:false/typesSource:"none" convention.
+ */
+async function captureLockfileSnapshot(
+  sandboxDir: string,
+  packageManagerInfo: PackageManagerInfo,
+  snapshotDir: string,
+  pkgName: string,
+  version: string,
+): Promise<{ hash: string | null; path: string | null }> {
+  const sourcePath = path.join(sandboxDir, packageManagerInfo.lockFile);
+  let content: Buffer;
+  try {
+    content = await fs.readFile(sourcePath);
+  } catch {
+    return { hash: null, path: null };
+  }
+
+  const hash = createHash("sha256").update(content).digest("hex");
+  const destPath = path.join(
+    snapshotDir,
+    `${pkgName.replace(/\//g, "__")}-${version}-${packageManagerInfo.manager}-${packageManagerInfo.lockFile}`,
+  );
+  await fs.writeFile(destPath, content);
+
+  return { hash, path: destPath };
+}
+
+async function resolveSnapshotDir(snapshotDir?: string): Promise<string> {
+  if (snapshotDir) {
+    await fs.mkdir(snapshotDir, { recursive: true });
+    return path.resolve(snapshotDir);
+  }
+  return fs.mkdtemp(path.join(os.tmpdir(), "packdev-compat-snapshots-"));
+}
+
 // True when a FAILED/INSTALL_FAILED version sits between two PASSED
 // versions in sorted order — a cheap, honest signal that the pass/fail
 // pattern isn't contiguous (full bisect is future work).
@@ -280,10 +326,12 @@ function computeNonMonotonic(versions: CompatVersionResult[]): boolean {
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
 async function testOneVersion(
+  pkgName: string,
   version: string,
   options: CompatOptions,
   packageManagerInfo: PackageManagerInfo,
   pinTargets: PinTarget[],
+  snapshotDir: string,
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
   let sandboxDir: string | null = null;
@@ -302,8 +350,18 @@ async function testOneVersion(
         exitCode: installResult.exitCode,
         durationMs: Date.now() - startedAt,
         output: installResult.output,
+        lockfileHash: null,
+        lockfileSnapshotPath: null,
       };
     }
+
+    const snapshot = await captureLockfileSnapshot(
+      sandboxDir,
+      packageManagerInfo,
+      snapshotDir,
+      pkgName,
+      version,
+    );
 
     const testResult = await runTestCommand(sandboxDir, options.testCommand);
     return {
@@ -312,6 +370,8 @@ async function testOneVersion(
       exitCode: testResult.exitCode,
       durationMs: Date.now() - startedAt,
       output: testResult.success ? undefined : testResult.output,
+      lockfileHash: snapshot.hash,
+      lockfileSnapshotPath: snapshot.path,
     };
   } finally {
     if (sandboxDir) await cleanupSandbox(sandboxDir);
@@ -342,11 +402,19 @@ export async function runCompat(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
 
   const versions: CompatVersionResult[] = [];
   for (const version of candidateVersions) {
     versions.push(
-      await testOneVersion(version, options, packageManagerInfo, pinTargets),
+      await testOneVersion(
+        pkgName,
+        version,
+        options,
+        packageManagerInfo,
+        pinTargets,
+        snapshotDir,
+      ),
     );
   }
 
@@ -361,6 +429,7 @@ export async function runCompat(
     nonMonotonic: computeNonMonotonic(versions),
     versions,
     group: options.group,
+    snapshotDir,
   };
 }
 
@@ -378,6 +447,7 @@ function finishBisect(
   minimumCompatibleVersion: string | null,
   recommendedVersion: string | null,
   fellBackToLinearScan: boolean,
+  snapshotDir: string,
   group?: string[] | undefined,
 ): CompatBisectReport {
   return {
@@ -391,6 +461,7 @@ function finishBisect(
     totalVersionCount: candidateVersions.length,
     fellBackToLinearScan,
     group,
+    snapshotDir,
   };
 }
 
@@ -408,17 +479,20 @@ export async function runCompatBisect(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
+  const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   if (candidateVersions.length === 0) {
-    return finishBisect(pkgName, candidateVersions, [], null, null, false, options.group);
+    return finishBisect(pkgName, candidateVersions, [], null, null, false, snapshotDir, options.group);
   }
 
   const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
   const testAt = (index: number) =>
     testOneVersion(
+      pkgName,
       candidateVersions[index]!,
       options,
       packageManagerInfo,
       pinTargets,
+      snapshotDir,
     );
 
   const tested: CompatVersionResult[] = [];
@@ -430,7 +504,7 @@ export async function runCompatBisect(
   if (topResult.status !== "PASSED") {
     // Nothing in range is presumed compatible under the monotonic
     // assumption — bisect makes no claim beyond the top version.
-    return finishBisect(pkgName, candidateVersions, tested, null, null, false, options.group);
+    return finishBisect(pkgName, candidateVersions, tested, null, null, false, snapshotDir, options.group);
   }
 
   if (candidateVersions.length === 1) {
@@ -441,6 +515,7 @@ export async function runCompatBisect(
       topVersion,
       topVersion,
       false,
+      snapshotDir,
       options.group,
     );
   }
@@ -455,6 +530,7 @@ export async function runCompatBisect(
       candidateVersions[0]!,
       topVersion,
       false,
+      snapshotDir,
       options.group,
     );
   }
@@ -479,7 +555,10 @@ export async function runCompatBisect(
   if (confirmResult.status !== "PASSED") {
     // The monotonic assumption broke (flaky test or a real non-monotonic
     // pattern) — fall back to a full linear scan for a trustworthy answer.
-    const fullReport = await runCompat(pkgName, options);
+    // Reuse the same resolved snapshotDir (not options.snapshotDir, which
+    // may be undefined) so pre-fallback and fallback snapshots land in one
+    // consistent directory instead of two.
+    const fullReport = await runCompat(pkgName, { ...options, snapshotDir });
     return {
       ...fullReport,
       bisected: true,
@@ -496,6 +575,7 @@ export async function runCompatBisect(
     boundaryVersion,
     topVersion,
     false,
+    snapshotDir,
     options.group,
   );
 }

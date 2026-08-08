@@ -1077,6 +1077,113 @@ class FeatureTests {
     });
   }
 
+  // --- compat --snapshot-dir (E8: transitive dependency drift) -------------
+
+  async testCompatCapturesLockfileSnapshot() {
+    await this.run('compat --snapshot-dir captures a hashed lockfile snapshot per version', async () => {
+      const transitiveV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-transitive', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const libV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          dependencies: { 'fake-transitive': '^1.0.0' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registryMulti({
+        'fake-lib': { '1.0.0': { tarballBuffer: libV1 } },
+        'fake-transitive': { '1.0.0': { tarballBuffer: transitiveV1 } },
+      });
+
+      const appDir = this.tmp('compat-snapshot-app');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+      const snapshotDir = this.tmp('compat-snapshot-dir');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--snapshot-dir', snapshotDir, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.snapshotDir, snapshotDir);
+      const versionResult = json.versions[0];
+      assert.ok(versionResult.lockfileHash, 'expected a non-empty lockfileHash');
+      assert.ok(versionResult.lockfileSnapshotPath, 'expected a lockfileSnapshotPath');
+      assert.ok(
+        fs.existsSync(versionResult.lockfileSnapshotPath),
+        `expected snapshot file to exist at ${versionResult.lockfileSnapshotPath}`,
+      );
+    });
+  }
+
+  async testCompatSnapshotRevealsTransitiveDrift() {
+    await this.run('compat --snapshot-dir makes transitive dependency drift visible across runs', async () => {
+      const transitiveV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-transitive', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const libV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          dependencies: { 'fake-transitive': '^1.0.0' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+
+      const appDir = this.tmp('compat-drift-app');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Two separate fake registries (distinct ports, so npm's own package
+      // cache never conflates them) stand in for "the registry as it stood"
+      // at two different points in time — registryB additionally has a
+      // newer fake-transitive patch that still satisfies fake-lib's
+      // "^1.0.0" range, simulating real transitive drift between runs.
+      const registryUrlA = await this.registryMulti({
+        'fake-lib': { '1.0.0': { tarballBuffer: libV1 } },
+        'fake-transitive': { '1.0.0': { tarballBuffer: transitiveV1 } },
+      });
+      const dirA = this.tmp('compat-drift-a');
+      const runA = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrlA,
+        '--test', 'node check.js', '--snapshot-dir', dirA, '--json',
+      ]);
+      assert.strictEqual(runA.code, 0, `expected exit 0, got ${runA.code}: ${runA.stderr}`);
+      const jsonA = parseJson(runA.stdout, 'compat');
+
+      const transitiveV1_1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-transitive', version: '1.1.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrlB = await this.registryMulti({
+        'fake-lib': { '1.0.0': { tarballBuffer: libV1 } },
+        'fake-transitive': {
+          '1.0.0': { tarballBuffer: transitiveV1 },
+          '1.1.0': { tarballBuffer: transitiveV1_1 },
+        },
+      });
+      const dirB = this.tmp('compat-drift-b');
+      const runB = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrlB,
+        '--test', 'node check.js', '--snapshot-dir', dirB, '--json',
+      ]);
+      assert.strictEqual(runB.code, 0, `expected exit 0, got ${runB.code}: ${runB.stderr}`);
+      const jsonB = parseJson(runB.stdout, 'compat');
+
+      assert.notStrictEqual(
+        jsonA.versions[0].lockfileHash,
+        jsonB.versions[0].lockfileHash,
+        'transitive drift between the two runs should change the resolved lockfile hash',
+      );
+      const contentA = fs.readFileSync(jsonA.versions[0].lockfileSnapshotPath, 'utf-8');
+      const contentB = fs.readFileSync(jsonB.versions[0].lockfileSnapshotPath, 'utf-8');
+      assert.notStrictEqual(contentA, contentB, 'the two snapshot files should be diffable and different');
+    });
+  }
+
   // --- compat --group -----------------------------------------------------
 
   async buildFakeFamilyRegistry(versions) {
@@ -1615,6 +1722,8 @@ class FeatureTests {
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
+      await this.testCompatCapturesLockfileSnapshot();
+      await this.testCompatSnapshotRevealsTransitiveDrift();
       await this.testCompatGroupWithoutFlagSurfacesMismatch();
       await this.testCompatGroupMovesFamilyTogether();
       await this.testCompatGroupErrorsOnUndeclaredMember();
