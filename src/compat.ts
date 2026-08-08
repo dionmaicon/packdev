@@ -44,6 +44,7 @@ export interface CompatReport {
   versions: CompatVersionResult[];
   group?: string[] | undefined;
   snapshotDir: string;
+  concurrency: number;
 }
 
 export interface CompatOptions {
@@ -56,6 +57,8 @@ export interface CompatOptions {
   includeDeprecated?: boolean | undefined;
   group?: string[] | undefined;
   snapshotDir?: string | undefined;
+  concurrency?: number | undefined;
+  preferOffline?: boolean | undefined;
 }
 
 export type DependencySection =
@@ -142,9 +145,11 @@ const EXCLUDED_COPY_NAMES = new Set([
   "build",
 ]);
 
-// Tracks the one in-flight sandbox so a signal handler can clean it up.
-// compat runs versions sequentially, so there's never more than one at a time.
-let activeSandboxDir: string | null = null;
+// Tracks every in-flight sandbox so a signal handler can clean all of them up.
+// A Set, not a single value: with --concurrency > 1 multiple sandboxes exist
+// simultaneously, and a single-slot tracker would leak every sandbox except
+// whichever one happened to be created last.
+const activeSandboxDirs = new Set<string>();
 
 /**
  * Copy `appDir` into a fresh temp directory (excluding node_modules, .git,
@@ -160,7 +165,7 @@ export async function createSandbox(
   pinTargets: PinTarget[],
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
-  activeSandboxDir = sandboxDir;
+  activeSandboxDirs.add(sandboxDir);
 
   await fs.cp(appDir, sandboxDir, {
     recursive: true,
@@ -186,7 +191,7 @@ export async function createSandbox(
 
 export async function cleanupSandbox(sandboxDir: string): Promise<void> {
   await fs.rm(sandboxDir, { recursive: true, force: true });
-  if (activeSandboxDir === sandboxDir) activeSandboxDir = null;
+  activeSandboxDirs.delete(sandboxDir);
 }
 
 let signalHandlersRegistered = false;
@@ -198,14 +203,14 @@ export function registerCompatSignalHandling(): void {
   signalHandlersRegistered = true;
 
   const cleanupAndExit = (signal: NodeJS.Signals) => {
-    if (activeSandboxDir) {
+    for (const dir of activeSandboxDirs) {
       try {
-        rmSync(activeSandboxDir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true });
       } catch {
         // best-effort
       }
-      activeSandboxDir = null;
     }
+    activeSandboxDirs.clear();
     process.exit(signal === "SIGINT" ? 130 : 143);
   };
 
@@ -253,8 +258,13 @@ export function runInstall(
   sandboxDir: string,
   manager: PackageManagerInfo["manager"],
   registryUrl?: string,
+  preferOffline?: boolean,
 ): Promise<RunResult> {
-  const args = ["install", ...(registryUrl ? ["--registry", registryUrl] : [])];
+  const args = [
+    "install",
+    ...(registryUrl ? ["--registry", registryUrl] : []),
+    ...(preferOffline ? ["--prefer-offline"] : []),
+  ];
   return runCommand(manager, args, sandboxDir);
 }
 
@@ -342,6 +352,7 @@ async function testOneVersion(
       sandboxDir,
       packageManagerInfo.manager,
       options.registryUrl,
+      options.preferOffline,
     );
     if (!installResult.success) {
       return {
@@ -394,6 +405,33 @@ async function resolveRunContext(
   return { pinTargets, packageManagerInfo };
 }
 
+/**
+ * Run `worker` over `items` with at most `limit` calls in flight at once.
+ * Results are written back by index, so the returned order always matches
+ * `items`' order regardless of which call finished first — every command's
+ * report stays deterministically ordered whether or not concurrency is on.
+ */
+async function runWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  async function runLane(): Promise<void> {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]!);
+    }
+  }
+
+  const laneCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
+  return results;
+}
+
 export async function runCompat(
   pkgName: string,
   options: CompatOptions,
@@ -403,11 +441,13 @@ export async function runCompat(
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
+  const concurrency = options.concurrency ?? 1;
 
-  const versions: CompatVersionResult[] = [];
-  for (const version of candidateVersions) {
-    versions.push(
-      await testOneVersion(
+  const versions = await runWithConcurrencyLimit(
+    candidateVersions,
+    concurrency,
+    (version) =>
+      testOneVersion(
         pkgName,
         version,
         options,
@@ -415,8 +455,7 @@ export async function runCompat(
         pinTargets,
         snapshotDir,
       ),
-    );
-  }
+  );
 
   const passedVersions = versions
     .filter((v) => v.status === "PASSED")
@@ -430,6 +469,7 @@ export async function runCompat(
     versions,
     group: options.group,
     snapshotDir,
+    concurrency,
   };
 }
 
@@ -462,6 +502,7 @@ function finishBisect(
     fellBackToLinearScan,
     group,
     snapshotDir,
+    concurrency: 1,
   };
 }
 

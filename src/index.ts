@@ -608,6 +608,16 @@ program
     "--snapshot-dir <dir>",
     "Directory to save a resolved-lockfile snapshot per tested version, for reproducibility auditing across runs",
   )
+  .option(
+    "--concurrency <n>",
+    "Number of versions to test in parallel (linear scan only, ignored with --bisect)",
+    "1",
+  )
+  .option(
+    "--prefer-offline",
+    "Prefer the local package manager cache over the registry when resolving versions",
+    false,
+  )
   .action(async (packageName: string, options) => {
     try {
       if (!options.range && !options.versions) {
@@ -637,6 +647,8 @@ program
               .filter(Boolean)
           : undefined,
         snapshotDir: options.snapshotDir,
+        concurrency: Number(options.concurrency) || 1,
+        preferOffline: !!options.preferOffline,
       };
 
       const report: CompatReport | CompatBisectReport = options.bisect
@@ -652,6 +664,9 @@ program
           console.log(
             `🔍 Bisected: ${report.testedVersionCount}/${report.totalVersionCount} versions tested`,
           );
+        }
+        if (report.concurrency > 1) {
+          console.log(`⚡ Concurrency: ${report.concurrency}`);
         }
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
         console.log("");

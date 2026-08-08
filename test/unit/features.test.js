@@ -834,6 +834,36 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffNeverInstallsAnything() {
+    await this.run('api-diff never runs an install, even across a multi-version range', async () => {
+      const versionsMap = {};
+      for (let i = 1; i <= 5; i++) {
+        const version = `${i}.0.0`;
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name: 'fake-lib', version, main: 'index.js', types: 'index.d.ts' }),
+          'index.js': 'module.exports = {};',
+          'index.d.ts': 'export function formatDate(input: string): string;',
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      const registryUrl = await this.registry('fake-lib', versionsMap);
+
+      const appDir = this.tmp('api-diff-no-install');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "fake-lib";\nformatDate("x");\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <6.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions.length, 5, 'expected all 5 versions diffed');
+      assert.ok(
+        !fs.existsSync(path.join(appDir, 'node_modules')),
+        'api-diff must never install anything, even across a 5-version range',
+      );
+    });
+  }
+
   async testApiDiffFallsBackToTypesPackage() {
     await this.run('api-diff resolves types via @types/<pkg> when the tarball has no bundled types', async () => {
       const libV1 = await buildFakeTarball({
@@ -1181,6 +1211,84 @@ class FeatureTests {
       const contentA = fs.readFileSync(jsonA.versions[0].lockfileSnapshotPath, 'utf-8');
       const contentB = fs.readFileSync(jsonB.versions[0].lockfileSnapshotPath, 'utf-8');
       assert.notStrictEqual(contentA, contentB, 'the two snapshot files should be diffable and different');
+    });
+  }
+
+  // --- compat --concurrency / --prefer-offline (E10: cost blowup) ---------
+
+  async testCompatConcurrencyOverlapsInstalls() {
+    await this.run('compat --concurrency actually runs installs in parallel, within the limit', async () => {
+      const versionsMap = {};
+      for (let i = 1; i <= 4; i++) {
+        const version = `${i}.0.0`;
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name: 'fake-lib', version, main: 'index.js' }),
+          'index.js': 'module.exports = {};',
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      const registryUrl = await this.registry('fake-lib', versionsMap);
+
+      const appDir = this.tmp('compat-concurrency-app');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const logDir = this.tmp('compat-concurrency-log');
+      const logPath = path.join(logDir, 'events.log');
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        `const fs = require('fs');\n` +
+        `const logPath = ${JSON.stringify(logPath)};\n` +
+        `fs.appendFileSync(logPath, JSON.stringify({ event: 'start', t: Date.now() }) + '\\n');\n` +
+        `const until = Date.now() + 400;\n` +
+        `while (Date.now() < until) {}\n` +
+        `fs.appendFileSync(logPath, JSON.stringify({ event: 'end', t: Date.now() }) + '\\n');\n` +
+        `process.exit(0);\n`,
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0,3.0.0,4.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--concurrency', '2', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.concurrency, 2);
+      assert.ok(json.versions.every((v) => v.status === 'PASSED'), 'all 4 versions should pass');
+
+      const events = fs.readFileSync(logPath, 'utf-8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .sort((a, b) => a.t - b.t);
+      let active = 0;
+      let maxActive = 0;
+      for (const event of events) {
+        active += event.event === 'start' ? 1 : -1;
+        maxActive = Math.max(maxActive, active);
+      }
+      assert.ok(maxActive > 1, `expected overlapping test-command windows, saw max concurrent = ${maxActive}`);
+      assert.ok(maxActive <= 2, `expected at most 2 concurrent test commands (the configured limit), saw ${maxActive}`);
+    });
+  }
+
+  async testCompatPreferOfflineDoesNotBreakNormalRun() {
+    await this.run('compat --prefer-offline still passes a normal run through correctly', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-prefer-offline');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--prefer-offline', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
     });
   }
 
@@ -1714,6 +1822,7 @@ class FeatureTests {
       await this.testApiDiffFlagsDynamicUsage();
       await this.testApiDiffNoUsageMeansEveryVersionCompatible();
       await this.testApiDiffCleansUpTempDirs();
+      await this.testApiDiffNeverInstallsAnything();
       await this.testApiDiffFallsBackToTypesPackage();
       await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
       await this.testApiDiffCountsSubpathExportsAsUsage();
@@ -1724,6 +1833,8 @@ class FeatureTests {
       await this.testCompatDoesNotMutateRealApp();
       await this.testCompatCapturesLockfileSnapshot();
       await this.testCompatSnapshotRevealsTransitiveDrift();
+      await this.testCompatConcurrencyOverlapsInstalls();
+      await this.testCompatPreferOfflineDoesNotBreakNormalRun();
       await this.testCompatGroupWithoutFlagSurfacesMismatch();
       await this.testCompatGroupMovesFamilyTogether();
       await this.testCompatGroupErrorsOnUndeclaredMember();
