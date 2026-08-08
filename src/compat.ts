@@ -39,6 +39,7 @@ export interface CompatReport {
   recommendedVersion: string | null;
   nonMonotonic: boolean;
   versions: CompatVersionResult[];
+  group?: string[] | undefined;
 }
 
 export interface CompatOptions {
@@ -49,6 +50,7 @@ export interface CompatOptions {
   registryUrl: string;
   includePrerelease?: boolean | undefined;
   includeDeprecated?: boolean | undefined;
+  group?: string[] | undefined;
 }
 
 export type DependencySection =
@@ -98,6 +100,32 @@ export function findDependencySection(
   return null;
 }
 
+export interface PinTarget {
+  name: string;
+  section: DependencySection;
+}
+
+/**
+ * Resolve the primary package plus every (deduplicated) group member to the
+ * section that currently declares it, so a lockstep group (e.g. NestJS's
+ * @nestjs/* family) can be pinned to the same candidate version in one
+ * sandboxed run instead of just the primary package alone.
+ */
+export function resolvePinTargets(
+  pkgName: string,
+  group: string[] | undefined,
+  packageJson: PackageJson,
+): PinTarget[] {
+  const names = [...new Set([pkgName, ...(group ?? [])])];
+  return names.map((name) => {
+    const section = findDependencySection(packageJson, name);
+    if (!section) {
+      throw new Error(`"${name}" is not declared in the app's package.json`);
+    }
+    return { name, section };
+  });
+}
+
 const SANDBOX_PREFIX = "packdev-compat-sandbox-";
 const EXCLUDED_COPY_NAMES = new Set([
   "node_modules",
@@ -115,16 +143,16 @@ let activeSandboxDir: string | null = null;
 
 /**
  * Copy `appDir` into a fresh temp directory (excluding node_modules, .git,
- * lockfiles, dist/build) and pin `pkgName` to `version` in `section`.
- * Deliberately not copying the lockfile: each sandbox gets a fully
- * independent install, which is what actually prevents workspace-hoisting
- * cross-contamination between version runs.
+ * lockfiles, dist/build) and pin every target in `pinTargets` to `version`
+ * in its own section — a lockstep group all moves to the same version in
+ * one sandboxed run. Deliberately not copying the lockfile: each sandbox
+ * gets a fully independent install, which is what actually prevents
+ * workspace-hoisting cross-contamination between version runs.
  */
 export async function createSandbox(
   appDir: string,
-  pkgName: string,
   version: string,
-  section: DependencySection,
+  pinTargets: PinTarget[],
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDir = sandboxDir;
@@ -140,10 +168,12 @@ export async function createSandbox(
     throw new Error(`No package.json found in sandboxed copy of ${appDir}`);
   }
 
-  packageJson[section] = {
-    ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
-    [pkgName]: version,
-  };
+  for (const { name, section } of pinTargets) {
+    packageJson[section] = {
+      ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
+      [name]: version,
+    };
+  }
   await writeJsonFile(packageJsonPath, packageJson);
 
   return sandboxDir;
@@ -250,16 +280,15 @@ function computeNonMonotonic(versions: CompatVersionResult[]): boolean {
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
 async function testOneVersion(
-  pkgName: string,
   version: string,
   options: CompatOptions,
   packageManagerInfo: PackageManagerInfo,
-  section: DependencySection,
+  pinTargets: PinTarget[],
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
   let sandboxDir: string | null = null;
   try {
-    sandboxDir = await createSandbox(options.appDir, pkgName, version, section);
+    sandboxDir = await createSandbox(options.appDir, version, pinTargets);
 
     const installResult = await runInstall(
       sandboxDir,
@@ -292,22 +321,17 @@ async function testOneVersion(
 async function resolveRunContext(
   pkgName: string,
   options: CompatOptions,
-): Promise<{ section: DependencySection; packageManagerInfo: PackageManagerInfo }> {
+): Promise<{ pinTargets: PinTarget[]; packageManagerInfo: PackageManagerInfo }> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
   if (!appPackageJson) {
     throw new Error(`No package.json found in app directory: ${options.appDir}`);
   }
 
-  const section = findDependencySection(appPackageJson, pkgName);
-  if (!section) {
-    throw new Error(
-      `"${pkgName}" is not declared in ${options.appDir}/package.json`,
-    );
-  }
+  const pinTargets = resolvePinTargets(pkgName, options.group, appPackageJson);
 
   const packageManagerInfo = await detectPackageManager(options.appDir);
-  return { section, packageManagerInfo };
+  return { pinTargets, packageManagerInfo };
 }
 
 export async function runCompat(
@@ -317,12 +341,12 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { section, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
 
   const versions: CompatVersionResult[] = [];
   for (const version of candidateVersions) {
     versions.push(
-      await testOneVersion(pkgName, version, options, packageManagerInfo, section),
+      await testOneVersion(version, options, packageManagerInfo, pinTargets),
     );
   }
 
@@ -336,6 +360,7 @@ export async function runCompat(
     recommendedVersion: passedVersions[passedVersions.length - 1] ?? null,
     nonMonotonic: computeNonMonotonic(versions),
     versions,
+    group: options.group,
   };
 }
 
@@ -353,6 +378,7 @@ function finishBisect(
   minimumCompatibleVersion: string | null,
   recommendedVersion: string | null,
   fellBackToLinearScan: boolean,
+  group?: string[] | undefined,
 ): CompatBisectReport {
   return {
     package: pkgName,
@@ -364,6 +390,7 @@ function finishBisect(
     testedVersionCount: tested.length,
     totalVersionCount: candidateVersions.length,
     fellBackToLinearScan,
+    group,
   };
 }
 
@@ -382,17 +409,16 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   if (candidateVersions.length === 0) {
-    return finishBisect(pkgName, candidateVersions, [], null, null, false);
+    return finishBisect(pkgName, candidateVersions, [], null, null, false, options.group);
   }
 
-  const { section, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
   const testAt = (index: number) =>
     testOneVersion(
-      pkgName,
       candidateVersions[index]!,
       options,
       packageManagerInfo,
-      section,
+      pinTargets,
     );
 
   const tested: CompatVersionResult[] = [];
@@ -404,11 +430,19 @@ export async function runCompatBisect(
   if (topResult.status !== "PASSED") {
     // Nothing in range is presumed compatible under the monotonic
     // assumption — bisect makes no claim beyond the top version.
-    return finishBisect(pkgName, candidateVersions, tested, null, null, false);
+    return finishBisect(pkgName, candidateVersions, tested, null, null, false, options.group);
   }
 
   if (candidateVersions.length === 1) {
-    return finishBisect(pkgName, candidateVersions, tested, topVersion, topVersion, false);
+    return finishBisect(
+      pkgName,
+      candidateVersions,
+      tested,
+      topVersion,
+      topVersion,
+      false,
+      options.group,
+    );
   }
 
   const bottomResult = await testAt(0);
@@ -421,6 +455,7 @@ export async function runCompatBisect(
       candidateVersions[0]!,
       topVersion,
       false,
+      options.group,
     );
   }
 
@@ -461,5 +496,6 @@ export async function runCompatBisect(
     boundaryVersion,
     topVersion,
     false,
+    options.group,
   );
 }

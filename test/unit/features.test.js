@@ -905,6 +905,126 @@ class FeatureTests {
     });
   }
 
+  // --- compat --group -----------------------------------------------------
+
+  async buildFakeFamilyRegistry(versions) {
+    const packages = {};
+    for (const name of ['fake-core', 'fake-common', 'fake-express']) {
+      const versionsMap = {};
+      for (const version of versions) {
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name, version, main: 'index.js' }),
+          'index.js': 'module.exports = {};',
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      packages[name] = versionsMap;
+    }
+    return this.registryMulti(packages);
+  }
+
+  async testCompatGroupWithoutFlagSurfacesMismatch() {
+    await this.run('compat without --group leaves peer packages mismatched and FAILED', async () => {
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0']);
+
+      const appDir = this.tmp('compat-group-mismatch');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0', 'fake-express': '1.0.0' },
+      });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'const c=require("fake-core/package.json").version,m=require("fake-common/package.json").version,e=require("fake-express/package.json").version;\n' +
+        'process.exit(c===m && m===e ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '2.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'FAILED', 'pinning only fake-core should leave the family mismatched');
+    });
+  }
+
+  async testCompatGroupMovesFamilyTogether() {
+    await this.run('compat --group pins the whole family to the same version', async () => {
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0']);
+
+      const appDir = this.tmp('compat-group-together');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0', 'fake-express': '1.0.0' },
+      });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'const c=require("fake-core/package.json").version,m=require("fake-common/package.json").version,e=require("fake-express/package.json").version;\n' +
+        'process.exit(c===m && m===e ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '2.0.0', '--group', 'fake-common,fake-express',
+        '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+      assert.deepStrictEqual(json.group, ['fake-common', 'fake-express']);
+    });
+  }
+
+  async testCompatGroupErrorsOnUndeclaredMember() {
+    await this.run('compat --group errors clearly when a group member is not declared', async () => {
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0']);
+
+      const appDir = this.tmp('compat-group-undeclared');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '2.0.0', '--group', 'fake-common,fake-express',
+        '--app', appDir, '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.notStrictEqual(r.code, 0, 'expected a non-zero exit for an undeclared group member');
+      assert.match(r.stderr, /fake-express/);
+      assert.match(r.stderr, /not declared/i);
+    });
+  }
+
+  async testCompatGroupComposesWithBisect() {
+    await this.run('compat --group composes with --bisect across the whole family', async () => {
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0', '3.0.0']);
+
+      const appDir = this.tmp('compat-group-bisect');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0', 'fake-express': '1.0.0' },
+      });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'const c=require("fake-core/package.json").version,m=require("fake-common/package.json").version,e=require("fake-express/package.json").version;\n' +
+        'process.exit(c===m && m===e ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '1.0.0,2.0.0,3.0.0', '--group', 'fake-common,fake-express',
+        '--bisect', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.minimumCompatibleVersion, '1.0.0');
+      assert.strictEqual(json.recommendedVersion, '3.0.0');
+      assert.ok(!json.versions.some((v) => v.status !== 'PASSED'), 'grouping should keep every tested version consistent and PASSED');
+    });
+  }
+
   // --- compat --bisect --------------------------------------------------
 
   async testCompatBisectFindsBoundaryInFewerRuns() {
@@ -1317,6 +1437,10 @@ class FeatureTests {
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
+      await this.testCompatGroupWithoutFlagSurfacesMismatch();
+      await this.testCompatGroupMovesFamilyTogether();
+      await this.testCompatGroupErrorsOnUndeclaredMember();
+      await this.testCompatGroupComposesWithBisect();
       await this.testCompatBisectFindsBoundaryInFewerRuns();
       await this.testCompatBisectEverythingPasses();
       await this.testCompatBisectNothingPasses();

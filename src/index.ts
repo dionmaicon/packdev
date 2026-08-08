@@ -562,6 +562,10 @@ program
     "Binary search for the pass/fail boundary instead of testing every version",
     false,
   )
+  .option(
+    "--group <packages>",
+    "Comma-separated package names to pin to the same version as <package> in every sandboxed run",
+  )
   .action(async (packageName: string, options) => {
     try {
       if (!options.range && !options.versions) {
@@ -584,6 +588,12 @@ program
         registryUrl: options.registry,
         includePrerelease: !!options.includePrerelease,
         includeDeprecated: !!options.includeDeprecated,
+        group: options.group
+          ? String(options.group)
+              .split(",")
+              .map((v: string) => v.trim())
+              .filter(Boolean)
+          : undefined,
       };
 
       const report: CompatReport | CompatBisectReport = options.bisect
@@ -592,6 +602,9 @@ program
 
       output({ command: "compat", ...report }, () => {
         console.log(`📦 ${report.package} — runtime compatibility`);
+        if (report.group && report.group.length > 0) {
+          console.log(`🔗 Group: ${report.group.join(", ")} (pinned in lockstep)`);
+        }
         if (isCompatBisectReport(report)) {
           console.log(
             `🔍 Bisected: ${report.testedVersionCount}/${report.totalVersionCount} versions tested`,
