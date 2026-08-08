@@ -500,6 +500,104 @@ class FeatureTests {
     });
   }
 
+  async testApiIntrospectFindsPrototypeMethods() {
+    await this.run('api --introspect reflects class prototype methods a naive Object.keys() would miss', async () => {
+      const dir = this.tmp('api-introspect-basic');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'plain-js',
+        { name: 'plain-js', version: '0.1.0', main: 'index.js' },
+        {
+          'index.js':
+            'class Foo { bar() {} baz() {} }\n' +
+            'module.exports = { Foo, plainFn: function (a, b) {} };\n',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'plain-js', '--introspect', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, false, 'no static types exist for this fixture');
+      assert.ok(json.runtimeIntrospection, 'expected a runtimeIntrospection result');
+      const foo = json.runtimeIntrospection.exports.find((e) => e.name === 'Foo');
+      const fn = json.runtimeIntrospection.exports.find((e) => e.name === 'plainFn');
+      assert.ok(foo, 'expected Foo in runtime-introspected exports');
+      assert.strictEqual(foo.kind, 'class');
+      assert.deepStrictEqual([...foo.members].sort(), ['bar', 'baz']);
+      assert.ok(fn, 'expected plainFn in runtime-introspected exports');
+      assert.strictEqual(fn.kind, 'function');
+      assert.strictEqual(fn.signature, '(2 args)');
+    });
+  }
+
+  async testApiIntrospectWorksThroughProxy() {
+    await this.run('api --introspect reflects members correctly through a Proxy-wrapped export', async () => {
+      const dir = this.tmp('api-introspect-proxy');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'proxied-js',
+        { name: 'proxied-js', version: '0.1.0', main: 'index.js' },
+        {
+          'index.js':
+            'class Foo { bar() {} }\n' +
+            'module.exports = new Proxy({ Foo, plainFn: function (a, b) {} }, {});\n',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'proxied-js', '--introspect', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.ok(json.runtimeIntrospection, 'expected a runtimeIntrospection result');
+      const foo = json.runtimeIntrospection.exports.find((e) => e.name === 'Foo');
+      assert.ok(foo, 'expected Foo to be visible through the wrapping Proxy');
+      assert.deepStrictEqual(foo.members, ['bar']);
+    });
+  }
+
+  async testApiIntrospectIsOptInOnly() {
+    await this.run('api never executes the package without --introspect', async () => {
+      const dir = this.tmp('api-introspect-optin');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      const pkgDir = writeNodeModulesPackage(
+        dir,
+        'plain-js',
+        { name: 'plain-js', version: '0.1.0', main: 'index.js' },
+        {
+          'index.js':
+            'require("fs").writeFileSync(require("path").join(__dirname, "loaded.marker"), "x");\n' +
+            'module.exports = {};\n',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'plain-js', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.runtimeIntrospection, null);
+      assert.ok(
+        !fs.existsSync(path.join(pkgDir, 'loaded.marker')),
+        'package must never be executed unless --introspect is passed',
+      );
+    });
+  }
+
+  async testApiIntrospectTimesOutSafely() {
+    await this.run('api --introspect times out instead of hanging on a stuck module', async () => {
+      const dir = this.tmp('api-introspect-timeout');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'hangs-js',
+        { name: 'hangs-js', version: '0.1.0', main: 'index.js' },
+        { 'index.js': 'while (true) {}\n' },
+      );
+      const r = await runPackdev(dir, [
+        'api', 'hangs-js', '--introspect', '--introspect-timeout-ms', '1500', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.runtimeIntrospection, null);
+    });
+  }
+
   async testApiPackageNotInstalled() {
     await this.run('api exits 4 when the package is not installed', async () => {
       const dir = this.tmp('api-not-installed');
@@ -1496,6 +1594,10 @@ class FeatureTests {
       await this.testApiExportsMapResolution();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
+      await this.testApiIntrospectFindsPrototypeMethods();
+      await this.testApiIntrospectWorksThroughProxy();
+      await this.testApiIntrospectIsOptInOnly();
+      await this.testApiIntrospectTimesOutSafely();
       await this.testApiPackageNotInstalled();
       await this.testApiHoistedResolution();
       await this.testApiDiffRangeEnumerationAndDiff();

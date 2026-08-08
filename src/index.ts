@@ -16,9 +16,14 @@ import {
 import {
   resolveInstalledPackage,
   resolvePackageExportMap,
+  resolveEntryPoint,
   getInstalledVersion,
   type ExportedSymbolWithSubpath,
 } from "./api";
+import {
+  introspectModuleRuntime,
+  type RuntimeExportedSymbol,
+} from "./runtimeIntrospect";
 import { readJsonFile, groupBy, type PackageInfo } from "./utils";
 import { runApiDiff } from "./apiDiff";
 import {
@@ -383,7 +388,17 @@ program
     "Show the export map of a package's currently-installed version",
   )
   .argument("<package>", "Package name to inspect")
-  .action(async (packageName: string) => {
+  .option(
+    "--introspect",
+    "When no static types are found, fall back to executing the installed package and reflecting its runtime shape (executes third-party code — opt-in only)",
+    false,
+  )
+  .option(
+    "--introspect-timeout-ms <n>",
+    "Timeout for runtime introspection",
+    "5000",
+  )
+  .action(async (packageName: string, options) => {
     try {
       const pkgDir = await resolveInstalledPackage(packageName, process.cwd());
       if (!pkgDir) {
@@ -414,6 +429,16 @@ program
       const version =
         (await getInstalledVersion(pkgDir)) || packageInfo.version;
 
+      let runtimeIntrospection: { exports: RuntimeExportedSymbol[] } | null = null;
+      if (!hasTypes && options.introspect) {
+        const { jsPath } = await resolveEntryPoint(pkgDir, packageInfo);
+        const introspected = await introspectModuleRuntime(
+          jsPath,
+          Number(options.introspectTimeoutMs),
+        );
+        if (introspected) runtimeIntrospection = { exports: introspected };
+      }
+
       output(
         {
           command: "api",
@@ -422,6 +447,7 @@ program
           resolvedPath: pkgDir,
           hasTypes,
           exports: exportsList,
+          runtimeIntrospection,
         },
         () => {
           console.log(`📦 ${packageName}@${version} (resolved: ${pkgDir})`);
@@ -429,6 +455,18 @@ program
             console.log(
               "\n⚠️  No type declarations found for this package (pure JS, or types could not be resolved).",
             );
+            if (runtimeIntrospection) {
+              console.log(
+                "\n⚠️  Runtime introspection (executed package code) — less precise than static types:",
+              );
+              printExportsByKind(
+                runtimeIntrospection.exports.map((e) => ({ ...e, subpath: "." })),
+              );
+            } else if (options.introspect) {
+              console.log(
+                "\n⚠️  Runtime introspection failed, timed out, or found nothing.",
+              );
+            }
             return;
           }
           if (exportsList.length === 0) {
