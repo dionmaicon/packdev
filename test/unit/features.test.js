@@ -567,6 +567,72 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffExcludesDeprecatedByDefault() {
+    await this.run('api-diff excludes deprecated versions unless --include-deprecated', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2, deprecated: 'superseded by 3.x' },
+      });
+
+      const appDir = this.tmp('api-diff-deprecated');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), '');
+
+      const withoutFlag = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      const withoutJson = parseJson(withoutFlag.stdout, 'api-diff');
+      assert.ok(!withoutJson.versions.some((v) => v.version === '2.0.0'), 'deprecated version should be excluded by default');
+
+      const withFlag = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--include-deprecated', '--json',
+      ]);
+      const withJson = parseJson(withFlag.stdout, 'api-diff');
+      assert.ok(withJson.versions.some((v) => v.version === '2.0.0'), 'deprecated version should be included with --include-deprecated');
+    });
+  }
+
+  async testApiDiffVsCompatDivergeOnBehaviorChange() {
+    await this.run('api-diff (static) and compat (behavioral) can honestly disagree on the same version', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = { formatDate: () => "wrong-value" };',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-vs-compat');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "fake-lib";\nformatDate("x");\n');
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(require("fake-lib").formatDate("x") === "expected-value" ? 0 : 1);\n',
+      );
+
+      const diffResult = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      const diffJson = parseJson(diffResult.stdout, 'api-diff');
+      const diffVersion = diffJson.versions.find((v) => v.version === '1.0.0');
+      assert.strictEqual(diffVersion.apiCompatible, true, 'export shape matches, so api-diff should call it compatible');
+
+      const compatResult = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const compatJson = parseJson(compatResult.stdout, 'compat');
+      assert.strictEqual(compatJson.versions[0].status, 'FAILED', 'runtime behavior differs, so compat should call it FAILED');
+    });
+  }
+
   async testApiDiffFlagsDynamicUsage() {
     await this.run('api-diff flags a namespace import as unverifiable dynamic usage', async () => {
       const v1 = await buildFakeTarball({
@@ -1239,6 +1305,8 @@ class FeatureTests {
       await this.testApiHoistedResolution();
       await this.testApiDiffRangeEnumerationAndDiff();
       await this.testApiDiffExcludesPrereleaseByDefault();
+      await this.testApiDiffExcludesDeprecatedByDefault();
+      await this.testApiDiffVsCompatDivergeOnBehaviorChange();
       await this.testApiDiffFlagsDynamicUsage();
       await this.testApiDiffNoUsageMeansEveryVersionCompatible();
       await this.testApiDiffCleansUpTempDirs();
