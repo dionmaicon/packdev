@@ -447,6 +447,29 @@ class FeatureTests {
     });
   }
 
+  async testApiResolvesExportEqualsAsDefault() {
+    await this.run('api reports a TS "export = X" declaration as the default export', async () => {
+      const dir = this.tmp('api-export-equals');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'export-equals-lib',
+        { name: 'export-equals-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = (value) => value % 2 !== 0;',
+          'index.d.ts': 'declare function isOdd(value: number): boolean;\nexport = isOdd;\n',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'export-equals-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, true);
+      const defaultExport = json.exports.find((e) => e.name === 'default');
+      assert.ok(defaultExport, 'expected "export = isOdd" to surface as a "default" export, not be invisible');
+      assert.strictEqual(defaultExport.kind, 'function');
+    });
+  }
+
   async testApiIncludesSubpathExports() {
     await this.run('api includes exports from subpaths declared in the "exports" map', async () => {
       const dir = this.tmp('api-subpath-exports');
@@ -668,6 +691,33 @@ class FeatureTests {
       const v1Result = json.versions.find((v) => v.version === '1.0.0');
       assert.strictEqual(v1Result.apiCompatible, false);
       assert.deepStrictEqual(v1Result.missingSymbols, ['formatDate']);
+    });
+  }
+
+  async testApiDiffDoesNotFalseNegativeOnExportEquals() {
+    await this.run('api-diff does not false-negative a default import against a TS "export = X" package', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = (value) => value % 2 !== 0;',
+        'index.d.ts': 'declare function isOdd(value: number): boolean;\nexport = isOdd;\n',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-export-equals');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import isOdd from "fake-lib";\nisOdd(3);\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.usedSymbols, ['default']);
+      const versionResult = json.versions[0];
+      assert.strictEqual(
+        versionResult.apiCompatible, true,
+        '"export = isOdd" satisfies a default import and must not be reported as a missing symbol',
+      );
+      assert.deepStrictEqual(versionResult.missingSymbols, []);
     });
   }
 
@@ -1807,6 +1857,7 @@ class FeatureTests {
       await this.testApiHumanOutput();
       await this.testApiJsonShape();
       await this.testApiExportsMapResolution();
+      await this.testApiResolvesExportEqualsAsDefault();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
       await this.testApiIntrospectFindsPrototypeMethods();
@@ -1816,6 +1867,7 @@ class FeatureTests {
       await this.testApiPackageNotInstalled();
       await this.testApiHoistedResolution();
       await this.testApiDiffRangeEnumerationAndDiff();
+      await this.testApiDiffDoesNotFalseNegativeOnExportEquals();
       await this.testApiDiffExcludesPrereleaseByDefault();
       await this.testApiDiffExcludesDeprecatedByDefault();
       await this.testApiDiffVsCompatDivergeOnBehaviorChange();

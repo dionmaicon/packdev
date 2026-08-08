@@ -565,7 +565,7 @@ program
         },
         () => console.error("❌ Error running api-diff:", error),
       );
-      process.exit(EXIT_CODE.GENERIC_ERROR);
+      process.exit(exitCodeFor(String(error)));
     }
   });
 
@@ -714,7 +714,7 @@ program
         },
         () => console.error("❌ Error running compat:", error),
       );
-      process.exit(EXIT_CODE.GENERIC_ERROR);
+      process.exit(exitCodeFor(String(error)));
     }
   });
 
@@ -767,7 +767,7 @@ program
         },
         () => console.error("❌ Error checking for duplicates:", error),
       );
-      process.exit(EXIT_CODE.GENERIC_ERROR);
+      process.exit(exitCodeFor(String(error)));
     }
   });
 

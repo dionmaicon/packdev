@@ -266,6 +266,33 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
   if (!moduleSymbol) return [];
 
   const results: ExportedSymbol[] = [];
+
+  // `export = X` (TypeScript's CommonJS export-assignment syntax — common
+  // in @types/* packages for pre-ESM libraries, e.g. `export = isOdd;`)
+  // never shows up in getExportsOfModule; it lives under the special
+  // "export=" key and must be resolved through its alias. Report it as
+  // "default" to match how appScan.ts records `import X from "pkg"" —
+  // without this, api-diff always false-negatives such packages as
+  // missing their entire default export.
+  const exportEqualsSymbol = moduleSymbol.exports?.get(
+    ts.InternalSymbolName.ExportEquals,
+  );
+  if (exportEqualsSymbol) {
+    const resolved =
+      exportEqualsSymbol.getFlags() & ts.SymbolFlags.Alias
+        ? checker.getAliasedSymbol(exportEqualsSymbol)
+        : exportEqualsSymbol;
+    const declaration = resolved.declarations?.[0];
+    if (declaration) {
+      const kind = classifySymbol(resolved);
+      results.push({
+        name: "default",
+        kind,
+        signature: describeSymbol(checker, resolved, kind, declaration),
+      });
+    }
+  }
+
   for (const symbol of checker.getExportsOfModule(moduleSymbol)) {
     const declaration = symbol.declarations?.[0];
     if (!declaration) continue;
