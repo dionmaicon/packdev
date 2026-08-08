@@ -22,7 +22,12 @@ import {
 } from "./api";
 import { readJsonFile, groupBy, type PackageInfo } from "./utils";
 import { runApiDiff } from "./apiDiff";
-import { runCompat } from "./compat";
+import {
+  runCompat,
+  runCompatBisect,
+  type CompatReport,
+  type CompatBisectReport,
+} from "./compat";
 
 const program = new Command();
 
@@ -43,6 +48,12 @@ function output(data: Record<string, unknown>, human: () => void): void {
   } else {
     human();
   }
+}
+
+function isCompatBisectReport(
+  report: CompatReport | CompatBisectReport,
+): report is CompatBisectReport {
+  return "bisected" in report;
 }
 
 function log(message: string): void {
@@ -545,6 +556,11 @@ program
   )
   .option("--include-prerelease", "Include prerelease versions with --range", false)
   .option("--include-deprecated", "Include deprecated versions with --range", false)
+  .option(
+    "--bisect",
+    "Binary search for the pass/fail boundary instead of testing every version",
+    false,
+  )
   .action(async (packageName: string, options) => {
     try {
       if (!options.range && !options.versions) {
@@ -554,7 +570,7 @@ program
         throw new Error("--range and --versions are mutually exclusive");
       }
 
-      const report = await runCompat(packageName, {
+      const compatOptions = {
         range: options.range,
         versions: options.versions
           ? String(options.versions)
@@ -567,10 +583,19 @@ program
         registryUrl: options.registry,
         includePrerelease: !!options.includePrerelease,
         includeDeprecated: !!options.includeDeprecated,
-      });
+      };
+
+      const report: CompatReport | CompatBisectReport = options.bisect
+        ? await runCompatBisect(packageName, compatOptions)
+        : await runCompat(packageName, compatOptions);
 
       output({ command: "compat", ...report }, () => {
         console.log(`📦 ${report.package} — runtime compatibility`);
+        if (isCompatBisectReport(report)) {
+          console.log(
+            `🔍 Bisected: ${report.testedVersionCount}/${report.totalVersionCount} versions tested`,
+          );
+        }
         console.log("");
 
         for (const v of report.versions) {
@@ -591,9 +616,15 @@ program
         if (!report.minimumCompatibleVersion) {
           console.log("⚠️  No version in range passed the test command.");
         }
-        if (report.nonMonotonic) {
+        if (isCompatBisectReport(report)) {
+          if (report.fellBackToLinearScan) {
+            console.log(
+              "⚠️  Bisect assumption broke (flaky test or non-monotonic pass/fail) — fell back to testing all versions for a trustworthy result.",
+            );
+          }
+        } else if (report.nonMonotonic) {
           console.log(
-            "⚠️  Pass/fail isn't contiguous — consider testing individual versions manually; full --bisect support isn't built yet.",
+            "⚠️  Pass/fail isn't contiguous — consider testing individual versions manually, or re-run with --bisect.",
           );
         }
       });

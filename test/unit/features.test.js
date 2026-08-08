@@ -839,6 +839,167 @@ class FeatureTests {
     });
   }
 
+  // --- compat --bisect --------------------------------------------------
+
+  async testCompatBisectFindsBoundaryInFewerRuns() {
+    await this.run('compat --bisect finds the pass/fail boundary without testing every version', async () => {
+      // v1-v4: no `special` export (test fails). v5-v9: has it (test passes).
+      const versionsMap = {};
+      for (let i = 1; i <= 9; i++) {
+        const version = `${i}.0.0`;
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name: 'fake-lib', version, main: 'index.js' }),
+          'index.js': `module.exports = { special: ${i >= 5} };`,
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      const registryUrl = await this.registry('fake-lib', versionsMap);
+
+      const appDir = this.tmp('compat-bisect-boundary');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(require("fake-lib").special ? 0 : 1);\n',
+      );
+
+      const allVersions = Array.from({ length: 9 }, (_, i) => `${i + 1}.0.0`).join(',');
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', allVersions, '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--bisect', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.bisected, true);
+      assert.strictEqual(json.minimumCompatibleVersion, '5.0.0');
+      assert.strictEqual(json.recommendedVersion, '9.0.0');
+      assert.strictEqual(json.totalVersionCount, 9);
+      assert.ok(
+        json.testedVersionCount < json.totalVersionCount,
+        `expected fewer than 9 versions tested, got ${json.testedVersionCount}`,
+      );
+      assert.strictEqual(json.fellBackToLinearScan, false);
+    });
+  }
+
+  async testCompatBisectEverythingPasses() {
+    await this.run('compat --bisect converges in 2 runs when every version passes', async () => {
+      const versionsMap = {};
+      for (let i = 1; i <= 3; i++) {
+        const version = `${i}.0.0`;
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name: 'fake-lib', version, main: 'index.js' }),
+          'index.js': 'module.exports = { special: true };',
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      const registryUrl = await this.registry('fake-lib', versionsMap);
+
+      const appDir = this.tmp('compat-bisect-allpass');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(require("fake-lib").special ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0,3.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--bisect', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.testedVersionCount, 2);
+      assert.strictEqual(json.minimumCompatibleVersion, '1.0.0');
+      assert.strictEqual(json.recommendedVersion, '3.0.0');
+    });
+  }
+
+  async testCompatBisectNothingPasses() {
+    await this.run('compat --bisect stops after 1 run when the top version fails', async () => {
+      const versionsMap = {};
+      for (let i = 1; i <= 3; i++) {
+        const version = `${i}.0.0`;
+        const tarball = await buildFakeTarball({
+          'package.json': JSON.stringify({ name: 'fake-lib', version, main: 'index.js' }),
+          'index.js': 'module.exports = { special: false };',
+        });
+        versionsMap[version] = { tarballBuffer: tarball };
+      }
+      const registryUrl = await this.registry('fake-lib', versionsMap);
+
+      const appDir = this.tmp('compat-bisect-nopass');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(require("fake-lib").special ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0,3.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--bisect', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.testedVersionCount, 1);
+      assert.strictEqual(json.minimumCompatibleVersion, null);
+      assert.strictEqual(json.recommendedVersion, null);
+    });
+  }
+
+  async testCompatBisectFallsBackOnFlakyBoundary() {
+    await this.run('compat --bisect falls back to a full scan when the boundary version is flaky', async () => {
+      const appDir = this.tmp('compat-bisect-flaky');
+      // v2's own test result flips between its first (bisect-loop) run and
+      // its confirmation re-run, simulating a flaky/non-monotonic boundary.
+      const counterPath = path.join(appDir, 'bisect-counter.txt');
+
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { marker: "v1" };',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { marker: "v2" };',
+      });
+      const v3 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '3.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { marker: "v3" };',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+        '3.0.0': { tarballBuffer: v3 },
+      });
+
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        [
+          'const fs = require("fs");',
+          'const lib = require("fake-lib");',
+          `const counterPath = ${JSON.stringify(counterPath)};`,
+          'if (lib.marker === "v1") process.exit(1);',
+          'if (lib.marker === "v3") process.exit(0);',
+          // v2: passes exactly once, fails on every subsequent run.
+          'let count = 0;',
+          'try { count = parseInt(fs.readFileSync(counterPath, "utf-8"), 10) || 0; } catch {}',
+          'fs.writeFileSync(counterPath, String(count + 1));',
+          'process.exit(count === 0 ? 0 : 1);',
+        ].join('\n'),
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0,3.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--bisect', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.fellBackToLinearScan, true);
+      assert.strictEqual(json.testedVersionCount, 3);
+      assert.strictEqual(json.totalVersionCount, 3);
+      assert.strictEqual(json.versions.length, 3, 'fallback should report exactly one result per version');
+    });
+  }
+
   // --- git dependencies -----------------------------------------------------
 
   async testGitFileUrlClassified() {
@@ -1026,6 +1187,10 @@ class FeatureTests {
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
+      await this.testCompatBisectFindsBoundaryInFewerRuns();
+      await this.testCompatBisectEverythingPasses();
+      await this.testCompatBisectNothingPasses();
+      await this.testCompatBisectFallsBackOnFlakyBoundary();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

@@ -247,14 +247,52 @@ function computeNonMonotonic(versions: CompatVersionResult[]): boolean {
   return false;
 }
 
-export async function runCompat(
+// Sandboxes, installs, and tests exactly one version — the shared execution
+// path for both the full linear scan (runCompat) and --bisect.
+async function testOneVersion(
+  pkgName: string,
+  version: string,
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  section: DependencySection,
+): Promise<CompatVersionResult> {
+  const startedAt = Date.now();
+  let sandboxDir: string | null = null;
+  try {
+    sandboxDir = await createSandbox(options.appDir, pkgName, version, section);
+
+    const installResult = await runInstall(
+      sandboxDir,
+      packageManagerInfo.manager,
+      options.registryUrl,
+    );
+    if (!installResult.success) {
+      return {
+        version,
+        status: "INSTALL_FAILED",
+        exitCode: installResult.exitCode,
+        durationMs: Date.now() - startedAt,
+        output: installResult.output,
+      };
+    }
+
+    const testResult = await runTestCommand(sandboxDir, options.testCommand);
+    return {
+      version,
+      status: testResult.success ? "PASSED" : "FAILED",
+      exitCode: testResult.exitCode,
+      durationMs: Date.now() - startedAt,
+      output: testResult.success ? undefined : testResult.output,
+    };
+  } finally {
+    if (sandboxDir) await cleanupSandbox(sandboxDir);
+  }
+}
+
+async function resolveRunContext(
   pkgName: string,
   options: CompatOptions,
-): Promise<CompatReport> {
-  registerCompatSignalHandling();
-
-  const candidateVersions = await resolveCandidateVersions(pkgName, options);
-
+): Promise<{ section: DependencySection; packageManagerInfo: PackageManagerInfo }> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
   if (!appPackageJson) {
@@ -269,41 +307,23 @@ export async function runCompat(
   }
 
   const packageManagerInfo = await detectPackageManager(options.appDir);
+  return { section, packageManagerInfo };
+}
+
+export async function runCompat(
+  pkgName: string,
+  options: CompatOptions,
+): Promise<CompatReport> {
+  registerCompatSignalHandling();
+
+  const candidateVersions = await resolveCandidateVersions(pkgName, options);
+  const { section, packageManagerInfo } = await resolveRunContext(pkgName, options);
 
   const versions: CompatVersionResult[] = [];
   for (const version of candidateVersions) {
-    const startedAt = Date.now();
-    let sandboxDir: string | null = null;
-    try {
-      sandboxDir = await createSandbox(options.appDir, pkgName, version, section);
-
-      const installResult = await runInstall(
-        sandboxDir,
-        packageManagerInfo.manager,
-        options.registryUrl,
-      );
-      if (!installResult.success) {
-        versions.push({
-          version,
-          status: "INSTALL_FAILED",
-          exitCode: installResult.exitCode,
-          durationMs: Date.now() - startedAt,
-          output: installResult.output,
-        });
-        continue;
-      }
-
-      const testResult = await runTestCommand(sandboxDir, options.testCommand);
-      versions.push({
-        version,
-        status: testResult.success ? "PASSED" : "FAILED",
-        exitCode: testResult.exitCode,
-        durationMs: Date.now() - startedAt,
-        output: testResult.success ? undefined : testResult.output,
-      });
-    } finally {
-      if (sandboxDir) await cleanupSandbox(sandboxDir);
-    }
+    versions.push(
+      await testOneVersion(pkgName, version, options, packageManagerInfo, section),
+    );
   }
 
   const passedVersions = versions
@@ -317,4 +337,129 @@ export async function runCompat(
     nonMonotonic: computeNonMonotonic(versions),
     versions,
   };
+}
+
+export interface CompatBisectReport extends CompatReport {
+  bisected: true;
+  testedVersionCount: number;
+  totalVersionCount: number;
+  fellBackToLinearScan: boolean;
+}
+
+function finishBisect(
+  pkgName: string,
+  candidateVersions: string[],
+  tested: CompatVersionResult[],
+  minimumCompatibleVersion: string | null,
+  recommendedVersion: string | null,
+  fellBackToLinearScan: boolean,
+): CompatBisectReport {
+  return {
+    package: pkgName,
+    minimumCompatibleVersion,
+    recommendedVersion,
+    nonMonotonic: false,
+    versions: tested,
+    bisected: true,
+    testedVersionCount: tested.length,
+    totalVersionCount: candidateVersions.length,
+    fellBackToLinearScan,
+  };
+}
+
+/**
+ * Binary-search for the pass/fail boundary instead of testing every
+ * candidate version. Assumes the pattern is monotonic (fails below some
+ * version, passes from it onward) — after converging, re-runs the boundary
+ * version once to catch flakiness/non-monotonicity, falling back to a full
+ * linear scan (runCompat) rather than trusting a possibly-wrong fast answer.
+ */
+export async function runCompatBisect(
+  pkgName: string,
+  options: CompatOptions,
+): Promise<CompatBisectReport> {
+  registerCompatSignalHandling();
+
+  const candidateVersions = await resolveCandidateVersions(pkgName, options);
+  if (candidateVersions.length === 0) {
+    return finishBisect(pkgName, candidateVersions, [], null, null, false);
+  }
+
+  const { section, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const testAt = (index: number) =>
+    testOneVersion(
+      pkgName,
+      candidateVersions[index]!,
+      options,
+      packageManagerInfo,
+      section,
+    );
+
+  const tested: CompatVersionResult[] = [];
+  const topIndex = candidateVersions.length - 1;
+  const topVersion = candidateVersions[topIndex]!;
+
+  const topResult = await testAt(topIndex);
+  tested.push(topResult);
+  if (topResult.status !== "PASSED") {
+    // Nothing in range is presumed compatible under the monotonic
+    // assumption — bisect makes no claim beyond the top version.
+    return finishBisect(pkgName, candidateVersions, tested, null, null, false);
+  }
+
+  if (candidateVersions.length === 1) {
+    return finishBisect(pkgName, candidateVersions, tested, topVersion, topVersion, false);
+  }
+
+  const bottomResult = await testAt(0);
+  tested.push(bottomResult);
+  if (bottomResult.status === "PASSED") {
+    return finishBisect(
+      pkgName,
+      candidateVersions,
+      tested,
+      candidateVersions[0]!,
+      topVersion,
+      false,
+    );
+  }
+
+  let lo = 0;
+  let hi = topIndex;
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    const midResult = await testAt(mid);
+    tested.push(midResult);
+    if (midResult.status === "PASSED") {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+
+  const boundaryVersion = candidateVersions[hi]!;
+  const confirmResult = await testAt(hi);
+  tested.push(confirmResult);
+
+  if (confirmResult.status !== "PASSED") {
+    // The monotonic assumption broke (flaky test or a real non-monotonic
+    // pattern) — fall back to a full linear scan for a trustworthy answer.
+    const fullReport = await runCompat(pkgName, options);
+    return {
+      ...fullReport,
+      bisected: true,
+      testedVersionCount: candidateVersions.length,
+      totalVersionCount: candidateVersions.length,
+      fellBackToLinearScan: true,
+    };
+  }
+
+  return finishBisect(
+    pkgName,
+    candidateVersions,
+    tested,
+    boundaryVersion,
+    topVersion,
+    false,
+  );
 }
