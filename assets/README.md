@@ -24,6 +24,22 @@ Edit `demo.tape` to change commands, timing, theme, or size. It points `packdev`
 at `dist/index.js` (no global install or publish needed) and uses `--no-install`
 to stay fast and offline; drop that flag to show the real install step.
 
+## 🔬 API compatibility demo (`api-compat-demo.gif`)
+
+`api-compat-demo.gif` demonstrates `packdev api` and `packdev api-diff` against
+a fictional `acme-utils` package whose `formatDate` export gets silently
+dropped in `2.0.0` — a real-shaped breaking change `api-diff` catches before
+you actually upgrade to it. Fully offline and deterministic: `api-compat-demo-setup.js`
+builds three throwaway package tarballs and serves them from a local fake
+registry (`api-compat-demo-server.js`, launched detached on a dynamically
+assigned port) — no real network calls.
+
+**Regenerate** (needs `vhs`, `ttyd`, and `ffmpeg` on PATH):
+
+```bash
+npm run build && vhs assets/api-compat-demo.tape   # writes assets/api-compat-demo.gif
+```
+
 ## 📁 Required Assets
 
 ### Favicon Files

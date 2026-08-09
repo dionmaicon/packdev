@@ -258,6 +258,8 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 
 Before upgrading a dependency (or letting an LLM assume an API exists), check what's actually there — cheap static checks first, expensive real ones only on the survivors:
 
+![API compatibility demo](assets/api-compat-demo.gif)
+
 ```bash
 # 1. Static, no install: which versions have every symbol my app imports?
 packdev api-diff is-odd --range ">=0.1.0 <4.0.0" --json
