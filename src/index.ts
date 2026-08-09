@@ -107,6 +107,7 @@ const EXIT_CODE = {
   PACKAGE_JSON_NOT_FOUND: 3,
   PACKAGE_NOT_INSTALLED: 4,
   DUPLICATE_FOUND: 5,
+  NOTHING_TESTED: 6,
 } as const;
 
 function exitCodeFor(error?: string): number {
@@ -724,6 +725,10 @@ program
         ? await runCompatBisect(packageName, compatOptions)
         : await runCompat(packageName, compatOptions);
 
+      const nothingTested =
+        report.versions.length > 0 &&
+        report.versions.every((v) => v.status === "SKIPPED");
+
       output({ command: "compat", ...report }, () => {
         console.log(`📦 ${report.package} — runtime compatibility`);
         if (report.group && report.group.length > 0) {
@@ -775,7 +780,13 @@ program
           console.log(`💡 Recommended version: ${report.recommendedVersion}`);
         }
         if (!report.minimumCompatibleVersion) {
-          console.log("⚠️  No version in range passed the test command.");
+          if (nothingTested) {
+            console.log(
+              "⚠️  Every version was skipped — nothing was actually tested. This is NOT a confirmed incompatibility.",
+            );
+          } else {
+            console.log("⚠️  No version in range passed the test command.");
+          }
         }
         if (isCompatBisectReport(report)) {
           if (report.fellBackToLinearScan) {
@@ -789,6 +800,8 @@ program
           );
         }
       });
+
+      if (nothingTested) process.exit(EXIT_CODE.NOTHING_TESTED);
     } catch (error) {
       output(
         {
@@ -871,12 +884,16 @@ program
             );
             if (prereleaseHoistingNote) {
               const n = prereleaseHoistingNote;
+              const rangeDetail =
+                n.allBlockedRanges.length > 1
+                  ? `${n.blockedRange}, most common of ${n.allBlockedRanges.length} distinct ranges across ${n.totalBlockedWorkspaces} workspaces`
+                  : `${n.blockedRange}, used by ${n.blockedWorkspaces.length} workspace(s)`;
               console.log(
                 `⚠️  ${n.pinnedWorkspaces.length} workspace(s) pin a PRERELEASE (${n.prereleaseVersion}).`,
               );
               console.log(
                 `    Prerelease versions are not matched by the caret/tilde ranges used by other workspaces ` +
-                  `(${n.blockedRange}), so they cannot hoist and each pinned workspace gets a private copy.`,
+                  `(${rangeDetail}), so they cannot hoist and each pinned workspace gets a private copy.`,
               );
               console.log(
                 "    If this package exports classes used as identity tokens (NestJS providers, instanceof " +

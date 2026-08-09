@@ -1355,7 +1355,9 @@ class FeatureTests {
       const r = await runPackdev(appDir, [
         'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
       ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // Exit 6 (NOTHING_TESTED): every version came back SKIPPED, so nothing
+      // was actually verified — see testCompatNothingTestedExitCodeAndMessage.
+      assert.strictEqual(r.code, 6, `expected exit 6, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.strictEqual(json.versions[0].status, 'SKIPPED');
       assert.match(json.versions[0].output, /workspace:-protocol/);
@@ -1366,6 +1368,71 @@ class FeatureTests {
       ]);
       assert.match(human.stdout, /SKIPPED/);
       assert.match(human.stdout, /@acme\/shared/);
+    });
+  }
+
+  async testCompatAttemptsRealInstallWhenMonorepoRootFound() {
+    await this.run('compat sandboxes the whole monorepo and attempts a real install when workspace:* deps exist and a root is found', async () => {
+      // This proves the code path actually changed from "always SKIPPED" to
+      // "attempt a real sandboxed install" — npm itself doesn't understand
+      // the workspace: protocol (only yarn berry / pnpm do), so this fixture
+      // can't reach PASSED, but it must NOT be SKIPPED either: that would
+      // mean compat gave up without even trying, which is exactly the bug.
+      // (Full PASSED-via-real-resolution was verified manually against a
+      // real Yarn Berry 4.14.1 monorepo during development — see the
+      // "compat workspace:* protocol" field-report fix.)
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-monorepo-root');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+      const sharedDir = path.join(monorepoRoot, 'packages', 'shared');
+      fs.mkdirSync(sharedDir, { recursive: true });
+      writeJson(path.join(sharedDir, 'package.json'), { name: '@acme/shared', version: '1.0.0' });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0', '@acme/shared': 'workspace:*' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.notStrictEqual(json.versions[0].status, 'SKIPPED', 'a real install must have been attempted, not skipped, once a monorepo root is discoverable');
+    });
+  }
+
+  async testCompatNothingTestedExitCodeAndMessage() {
+    await this.run('compat exits 6 and says nothing was tested when every version is SKIPPED (not "no version passed")', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-nothing-tested');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0', '@acme/shared': 'workspace:*' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.strictEqual(r.code, 6, `expected exit 6 (NOTHING_TESTED), got ${r.code}: ${r.stderr}`);
+      assert.match(r.stdout, /nothing was actually tested/i);
+      assert.doesNotMatch(r.stdout, /No version in range passed the test command/);
     });
   }
 
@@ -2087,6 +2154,53 @@ class FeatureTests {
     });
   }
 
+  async testDupesPrereleaseNoteCitesMajorityRangeAcrossHoistedWorkspaces() {
+    await this.run('dupes cites the majority blocking range, including workspaces with no physical duplicate copy of their own', async () => {
+      // Regression for a real bug: the first version of this feature only
+      // scanned `resolutions` (workspaces with a PHYSICAL duplicate copy),
+      // silently missing every hoisted workspace (no copy of its own,
+      // resolves via the root) -- which is most of them in a real repo.
+      // Reproduces the exact reported distribution: 30 workspaces on
+      // ^1.0.195 (hoisted, no dupe), 4 pinning the prerelease (dupes), 1
+      // outlier on ^1.0.198 (also hoisted, no dupe).
+      const dir = this.tmp('dupes-prerelease-majority');
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'root', workspaces: ['apps/*'] }),
+      );
+      writeNodeModulesPackage(dir, 'shared-lib', { name: 'shared-lib', version: '1.0.196' });
+
+      for (let i = 0; i < 30; i++) {
+        const wsDir = path.join(dir, 'apps', `a${i}`);
+        fs.mkdirSync(wsDir, { recursive: true });
+        fs.writeFileSync(path.join(wsDir, 'package.json'), JSON.stringify({ name: `a${i}`, dependencies: { 'shared-lib': '^1.0.195' } }));
+      }
+      for (let i = 0; i < 4; i++) {
+        const wsDir = path.join(dir, 'apps', `pre${i}`);
+        fs.mkdirSync(wsDir, { recursive: true });
+        fs.writeFileSync(path.join(wsDir, 'package.json'), JSON.stringify({ name: `pre${i}`, dependencies: { 'shared-lib': '1.0.199-abc123' } }));
+        writeNodeModulesPackage(wsDir, 'shared-lib', { name: 'shared-lib', version: '1.0.199-abc123' });
+      }
+      const outlierDir = path.join(dir, 'apps', 'outlier');
+      fs.mkdirSync(outlierDir, { recursive: true });
+      fs.writeFileSync(path.join(outlierDir, 'package.json'), JSON.stringify({ name: 'outlier', dependencies: { 'shared-lib': '^1.0.198' } }));
+
+      const r = await runPackdev(dir, ['dupes', 'shared-lib', '--json']);
+      assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      const note = json.prereleaseHoistingNote;
+      assert.ok(note, 'expected a prereleaseHoistingNote to be present');
+      assert.strictEqual(note.blockedRange, '^1.0.195', 'must cite the majority range (30 workspaces), not the 1-workspace outlier');
+      assert.strictEqual(note.blockedWorkspaces.length, 30);
+      assert.strictEqual(note.totalBlockedWorkspaces, 31);
+      assert.strictEqual(note.allBlockedRanges.length, 2);
+
+      const human = await runPackdev(dir, ['dupes', 'shared-lib']);
+      assert.match(human.stdout, /\^1\.0\.195/);
+      assert.match(human.stdout, /31 workspaces/);
+    });
+  }
+
   async testDupesNoPrereleaseNoteWhenAllSameVersion() {
     await this.run('dupes omits prereleaseHoistingNote when there is no prerelease involved', async () => {
       const dir = this.tmp('dupes-no-prerelease-note');
@@ -2332,6 +2446,8 @@ class FeatureTests {
       await this.testCompatPassFailPerVersion();
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
+      await this.testCompatAttemptsRealInstallWhenMonorepoRootFound();
+      await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
@@ -2355,6 +2471,7 @@ class FeatureTests {
       await this.testDupesNoWorkspacesFlagHedgesVerdict();
       await this.testDupesSameVersionDifferentPathIsDuplicate();
       await this.testDupesExplainsPrereleaseHoistingIssue();
+      await this.testDupesPrereleaseNoteCitesMajorityRangeAcrossHoistedWorkspaces();
       await this.testDupesNoPrereleaseNoteWhenAllSameVersion();
       await this.testDupesResolvedViaParent();
       await this.testDupesGenuinelyNotADependency();

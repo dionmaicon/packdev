@@ -67,8 +67,15 @@ export interface DupeReport {
 export interface PrereleaseHoistingNote {
   prereleaseVersion: string;
   pinnedWorkspaces: string[];
+  /** The most common range among all that genuinely can't match the prerelease. */
   blockedRange: string;
+  /** Workspaces declaring that specific (most common) range. */
   blockedWorkspaces: string[];
+  /** Every distinct blocking range found, most common first — for when the
+   *  declared ranges aren't uniform and blockedRange alone would understate it. */
+  allBlockedRanges: { range: string; workspaces: string[] }[];
+  /** Total workspaces blocked by ANY non-matching range, not just blockedRange's. */
+  totalBlockedWorkspaces: number;
 }
 
 async function listPackageDirs(
@@ -360,6 +367,14 @@ async function findDeclaredRange(
 export async function detectPrereleaseHoistingIssue(
   pkgName: string,
   resolutions: DupeResolution[],
+  // Every workspace label reachable from the scan (".", plus each scanned
+  // workspace) — NOT just `resolutions`. A workspace whose declared range is
+  // satisfied by the hoisted version has no physical duplicate copy of its
+  // own, so it never appears in `resolutions` at all, yet it's exactly the
+  // kind of workspace whose declared range matters here: scanning only
+  // `resolutions` silently drops every hoisted workspace and can make the
+  // majority blocking range undetectable (or worse, cite a rare outlier).
+  allWorkspaceLabels: string[],
   rootDir: string,
 ): Promise<PrereleaseHoistingNote | null> {
   const distinctVersions = [...new Set(resolutions.map((r) => r.version))];
@@ -373,22 +388,42 @@ export async function detectPrereleaseHoistingIssue(
   const pinnedWorkspaces = resolutions
     .filter((r) => r.version === prereleaseVersion)
     .map((r) => r.workspace);
+  const pinnedWorkspaceSet = new Set(pinnedWorkspaces);
 
-  let blockedRange: string | null = null;
-  const blockedWorkspaces: string[] = [];
-  for (const r of resolutions) {
-    if (r.version === prereleaseVersion) continue;
-    const workspaceDir = r.workspace === "." ? rootDir : path.join(rootDir, r.workspace);
+  const byRange = new Map<string, string[]>();
+  for (const label of allWorkspaceLabels) {
+    if (pinnedWorkspaceSet.has(label)) continue;
+    const workspaceDir = label === "." ? rootDir : path.join(rootDir, label);
     const range = await findDeclaredRange(workspaceDir, pkgName);
     if (!range) continue;
     if (!semver.satisfies(prereleaseVersion, range)) {
-      blockedRange = blockedRange ?? range;
-      if (range === blockedRange) blockedWorkspaces.push(r.workspace);
+      const workspaces = byRange.get(range) ?? [];
+      workspaces.push(label);
+      byRange.set(range, workspaces);
     }
   }
-  if (!blockedRange) return null;
+  if (byRange.size === 0) return null;
 
-  return { prereleaseVersion, pinnedWorkspaces, blockedRange, blockedWorkspaces };
+  // Cite the most common blocking range, not just the first one encountered
+  // in resolutions' (filesystem walk) order — an outlier range would
+  // otherwise understate how systemic the issue actually is.
+  const allBlockedRanges = [...byRange.entries()]
+    .map(([range, workspaces]) => ({ range, workspaces }))
+    .sort((a, b) => b.workspaces.length - a.workspaces.length);
+  const [top] = allBlockedRanges;
+  const totalBlockedWorkspaces = allBlockedRanges.reduce(
+    (sum, entry) => sum + entry.workspaces.length,
+    0,
+  );
+
+  return {
+    prereleaseVersion,
+    pinnedWorkspaces,
+    blockedRange: top!.range,
+    blockedWorkspaces: top!.workspaces,
+    allBlockedRanges,
+    totalBlockedWorkspaces,
+  };
 }
 
 export async function findDuplicateResolutions(
@@ -442,9 +477,13 @@ export async function findDuplicateResolutions(
     }
   }
 
+  const allWorkspaceLabels = [
+    ".",
+    ...scannedWorkspaces.map((dir) => path.relative(resolvedRoot, dir) || "."),
+  ];
   const prereleaseHoistingNote =
     results.length > 1
-      ? await detectPrereleaseHoistingIssue(pkgName, results, resolvedRoot)
+      ? await detectPrereleaseHoistingIssue(pkgName, results, allWorkspaceLabels, resolvedRoot)
       : null;
 
   return {

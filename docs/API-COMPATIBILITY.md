@@ -163,13 +163,15 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 | `--concurrency <n>` | Test up to `n` versions in parallel (linear scan only — `--bisect`'s binary search is inherently sequential, this is a documented no-op there). |
 | `--prefer-offline` | Pass `--prefer-offline` through to the sandbox's package manager install. |
 
-- `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem) / `"SKIPPED"` (the app can't be sandboxed at all — see below).
-- **`"SKIPPED"`**: if the app's `package.json` declares any `workspace:`-protocol dependency (`"workspace:*"`, `"workspace:^"`, the yarn/pnpm workspaces convention), `compat` reports `SKIPPED` instead of attempting an install — a sandboxed copy is detached from the monorepo's workspace root, so `workspace:` specifiers can never resolve there, and reporting that as `INSTALL_FAILED` would hide a structural limitation behind a generic-looking failure. `output` names every blocking dependency.
+- `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem) / `"SKIPPED"` (couldn't even be sandboxed — see below).
+- **`workspace:`-protocol dependencies are handled, not just diagnosed**: if the app's `package.json` declares a `workspace:`-protocol dependency (`"workspace:*"`, `"workspace:^"`, the yarn/pnpm workspaces convention), `compat` finds the monorepo root (walking up for a `package.json` with `workspaces` or a `pnpm-workspace.yaml`) and sandboxes the **whole monorepo**, not just the app — so sibling workspace packages physically exist in the sandbox and those specifiers resolve normally. The install runs at the sandboxed monorepo root; the test command runs at the sandboxed app's own directory within it. This needs a package manager that actually understands `workspace:` (Yarn Berry / pnpm — npm and Yarn Classic don't); if the app's own detected manager doesn't, expect `INSTALL_FAILED` with that manager's real error, not a silent skip.
+- **`"SKIPPED"`** now only happens when no workspaces root is discoverable anywhere above the app at all (an unusual layout) — `compat` genuinely has nothing to sandbox against. `output` names the blocking dependencies either way.
+- **All versions `SKIPPED` is a distinct, honest outcome from "tested and failed"**: the human summary says `⚠️ Every version was skipped — nothing was actually tested` (not the generic "no version passed the test command," which would misleadingly imply a real test ran) and the command exits **`6`** — not `0` — so a CI pipeline can't mistake "verified nothing" for a pass.
 - **`INSTALL_FAILED`/`SKIPPED` diagnostics**: human output prints the real reason under each such line (the package manager's actual stderr for `INSTALL_FAILED`, the blocking dependency names for `SKIPPED`) — `--json`'s `output` field has the same text if you're scripting against it instead.
 - `nonMonotonic: true` (linear scan only) means a fail sits between two passes in version order — the assumption `--bisect` relies on doesn't hold for this package; test individually or accept the slower full scan.
 - Exact reproduction: `snapshotDir` + `lockfileSnapshotPath` per version are always present (auto-generated if `--snapshot-dir` wasn't passed) — diff two runs' snapshot files for the same version to see exactly what changed.
 
-**Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.).
+**Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.), `6` every version was `SKIPPED` (nothing was actually tested).
 
 ## 🧬 `packdev dupes <pkg>`
 
@@ -199,7 +201,7 @@ A common real cause: a **prerelease** pinned in some workspaces (`1.0.199-abc123
     If this package exports classes used as identity tokens (NestJS providers, instanceof checks), those copies are NOT interchangeable.
 ```
 
-This is the `prereleaseHoistingNote` field in `--json` output (`null` when no prerelease is involved, or when the specific blocking range couldn't be confirmed — an unconfirmed guess isn't printed).
+This is the `prereleaseHoistingNote` field in `--json` output (`null` when no prerelease is involved, or when the specific blocking range couldn't be confirmed — an unconfirmed guess isn't printed). Every workspace reachable from the scan is checked for its own declared range, not just the ones with a physical duplicate copy — most affected workspaces are simply *hoisted* to the non-prerelease version and have no copy of their own, so they'd otherwise be invisible to this check entirely. `blockedRange` cites whichever range blocks the **most** workspaces (not just the first one found); `allBlockedRanges` lists every distinct blocking range with its own workspace list, and `totalBlockedWorkspaces` sums across all of them, for repos where the declared ranges aren't uniform.
 
 | Flag | Purpose |
 |---|---|
@@ -227,6 +229,7 @@ Each resolution includes `realpath` (fully resolved, symlinks followed) alongsid
 | `1` | Generic error — see the `error` field in `--json` output for the actual message. |
 | `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
 | `5` | `dupes` found `duplicate: true` — usable directly as a CI guard. |
+| `6` | `compat` — every version was `SKIPPED`; nothing was actually tested. |
 
 ## 🤖 Agent/scripting notes
 

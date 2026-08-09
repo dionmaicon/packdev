@@ -16,7 +16,7 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as semver from "semver";
-import { readJsonFile, writeJsonFile } from "./utils";
+import { fileExists, readJsonFile, writeJsonFile } from "./utils";
 import {
   detectPackageManager,
   type PackageJson,
@@ -151,6 +151,29 @@ export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
 }
 
 /**
+ * Walk upward from `appDir` looking for the monorepo root a `workspace:`
+ * specifier actually resolves against — a `package.json` with a
+ * `workspaces` field, or a `pnpm-workspace.yaml`. Returns null if none is
+ * found anywhere up the tree (an unusual case: `workspace:` specifiers
+ * outside any discoverable workspaces config), which is the only situation
+ * compat still has to report SKIPPED for.
+ */
+export async function findMonorepoRoot(appDir: string): Promise<string | null> {
+  let dir = path.resolve(appDir);
+  for (;;) {
+    const packageJson = await readJsonFile<PackageJson & { workspaces?: unknown }>(
+      path.join(dir, "package.json"),
+    );
+    if (packageJson?.workspaces) return dir;
+    if (await fileExists(path.join(dir, "pnpm-workspace.yaml"))) return dir;
+
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
  * Resolve the primary package plus every (deduplicated) group member to the
  * section that currently declares it, so a lockstep group (e.g. NestJS's
  * @nestjs/* family) can be pinned to the same candidate version in one
@@ -196,23 +219,36 @@ const activeSandboxDirs = new Set<string>();
  * gets a fully independent install, which is what actually prevents
  * workspace-hoisting cross-contamination between version runs.
  */
+/**
+ * Copy `sourceDir` into a fresh sandbox and pin `pinTargets` in the
+ * package.json at `sourceDir/appRelativePath` (default "" — the common
+ * case, sourceDir *is* the app). When the app has `workspace:`-protocol
+ * deps, `sourceDir` is instead the whole monorepo root (so those specifiers
+ * resolve against real sibling workspace directories that now physically
+ * exist in the sandbox) and `appRelativePath` locates the actual app within
+ * it — the caller must then run the install at the sandbox root and the
+ * test command at `sandboxDir/appRelativePath`.
+ */
 export async function createSandbox(
-  appDir: string,
+  sourceDir: string,
   version: string,
   pinTargets: PinTarget[],
+  appRelativePath: string = "",
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
 
-  await fs.cp(appDir, sandboxDir, {
+  await fs.cp(sourceDir, sandboxDir, {
     recursive: true,
     filter: (source: string) => !EXCLUDED_COPY_NAMES.has(path.basename(source)),
   });
 
-  const packageJsonPath = path.join(sandboxDir, "package.json");
+  const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
   const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
   if (!packageJson) {
-    throw new Error(`No package.json found in sandboxed copy of ${appDir}`);
+    throw new Error(
+      `No package.json found in sandboxed copy of ${path.join(sourceDir, appRelativePath)}`,
+    );
   }
 
   for (const { name, section } of pinTargets) {
@@ -306,10 +342,10 @@ export function runInstall(
 }
 
 export function runTestCommand(
-  sandboxDir: string,
+  testCwd: string,
   testCommand: string,
 ): Promise<RunResult> {
-  return runCommand(testCommand, [], sandboxDir);
+  return runCommand(testCommand, [], testCwd);
 }
 
 /**
@@ -380,10 +416,12 @@ async function testOneVersion(
   pinTargets: PinTarget[],
   snapshotDir: string,
   workspaceProtocolDeps: string[],
+  monorepoRoot: string | null,
+  appRelativePath: string,
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
 
-  if (workspaceProtocolDeps.length > 0) {
+  if (workspaceProtocolDeps.length > 0 && !monorepoRoot) {
     return {
       version,
       status: "SKIPPED",
@@ -391,17 +429,24 @@ async function testOneVersion(
       durationMs: Date.now() - startedAt,
       output:
         `Cannot sandbox: ${options.appDir}'s package.json declares workspace:-protocol ` +
-        `dependencies (${workspaceProtocolDeps.join(", ")}) that only resolve inside the ` +
-        `monorepo's own workspace root — a standalone sandboxed copy can never install them. ` +
-        `compat cannot test this app as-is.`,
+        `dependencies (${workspaceProtocolDeps.join(", ")}), but no workspaces root ` +
+        `(package.json "workspaces" or pnpm-workspace.yaml) could be found anywhere above ` +
+        `it — compat cannot resolve these specifiers without one.`,
       lockfileHash: null,
       lockfileSnapshotPath: null,
     };
   }
 
+  // With workspace:-protocol deps, sandbox the whole monorepo (not just the
+  // app) so sibling workspaces physically exist and those specifiers
+  // resolve normally — install runs at the sandboxed monorepo root, the
+  // test command runs at the sandboxed app's own directory within it.
+  const sourceDir = monorepoRoot ?? options.appDir;
+  const testCwdRelative = monorepoRoot ? appRelativePath : "";
+
   let sandboxDir: string | null = null;
   try {
-    sandboxDir = await createSandbox(options.appDir, version, pinTargets);
+    sandboxDir = await createSandbox(sourceDir, version, pinTargets, testCwdRelative);
 
     const installResult = await runInstall(
       sandboxDir,
@@ -429,7 +474,8 @@ async function testOneVersion(
       version,
     );
 
-    const testResult = await runTestCommand(sandboxDir, options.testCommand);
+    const testCwd = path.join(sandboxDir, testCwdRelative);
+    const testResult = await runTestCommand(testCwd, options.testCommand);
     return {
       version,
       status: testResult.success ? "PASSED" : "FAILED",
@@ -451,6 +497,8 @@ async function resolveRunContext(
   pinTargets: PinTarget[];
   packageManagerInfo: PackageManagerInfo;
   workspaceProtocolDeps: string[];
+  monorepoRoot: string | null;
+  appRelativePath: string;
 }> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
@@ -461,8 +509,17 @@ async function resolveRunContext(
   const pinTargets = resolvePinTargets(pkgName, options.group, appPackageJson);
   const workspaceProtocolDeps = findWorkspaceProtocolDeps(appPackageJson);
 
+  let monorepoRoot: string | null = null;
+  let appRelativePath = "";
+  if (workspaceProtocolDeps.length > 0) {
+    monorepoRoot = await findMonorepoRoot(options.appDir);
+    if (monorepoRoot) {
+      appRelativePath = path.relative(monorepoRoot, path.resolve(options.appDir));
+    }
+  }
+
   const packageManagerInfo = await detectPackageManager(options.appDir);
-  return { pinTargets, packageManagerInfo, workspaceProtocolDeps };
+  return { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath };
 }
 
 /**
@@ -499,7 +556,7 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps } =
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath } =
     await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
@@ -516,6 +573,8 @@ export async function runCompat(
         pinTargets,
         snapshotDir,
         workspaceProtocolDeps,
+        monorepoRoot,
+        appRelativePath,
       ),
   );
 
@@ -587,7 +646,7 @@ export async function runCompatBisect(
     return finishBisect(pkgName, candidateVersions, [], null, null, false, snapshotDir, options.group);
   }
 
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps } =
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath } =
     await resolveRunContext(pkgName, options);
   const testAt = (index: number) =>
     testOneVersion(
@@ -598,6 +657,8 @@ export async function runCompatBisect(
       pinTargets,
       snapshotDir,
       workspaceProtocolDeps,
+      monorepoRoot,
+      appRelativePath,
     );
 
   const tested: CompatVersionResult[] = [];
