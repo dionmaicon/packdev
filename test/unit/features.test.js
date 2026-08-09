@@ -1095,6 +1095,71 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffReportsUnresolvedNotMissingOnBarrelExport() {
+    await this.run('api-diff reports unresolved (not missing) when types exist but resolve to zero exports (barrel re-export)', async () => {
+      // A pure `export * from "./sibling"` where the sibling itself declares
+      // nothing statically resolvable — checker.getExportsOfModule legitimately
+      // returns [] here. Before the fix this made every used symbol show up in
+      // missingSymbols as if genuinely absent: a confident false negative.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'barrel-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export * from "./sibling";\n',
+        'sibling.d.ts': '',
+      });
+      const registryUrl = await this.registry('barrel-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-barrel-usage');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { SomeRealExport } from "barrel-lib";\nSomeRealExport();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'barrel-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, null, 'unresolved must be null, not false');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, [], 'must never report an unverifiable symbol as missing');
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, ['SomeRealExport']);
+      assert.strictEqual(json.minimumCompatibleVersion, null);
+
+      const human = await runPackdev(appDir, [
+        'api-diff', 'barrel-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl,
+      ]);
+      assert.match(human.stdout, /unresolved: SomeRealExport/);
+      assert.match(human.stdout, /NOT a confirmed incompatibility/);
+      assert.doesNotMatch(human.stdout, /missing: SomeRealExport/);
+    });
+  }
+
+  async testApiDiffStillReportsGenuineMissingSymbols() {
+    await this.run('api-diff still reports a genuinely missing symbol as missing, not unresolved', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;\n',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-genuine-missing');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { notExported } from "fake-lib";\nnotExported();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, false);
+      assert.deepStrictEqual(json.versions[0].missingSymbols, ['notExported']);
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, []);
+    });
+  }
+
   // --- registry auth (--token / NPM_TOKEN / NODE_AUTH_TOKEN / .npmrc) ------
 
   async testApiDiffFailsWithHintOnPrivateRegistryWithoutToken() {
@@ -1269,6 +1334,38 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.strictEqual(json.versions[0].status, 'INSTALL_FAILED');
+    });
+  }
+
+  async testCompatSkipsAppsWithWorkspaceProtocolDeps() {
+    await this.run('compat reports SKIPPED (not INSTALL_FAILED) when the app has workspace:* deps', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-workspace-protocol');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0', '@acme/shared': 'workspace:*' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'SKIPPED');
+      assert.match(json.versions[0].output, /workspace:-protocol/);
+      assert.match(json.versions[0].output, /@acme\/shared/);
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.match(human.stdout, /SKIPPED/);
+      assert.match(human.stdout, /@acme\/shared/);
     });
   }
 
@@ -1954,6 +2051,55 @@ class FeatureTests {
     });
   }
 
+  async testDupesExplainsPrereleaseHoistingIssue() {
+    await this.run('dupes explains the prerelease/hoisting mechanism when it can confirm the blocking range', async () => {
+      const dir = this.tmp('dupes-prerelease-hoisting');
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'root', workspaces: ['apps/*'] }),
+      );
+      fs.mkdirSync(path.join(dir, 'apps', 'a'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'apps', 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'apps', 'a', 'package.json'),
+        JSON.stringify({ name: 'a', dependencies: { 'shared-lib': '1.0.199-abc123' } }),
+      );
+      fs.writeFileSync(
+        path.join(dir, 'apps', 'b', 'package.json'),
+        JSON.stringify({ name: 'b', dependencies: { 'shared-lib': '^1.0.195' } }),
+      );
+      writeNodeModulesPackage(dir, 'shared-lib', { name: 'shared-lib', version: '1.0.196' });
+      writeNodeModulesPackage(path.join(dir, 'apps', 'a'), 'shared-lib', { name: 'shared-lib', version: '1.0.199-abc123' });
+      writeNodeModulesPackage(path.join(dir, 'apps', 'b'), 'shared-lib', { name: 'shared-lib', version: '1.0.196' });
+
+      const r = await runPackdev(dir, ['dupes', 'shared-lib', '--json']);
+      assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.ok(json.prereleaseHoistingNote, 'expected a prereleaseHoistingNote to be present');
+      assert.strictEqual(json.prereleaseHoistingNote.prereleaseVersion, '1.0.199-abc123');
+      assert.deepStrictEqual(json.prereleaseHoistingNote.pinnedWorkspaces, ['apps/a']);
+      assert.strictEqual(json.prereleaseHoistingNote.blockedRange, '^1.0.195');
+
+      const human = await runPackdev(dir, ['dupes', 'shared-lib']);
+      assert.match(human.stdout, /PRERELEASE \(1\.0\.199-abc123\)/);
+      assert.match(human.stdout, /\^1\.0\.195/);
+      assert.match(human.stdout, /NOT interchangeable/);
+    });
+  }
+
+  async testDupesNoPrereleaseNoteWhenAllSameVersion() {
+    await this.run('dupes omits prereleaseHoistingNote when there is no prerelease involved', async () => {
+      const dir = this.tmp('dupes-no-prerelease-note');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+      writeNodeModulesPackage(path.join(dir, 'node_modules', 'some-dep'), 'left-pad', { name: 'left-pad', version: '1.1.2' });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 5);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.prereleaseHoistingNote, null);
+    });
+  }
+
   async testDupesResolvedViaParent() {
     await this.run('dupes distinguishes resolved-via-parent from not-a-dependency', async () => {
       const dir = this.tmp('dupes-resolved-via-parent');
@@ -2177,12 +2323,15 @@ class FeatureTests {
       await this.testApiDiffFallsBackToTypesPackage();
       await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
       await this.testApiDiffCountsSubpathExportsAsUsage();
+      await this.testApiDiffReportsUnresolvedNotMissingOnBarrelExport();
+      await this.testApiDiffStillReportsGenuineMissingSymbols();
       await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
       await this.testApiDiffAuthenticatesWithTokenFlag();
       await this.testApiDiffAuthenticatesWithNpmTokenEnv();
       await this.testApiDiffAutoDetectsRegistryAndTokenFromNpmrc();
       await this.testCompatPassFailPerVersion();
       await this.testCompatDistinguishesInstallFailure();
+      await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
@@ -2205,6 +2354,8 @@ class FeatureTests {
       await this.testDupesWorkspaceAware();
       await this.testDupesNoWorkspacesFlagHedgesVerdict();
       await this.testDupesSameVersionDifferentPathIsDuplicate();
+      await this.testDupesExplainsPrereleaseHoistingIssue();
+      await this.testDupesNoPrereleaseNoteWhenAllSameVersion();
       await this.testDupesResolvedViaParent();
       await this.testDupesGenuinelyNotADependency();
       await this.testGitFileUrlClassified();

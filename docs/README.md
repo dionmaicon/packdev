@@ -67,7 +67,7 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 - **Audience**: All users, especially teams
 - **Key Topics**: Configuration persistence, safety features, advanced workflows
 
-### [API Compatibility Guide](./API-COMPATIBILITY.md) (220+ lines)
+### [API Compatibility Guide](./API-COMPATIBILITY.md) (240+ lines)
 - **Purpose**: Checking API/behavioral compatibility across published versions before upgrading
 - **Contains**: `api`/`api-diff`/`compat`/`dupes` command reference, decision table, real captured output, exit codes
 - **Audience**: All users, especially those scripting or using coding agents

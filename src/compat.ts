@@ -24,7 +24,7 @@ import {
 } from "./packageManager";
 import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 
-export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED";
+export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
 export interface CompatVersionResult {
   version: string;
@@ -121,6 +121,33 @@ export function findDependencySection(
 export interface PinTarget {
   name: string;
   section: DependencySection;
+}
+
+/**
+ * Names of dependencies declared with the `workspace:` protocol (yarn/pnpm
+ * workspaces convention, e.g. `"workspace:*"`, `"workspace:^"`). These only
+ * resolve inside the monorepo's own workspace root — createSandbox copies
+ * the app out to a standalone temp directory, so a real install there can
+ * never satisfy them. Detecting this up front lets testOneVersion report a
+ * clear SKIPPED instead of a bare, undiagnosable INSTALL_FAILED.
+ */
+export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
+  const sections: DependencySection[] = [
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+  ];
+  const found = new Set<string>();
+  for (const section of sections) {
+    const entries = packageJson[section] as Record<string, string> | undefined;
+    if (!entries) continue;
+    for (const [name, spec] of Object.entries(entries)) {
+      if (typeof spec === "string" && spec.startsWith("workspace:")) {
+        found.add(name);
+      }
+    }
+  }
+  return [...found].sort();
 }
 
 /**
@@ -352,8 +379,26 @@ async function testOneVersion(
   packageManagerInfo: PackageManagerInfo,
   pinTargets: PinTarget[],
   snapshotDir: string,
+  workspaceProtocolDeps: string[],
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
+
+  if (workspaceProtocolDeps.length > 0) {
+    return {
+      version,
+      status: "SKIPPED",
+      exitCode: null,
+      durationMs: Date.now() - startedAt,
+      output:
+        `Cannot sandbox: ${options.appDir}'s package.json declares workspace:-protocol ` +
+        `dependencies (${workspaceProtocolDeps.join(", ")}) that only resolve inside the ` +
+        `monorepo's own workspace root — a standalone sandboxed copy can never install them. ` +
+        `compat cannot test this app as-is.`,
+      lockfileHash: null,
+      lockfileSnapshotPath: null,
+    };
+  }
+
   let sandboxDir: string | null = null;
   try {
     sandboxDir = await createSandbox(options.appDir, version, pinTargets);
@@ -402,7 +447,11 @@ async function testOneVersion(
 async function resolveRunContext(
   pkgName: string,
   options: CompatOptions,
-): Promise<{ pinTargets: PinTarget[]; packageManagerInfo: PackageManagerInfo }> {
+): Promise<{
+  pinTargets: PinTarget[];
+  packageManagerInfo: PackageManagerInfo;
+  workspaceProtocolDeps: string[];
+}> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
   if (!appPackageJson) {
@@ -410,9 +459,10 @@ async function resolveRunContext(
   }
 
   const pinTargets = resolvePinTargets(pkgName, options.group, appPackageJson);
+  const workspaceProtocolDeps = findWorkspaceProtocolDeps(appPackageJson);
 
   const packageManagerInfo = await detectPackageManager(options.appDir);
-  return { pinTargets, packageManagerInfo };
+  return { pinTargets, packageManagerInfo, workspaceProtocolDeps };
 }
 
 /**
@@ -449,7 +499,8 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps } =
+    await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
 
@@ -464,6 +515,7 @@ export async function runCompat(
         packageManagerInfo,
         pinTargets,
         snapshotDir,
+        workspaceProtocolDeps,
       ),
   );
 
@@ -535,7 +587,8 @@ export async function runCompatBisect(
     return finishBisect(pkgName, candidateVersions, [], null, null, false, snapshotDir, options.group);
   }
 
-  const { pinTargets, packageManagerInfo } = await resolveRunContext(pkgName, options);
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps } =
+    await resolveRunContext(pkgName, options);
   const testAt = (index: number) =>
     testOneVersion(
       pkgName,
@@ -544,6 +597,7 @@ export async function runCompatBisect(
       packageManagerInfo,
       pinTargets,
       snapshotDir,
+      workspaceProtocolDeps,
     );
 
   const tested: CompatVersionResult[] = [];

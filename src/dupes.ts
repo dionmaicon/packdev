@@ -21,6 +21,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as semver from "semver";
 import { fileExists, isDirectory, readJsonFile, type PackageInfo } from "./utils";
 import { resolveInstalledPackage } from "./api";
 
@@ -51,6 +52,23 @@ export interface DupeReport {
    * all" even though both currently produce an empty `resolutions` list.
    */
   resolvedViaParent: ParentResolution | null;
+  /**
+   * Set only when a prerelease copy and a non-prerelease copy of the same
+   * package coexist among `resolutions`, and at least one other declaring
+   * workspace's own range genuinely can't match the prerelease — the actual
+   * mechanism (not just the fact) behind the single most common cause of
+   * this class of duplicate-copy bug: a prerelease can never satisfy a
+   * caret/tilde range, so it can never hoist, so every workspace pinned to
+   * it is permanently, structurally stuck with a private copy.
+   */
+  prereleaseHoistingNote: PrereleaseHoistingNote | null;
+}
+
+export interface PrereleaseHoistingNote {
+  prereleaseVersion: string;
+  pinnedWorkspaces: string[];
+  blockedRange: string;
+  blockedWorkspaces: string[];
 }
 
 async function listPackageDirs(
@@ -315,6 +333,64 @@ export interface FindDuplicateResolutionsOptions {
   scanWorkspaces?: boolean;
 }
 
+async function findDeclaredRange(
+  workspaceDir: string,
+  pkgName: string,
+): Promise<string | null> {
+  const packageJson = await readJsonFile<Record<string, unknown>>(
+    path.join(workspaceDir, "package.json"),
+  );
+  if (!packageJson) return null;
+  for (const section of ["dependencies", "devDependencies", "peerDependencies"]) {
+    const entries = packageJson[section] as Record<string, string> | undefined;
+    const range = entries?.[pkgName];
+    if (typeof range === "string") return range;
+  }
+  return null;
+}
+
+/**
+ * Detect the specific prerelease/hoisting mechanism: a prerelease version
+ * pinned in some workspaces coexisting with a non-prerelease copy declared
+ * elsewhere with a range the prerelease genuinely can't satisfy (semver
+ * never matches a prerelease against a plain caret/tilde range). Returns
+ * null rather than guessing when the coexistence can't be tied to a
+ * concrete blocking range — an unconfirmed guess is worse than no note.
+ */
+export async function detectPrereleaseHoistingIssue(
+  pkgName: string,
+  resolutions: DupeResolution[],
+  rootDir: string,
+): Promise<PrereleaseHoistingNote | null> {
+  const distinctVersions = [...new Set(resolutions.map((r) => r.version))];
+  const prereleaseVersions = distinctVersions.filter((v) => semver.prerelease(v));
+  const nonPrereleaseVersions = distinctVersions.filter((v) => !semver.prerelease(v));
+  if (prereleaseVersions.length === 0 || nonPrereleaseVersions.length === 0) {
+    return null;
+  }
+
+  const prereleaseVersion = prereleaseVersions[0]!;
+  const pinnedWorkspaces = resolutions
+    .filter((r) => r.version === prereleaseVersion)
+    .map((r) => r.workspace);
+
+  let blockedRange: string | null = null;
+  const blockedWorkspaces: string[] = [];
+  for (const r of resolutions) {
+    if (r.version === prereleaseVersion) continue;
+    const workspaceDir = r.workspace === "." ? rootDir : path.join(rootDir, r.workspace);
+    const range = await findDeclaredRange(workspaceDir, pkgName);
+    if (!range) continue;
+    if (!semver.satisfies(prereleaseVersion, range)) {
+      blockedRange = blockedRange ?? range;
+      if (range === blockedRange) blockedWorkspaces.push(r.workspace);
+    }
+  }
+  if (!blockedRange) return null;
+
+  return { prereleaseVersion, pinnedWorkspaces, blockedRange, blockedWorkspaces };
+}
+
 export async function findDuplicateResolutions(
   pkgName: string,
   rootDir: string,
@@ -366,5 +442,16 @@ export async function findDuplicateResolutions(
     }
   }
 
-  return { resolutions: results, workspacesDetected, scannedWorkspaces, resolvedViaParent };
+  const prereleaseHoistingNote =
+    results.length > 1
+      ? await detectPrereleaseHoistingIssue(pkgName, results, resolvedRoot)
+      : null;
+
+  return {
+    resolutions: results,
+    workspacesDetected,
+    scannedWorkspaces,
+    resolvedViaParent,
+    prereleaseHoistingNote,
+  };
 }

@@ -25,6 +25,8 @@ Four commands that answer "what's actually there" at increasing levels of confid
 { "version": "1.0.0", "status": "FAILED" }
 ```
 
+`apiCompatible` is actually a **tri-state**: `true` / `false` / `null` — `null` means "couldn't be statically verified" (a barrel `.d.ts`, see `api-diff`'s reference section below), and is never a synonym for `false`. Treat `null` as "run `compat` for a real answer," not as a failure.
+
 ## 📦 `packdev api <pkg>`
 
 Shows the export map of whatever version of `<pkg>` is currently resolved in `node_modules` — functions, classes, interfaces, types, with signatures.
@@ -121,6 +123,10 @@ packdev api-diff is-odd --range ">=0.1.0 <4.0.0" --app . --json
 - `hasDynamicUsage: true` means the app uses a namespace import (`import * as x`) or a bare `require(pkg)` somewhere — those can't be statically resolved to specific symbols, so the usage check is only a partial guarantee for that app. It's surfaced, not silently ignored.
 - `typesSource` tells you where the types came from for that version: `"bundled"` (shipped with the package), `"types-package"` (fetched `@types/<pkg>` separately), or `"none"` (no types found anywhere — `missingSymbols` will include everything the app imports, since nothing could be verified).
 - `usedSymbols: []` (app never imports the package) makes every version trivially `apiCompatible: true` — nothing to miss.
+- **`apiCompatible: null`** is a third, distinct state from `true`/`false` — "couldn't be verified," not "incompatible." It fires when types exist but resolve to zero exports (a barrel `.d.ts` — `export * from "./generated"` re-exports the isolated single-file resolver can't follow — same limitation `api`'s `rawExportHints` fallback exists for). The affected symbols land in `unresolvedSymbols`, **never** in `missingSymbols` — reporting an unverifiable symbol as missing would be a confident false negative, not an honest "unknown." When every version in range is `null` (nothing confirmed either way), the human output explicitly says so isn't a confirmed incompatibility and points at `compat` for a real answer:
+  ```json
+  { "version": "1.0.199-abc123", "apiCompatible": null, "missingSymbols": [], "unresolvedSymbols": ["EventPublisher"], "exportCount": 0, "typesSource": "bundled" }
+  ```
 - **Private registries** (GitHub Packages, Artifactory, Verdaccio, ...): if `--app`'s `.npmrc` already has `@scope:registry` and `//<host>/:_authToken` lines (the same ones your real installs use), `api-diff` picks them up automatically — no `--registry`/`--token` needed. A `401` error names the exact host and explains which of `--token`/env/`.npmrc` it looked for and found nothing.
 
 **Exit codes**: `0` success, `1` generic error (invalid range, registry unreachable or unauthorized, etc.).
@@ -157,7 +163,9 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 | `--concurrency <n>` | Test up to `n` versions in parallel (linear scan only — `--bisect`'s binary search is inherently sequential, this is a documented no-op there). |
 | `--prefer-offline` | Pass `--prefer-offline` through to the sandbox's package manager install. |
 
-- `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem).
+- `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem) / `"SKIPPED"` (the app can't be sandboxed at all — see below).
+- **`"SKIPPED"`**: if the app's `package.json` declares any `workspace:`-protocol dependency (`"workspace:*"`, `"workspace:^"`, the yarn/pnpm workspaces convention), `compat` reports `SKIPPED` instead of attempting an install — a sandboxed copy is detached from the monorepo's workspace root, so `workspace:` specifiers can never resolve there, and reporting that as `INSTALL_FAILED` would hide a structural limitation behind a generic-looking failure. `output` names every blocking dependency.
+- **`INSTALL_FAILED`/`SKIPPED` diagnostics**: human output prints the real reason under each such line (the package manager's actual stderr for `INSTALL_FAILED`, the blocking dependency names for `SKIPPED`) — `--json`'s `output` field has the same text if you're scripting against it instead.
 - `nonMonotonic: true` (linear scan only) means a fail sits between two passes in version order — the assumption `--bisect` relies on doesn't hold for this package; test individually or accept the slower full scan.
 - Exact reproduction: `snapshotDir` + `lockfileSnapshotPath` per version are always present (auto-generated if `--snapshot-dir` wasn't passed) — diff two runs' snapshot files for the same version to see exactly what changed.
 
@@ -182,7 +190,16 @@ $ packdev dupes @acme/shared-lib --json
 ], "workspacesDetected":["apps/checkout","apps/api"], "scannedWorkspaces":["apps/checkout","apps/api"]}
 ```
 
-A common real cause: a **prerelease** pinned in some workspaces (`1.0.199-abc123`) can never satisfy the caret ranges (`^1.0.0`) the rest of the monorepo uses, so it can never hoist — every workspace pinned to it gets a private, non-interchangeable copy even though nothing about it looks wrong in a build or test run.
+A common real cause: a **prerelease** pinned in some workspaces (`1.0.199-abc123`) can never satisfy the caret ranges (`^1.0.0`) the rest of the monorepo uses, so it can never hoist — every workspace pinned to it gets a private, non-interchangeable copy even though nothing about it looks wrong in a build or test run. When `dupes` can confirm this mechanism (a prerelease copy coexists with a non-prerelease copy, and it can find another workspace whose own declared range genuinely can't match the prerelease), it says so directly instead of only reporting the generic "copies may break identity checks" warning:
+
+```console
+⚠️  3 distinct copies found (2 distinct versions) — instanceof/DI singletons may break across copies
+⚠️  1 workspace(s) pin a PRERELEASE (1.0.199-abc123).
+    Prerelease versions are not matched by the caret/tilde ranges used by other workspaces (^1.0.195), so they cannot hoist and each pinned workspace gets a private copy.
+    If this package exports classes used as identity tokens (NestJS providers, instanceof checks), those copies are NOT interchangeable.
+```
+
+This is the `prereleaseHoistingNote` field in `--json` output (`null` when no prerelease is involved, or when the specific blocking range couldn't be confirmed — an unconfirmed guess isn't printed).
 
 | Flag | Purpose |
 |---|---|
@@ -219,3 +236,4 @@ Each resolution includes `realpath` (fully resolved, symlinks followed) alongsid
 - `--introspect` executes third-party code. Treat it the same as running the package's own code directly — don't enable it by default in an automated pipeline against untrusted packages.
 - First-party, mid-migration packages living behind a private registry are exactly the ones most worth checking with `api-diff`/`compat` — and the ones your `.npmrc` already knows how to authenticate to for real installs. Point `--app` at the project whose `.npmrc` has the right `@scope:registry`/`_authToken` lines and skip `--registry`/`--token` entirely; only reach for `--token` (or `NPM_TOKEN`/`NODE_AUTH_TOKEN`) when running somewhere without that `.npmrc` on disk, e.g. a bare CI job.
 - `dupes` exits `5` on `duplicate: true` — wire it into CI as a guard (`packdev dupes <pkg> || exit 1`) rather than only reading `--json`'s `duplicate` field by hand.
+- Never treat `api-diff`'s `apiCompatible: null` or `compat`'s `status: "SKIPPED"` as a failure signal — both mean "couldn't be determined," a different claim than `false`/`FAILED`. An agent auto-upgrading or auto-blocking on these commands' output should branch on them separately (e.g. surface for human review) rather than folding them into the same bucket as a confirmed incompatibility.

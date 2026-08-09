@@ -10,7 +10,12 @@
 
 import * as path from "path";
 import { readJsonFile, type PackageInfo } from "./utils";
-import { resolvePackageExportMap, type ExportedSymbolWithSubpath } from "./api";
+import {
+  resolvePackageExportMap,
+  resolveEntryPoint,
+  extractRawExportHints,
+  type ExportedSymbolWithSubpath,
+} from "./api";
 import { scanImportedSymbols } from "./appScan";
 import {
   fetchPackageMetadata,
@@ -25,8 +30,18 @@ export type TypesSource = "bundled" | "types-package" | "none";
 
 export interface ApiDiffVersionResult {
   version: string;
-  apiCompatible: boolean;
+  // null means "couldn't be verified" (see unresolvedSymbols) — a distinct,
+  // honest third state from true/false, not a synonym for "incompatible".
+  apiCompatible: boolean | null;
   missingSymbols: string[];
+  // Symbols the app uses that this version's types exist for but couldn't be
+  // statically confirmed present or absent — typically a barrel .d.ts
+  // (`export * from "./generated"`) the isolated single-file program can't
+  // follow. These are never counted as missing: reporting a real symbol as
+  // absent when it can't actually be verified is a false negative, worse
+  // than admitting "unknown" (see api's rawExportHints fallback, the same
+  // underlying limitation).
+  unresolvedSymbols: string[];
   exportCount: number;
   typesSource: TypesSource;
 }
@@ -54,6 +69,24 @@ interface ResolvedExports {
   exports: ExportedSymbolWithSubpath[];
   typesSource: TypesSource;
   extraCleanupDir?: string;
+  // Non-null when types exist but resolved to zero exports and a raw syntax
+  // scan of the root .d.ts still found export-shaped content (barrel
+  // re-exports, generic wrappers, ...) — signals "unverifiable", not "empty".
+  unresolved: boolean;
+}
+
+// Types resolved but produced zero exports — check whether that's a
+// genuinely empty declaration file or an unresolvable barrel/re-export the
+// isolated single-file program can't follow (same detection api's
+// rawExportHints fallback uses). Only the latter should suppress
+// missingSymbols — a truly empty .d.ts legitimately exports nothing.
+async function hasUnresolvableBarrelContent(
+  pkgDir: string,
+  packageInfo: PackageInfo,
+): Promise<boolean> {
+  const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+  if (!typesPath) return false;
+  return extractRawExportHints(typesPath).length > 0;
 }
 
 // Bundled types (root export plus any subpath exports, e.g. pkg/testing) win
@@ -72,7 +105,10 @@ async function resolveExportsForVersion(
 ): Promise<ResolvedExports> {
   const bundled = await resolvePackageExportMap(packageDir, packageInfo);
   if (bundled.hasTypes) {
-    return { exports: bundled.exports, typesSource: "bundled" };
+    const unresolved =
+      bundled.exports.length === 0 &&
+      (await hasUnresolvableBarrelContent(packageDir, packageInfo));
+    return { exports: bundled.exports, typesSource: "bundled", unresolved };
   }
 
   const typesMatch = await resolveTypesPackageTarball(
@@ -82,7 +118,7 @@ async function resolveExportsForVersion(
     token,
   );
   if (!typesMatch) {
-    return { exports: [], typesSource: "none" };
+    return { exports: [], typesSource: "none", unresolved: false };
   }
 
   const typesBuffer = await downloadTarball(typesMatch.tarball, token);
@@ -94,19 +130,24 @@ async function resolveExportsForVersion(
   );
   if (!typesPkgInfo) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { exports: [], typesSource: "none" };
+    return { exports: [], typesSource: "none", unresolved: false };
   }
 
   const resolved = await resolvePackageExportMap(typesPkgDir, typesPkgInfo);
   if (!resolved.hasTypes) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { exports: [], typesSource: "none" };
+    return { exports: [], typesSource: "none", unresolved: false };
   }
+
+  const unresolved =
+    resolved.exports.length === 0 &&
+    (await hasUnresolvableBarrelContent(typesPkgDir, typesPkgInfo));
 
   return {
     exports: resolved.exports,
     typesSource: "types-package",
     extraCleanupDir: typesCleanupDir,
+    unresolved,
   };
 }
 
@@ -119,6 +160,7 @@ async function diffOneVersion(
   token: string | undefined,
 ): Promise<{
   missingSymbols: string[];
+  unresolvedSymbols: string[];
   exportCount: number;
   typesSource: TypesSource;
 }> {
@@ -148,12 +190,19 @@ async function diffOneVersion(
 
     const exportedNames = new Set(resolved.exports.map((e) => e.name));
 
-    const missingSymbols = [...usedSymbols].filter(
-      (symbol) => !exportedNames.has(symbol),
-    );
+    // An unresolved barrel means we genuinely can't tell which used symbols
+    // are present — reporting them all as "missing" would be a confident
+    // false negative (worse than the pre-registry-auth 401 this replaced:
+    // it now runs and looks authoritative). Report them as unresolved
+    // instead, never as missing, when resolution itself couldn't verify.
+    const missingSymbols = resolved.unresolved
+      ? []
+      : [...usedSymbols].filter((symbol) => !exportedNames.has(symbol));
+    const unresolvedSymbols = resolved.unresolved ? [...usedSymbols] : [];
 
     return {
       missingSymbols,
+      unresolvedSymbols,
       exportCount: resolved.exports.length,
       typesSource: resolved.typesSource,
     };
@@ -187,25 +236,36 @@ export async function runApiDiff(
     const dist = metadata.versions[version]?.dist;
     if (!dist) continue;
 
-    const { missingSymbols, exportCount, typesSource } = await diffOneVersion(
-      pkgName,
-      version,
-      dist.tarball,
-      symbols,
-      options.registryUrl,
-      options.token,
-    );
+    const { missingSymbols, unresolvedSymbols, exportCount, typesSource } =
+      await diffOneVersion(
+        pkgName,
+        version,
+        dist.tarball,
+        symbols,
+        options.registryUrl,
+        options.token,
+      );
+
+    // unresolvedSymbols is only non-empty when there was something to
+    // verify and resolution couldn't — apiCompatible: null then means
+    // "couldn't determine", never "incompatible". When the app doesn't
+    // import anything (usedSymbols empty), unresolvedSymbols stays empty
+    // even for an unresolved barrel, so apiCompatible correctly stays
+    // `true` (nothing to miss) rather than downgrading to unknown.
+    const apiCompatible =
+      unresolvedSymbols.length > 0 ? null : missingSymbols.length === 0;
 
     versions.push({
       version,
-      apiCompatible: missingSymbols.length === 0,
+      apiCompatible,
       missingSymbols,
+      unresolvedSymbols,
       exportCount,
       typesSource,
     });
   }
 
-  const compatibleVersions = versions.filter((v) => v.apiCompatible);
+  const compatibleVersions = versions.filter((v) => v.apiCompatible === true);
   const minimumCompatibleVersion = compatibleVersions[0]?.version ?? null;
   const recommendedVersion =
     compatibleVersions[compatibleVersions.length - 1]?.version ?? null;

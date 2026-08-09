@@ -575,10 +575,14 @@ program
 
         console.log("");
         for (const v of report.versions) {
-          const mark = v.apiCompatible ? "✅" : "❌";
-          const detail = v.apiCompatible
-            ? ""
-            : ` (missing: ${v.missingSymbols.join(", ")})`;
+          const mark =
+            v.apiCompatible === null ? "⚠️ " : v.apiCompatible ? "✅" : "❌";
+          const detail =
+            v.apiCompatible === false
+              ? ` (missing: ${v.missingSymbols.join(", ")})`
+              : v.apiCompatible === null
+                ? ` (unresolved: ${v.unresolvedSymbols.join(", ")} — barrel export, could not verify)`
+                : "";
           const typesNote =
             v.typesSource === "none"
               ? " [no type declarations found — bundled or via @types]"
@@ -598,9 +602,18 @@ program
           console.log(`💡 Recommended version: ${report.recommendedVersion}`);
         }
         if (!report.minimumCompatibleVersion) {
-          console.log(
-            "⚠️  No version in range satisfies the app's current usage.",
-          );
+          const anyUnresolved = report.versions.some((v) => v.apiCompatible === null);
+          const anyConfirmedIncompatible = report.versions.some((v) => v.apiCompatible === false);
+          if (anyUnresolved && !anyConfirmedIncompatible) {
+            console.log(
+              "⚠️  Couldn't statically verify any version (barrel/unresolvable exports) — " +
+                "this is NOT a confirmed incompatibility. Try `packdev compat` for a real test run.",
+            );
+          } else {
+            console.log(
+              "⚠️  No version in range satisfies the app's current usage.",
+            );
+          }
         }
       });
     } catch (error) {
@@ -729,11 +742,27 @@ program
 
         for (const v of report.versions) {
           const mark =
-            v.status === "PASSED" ? "✅" : v.status === "FAILED" ? "❌" : "⚠️ ";
+            v.status === "PASSED"
+              ? "✅"
+              : v.status === "FAILED"
+                ? "❌"
+                : v.status === "SKIPPED"
+                  ? "⏭️ "
+                  : "⚠️ ";
           const hashSuffix = v.lockfileHash
             ? `, lockfile ${v.lockfileHash.slice(0, 8)}`
             : "";
           console.log(`  ${mark} ${v.version} (${v.status}, ${v.durationMs}ms${hashSuffix})`);
+          // INSTALL_FAILED/SKIPPED are the two statuses a user can't
+          // diagnose from the status word alone — surface the real reason
+          // instead of leaving them to reach for --json.
+          if ((v.status === "INSTALL_FAILED" || v.status === "SKIPPED") && v.output) {
+            const indented = v.output
+              .split("\n")
+              .map((line) => `      ${line}`)
+              .join("\n");
+            console.log(indented);
+          }
         }
 
         console.log("");
@@ -793,7 +822,7 @@ program
       const report = await findDuplicateResolutions(packageName, options.root, {
         scanWorkspaces: options.workspaces !== false,
       });
-      const { resolutions, workspacesDetected, scannedWorkspaces, resolvedViaParent } = report;
+      const { resolutions, workspacesDetected, scannedWorkspaces, resolvedViaParent, prereleaseHoistingNote } = report;
       const distinctVersions = new Set(resolutions.map((r) => r.version));
       // Any two distinct physical copies are a duplicate, even at the same
       // version — Node caches by realpath, so identity checks break either way.
@@ -810,6 +839,7 @@ program
           workspacesDetected,
           scannedWorkspaces,
           resolvedViaParent,
+          prereleaseHoistingNote,
         },
         () => {
           console.log(`📦 ${packageName}`);
@@ -839,6 +869,20 @@ program
             console.log(
               `⚠️  ${resolutions.length} distinct copies found (${versionNote}) — instanceof/DI singletons may break across copies`,
             );
+            if (prereleaseHoistingNote) {
+              const n = prereleaseHoistingNote;
+              console.log(
+                `⚠️  ${n.pinnedWorkspaces.length} workspace(s) pin a PRERELEASE (${n.prereleaseVersion}).`,
+              );
+              console.log(
+                `    Prerelease versions are not matched by the caret/tilde ranges used by other workspaces ` +
+                  `(${n.blockedRange}), so they cannot hoist and each pinned workspace gets a private copy.`,
+              );
+              console.log(
+                "    If this package exports classes used as identity tokens (NestJS providers, instanceof " +
+                  "checks), those copies are NOT interchangeable.",
+              );
+            }
           } else {
             console.log("✅ single resolution");
           }
