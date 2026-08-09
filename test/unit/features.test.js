@@ -28,12 +28,20 @@ function log(message, color = 'reset') {
 
 // Run the CLI in `cwd`, resolving with { code, stdout, stderr }. stdout is kept
 // separate so JSON-mode purity can be asserted.
+// `env` values of `null` delete that key from the inherited environment
+// entirely (rather than merging in the literal string "null") — needed so
+// tests can assert "no token configured" behavior even when the runner
+// itself has NPM_TOKEN/NODE_AUTH_TOKEN set (e.g. this repo's own publish CI).
 function runPackdev(cwd, args = [], env = {}) {
   return new Promise((resolve, reject) => {
+    const mergedEnv = { ...process.env, ...env };
+    for (const [key, value] of Object.entries(mergedEnv)) {
+      if (value === null) delete mergedEnv[key];
+    }
     const child = spawn('node', [BINARY_PATH, ...args], {
       stdio: 'pipe',
       cwd,
-      env: { ...process.env, ...env },
+      env: mergedEnv,
     });
     let stdout = '';
     let stderr = '';
@@ -1101,9 +1109,14 @@ class FeatureTests {
       const registryUrl = `http://127.0.0.1:${server.address().port}`;
 
       const appDir = this.tmp('api-diff-auth-missing');
-      const r = await runPackdev(appDir, [
-        'api-diff', 'fake-lib', '--range', '>=1.0.0', '--app', appDir, '--registry', registryUrl, '--json',
-      ]);
+      const r = await runPackdev(
+        appDir,
+        ['api-diff', 'fake-lib', '--range', '>=1.0.0', '--app', appDir, '--registry', registryUrl, '--json'],
+        // The runner itself may have NPM_TOKEN/NODE_AUTH_TOKEN set (e.g.
+        // this repo's own publish CI) — strip them so this test genuinely
+        // exercises the no-token-configured path, not "wrong token sent".
+        { NPM_TOKEN: null, NODE_AUTH_TOKEN: null },
+      );
       assert.notStrictEqual(r.code, 0);
       const json = parseJson(r.stdout, 'api-diff');
       assert.match(json.error, /401/);
@@ -1177,9 +1190,14 @@ class FeatureTests {
         `@myscope:registry=${registryUrl}\n//${host}/:_authToken=npmrc-token\n`,
       );
 
-      const r = await runPackdev(appDir, [
-        'api-diff', '@myscope/fake-lib', '--range', '>=1.0.0', '--app', appDir, '--json',
-      ]);
+      const r = await runPackdev(
+        appDir,
+        ['api-diff', '@myscope/fake-lib', '--range', '>=1.0.0', '--app', appDir, '--json'],
+        // Env vars outrank .npmrc in resolveAuthToken's priority order, so a
+        // real NPM_TOKEN in the runner's environment would otherwise mask
+        // exactly the .npmrc auto-detection this test exists to verify.
+        { NPM_TOKEN: null, NODE_AUTH_TOKEN: null },
+      );
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'api-diff');
       assert.strictEqual(json.versions[0].version, '1.0.0');
