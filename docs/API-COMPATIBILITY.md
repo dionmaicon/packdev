@@ -72,7 +72,23 @@ packdev api pure-js-lib --introspect --json
 
 `--introspect` **executes the installed package's real code** in an isolated, timeout-bounded child process to walk its prototype chain (a plain `Object.keys()` on a class instance misses methods — they live on `.prototype`). It's opt-in only, never automatic, and clearly separated from static output (`runtimeIntrospection` is `null` unless the flag is passed and static resolution found nothing) — don't reach for it by default against untrusted packages.
 
-**Exit codes**: `0` success (including `hasTypes: false`), `4` package not installed anywhere up the `node_modules` tree.
+**`hasTypes: true` but `exports: []`** (types exist but the checker couldn't statically resolve anything to a real symbol — the common case is a barrel `.d.ts` built from `export * from "./generated"` re-exports the isolated single-file program can't follow, or a generic factory-wrapper pattern) surfaces a `rawExportHints` fallback: a syntax-only scan (no type checker) that can still name what's there, even without a signature. It is never conflated with a resolved export — treat it as "there's *something* here, but not verified":
+
+```bash
+packdev api barrel-lib --json
+```
+```json
+{
+  "hasTypes": true, "exports": [],
+  "rawExportHints": [
+    { "name": "*", "note": "re-exported from \"./generated\"" }
+  ]
+}
+```
+
+`--introspect` also applies in this case (types resolved to nothing usable, same as no types at all) for a runtime-reflected shape instead.
+
+**Exit codes**: `0` success (including `hasTypes: false` and the `rawExportHints` fallback), `4` package not installed anywhere up the `node_modules` tree.
 
 ## 🔍 `packdev api-diff <pkg> --range <semver>`
 
@@ -97,15 +113,17 @@ packdev api-diff is-odd --range ">=0.1.0 <4.0.0" --app . --json
 |---|---|
 | `--range <semver>` | **Required.** Version range to check, e.g. `">=1.0.0 <3.0.0"`. |
 | `--app <dir>` | App directory to scan for imports (default `.`). |
-| `--registry <url>` | npm registry URL (default `https://registry.npmjs.org`). |
+| `--registry <url>` | npm registry URL. Defaults to `.npmrc`'s `@scope:registry` mapping for a scoped package, then `.npmrc`'s own `registry` line, then `https://registry.npmjs.org` — usually doesn't need to be passed by hand. |
+| `--token <token>` | Bearer token for a private registry. Defaults to `NPM_TOKEN`/`NODE_AUTH_TOKEN` env vars, then `.npmrc`'s `//<host>/:_authToken`. |
 | `--include-prerelease` | Include prerelease versions (excluded by default). |
 | `--include-deprecated` | Include deprecated versions (excluded by default). |
 
 - `hasDynamicUsage: true` means the app uses a namespace import (`import * as x`) or a bare `require(pkg)` somewhere — those can't be statically resolved to specific symbols, so the usage check is only a partial guarantee for that app. It's surfaced, not silently ignored.
 - `typesSource` tells you where the types came from for that version: `"bundled"` (shipped with the package), `"types-package"` (fetched `@types/<pkg>` separately), or `"none"` (no types found anywhere — `missingSymbols` will include everything the app imports, since nothing could be verified).
 - `usedSymbols: []` (app never imports the package) makes every version trivially `apiCompatible: true` — nothing to miss.
+- **Private registries** (GitHub Packages, Artifactory, Verdaccio, ...): if `--app`'s `.npmrc` already has `@scope:registry` and `//<host>/:_authToken` lines (the same ones your real installs use), `api-diff` picks them up automatically — no `--registry`/`--token` needed. A `401` error names the exact host and explains which of `--token`/env/`.npmrc` it looked for and found nothing.
 
-**Exit codes**: `0` success, `1` generic error (invalid range, registry unreachable, etc.).
+**Exit codes**: `0` success, `1` generic error (invalid range, registry unreachable or unauthorized, etc.).
 
 ## 🧪 `packdev compat <pkg> --test <cmd>`
 
@@ -132,7 +150,7 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 |---|---|
 | `--test <cmd>` | **Required.** Command to run in each sandbox, e.g. `"npm test"`. |
 | `--range <semver>` / `--versions <list>` | Mutually exclusive — a registry range, or an explicit comma-separated list. |
-| `--app <dir>`, `--registry <url>`, `--include-prerelease`, `--include-deprecated` | Same meaning as `api-diff`. |
+| `--app <dir>`, `--registry <url>`, `--token <token>`, `--include-prerelease`, `--include-deprecated` | Same meaning and `.npmrc` auto-detection as `api-diff`. `--registry`/`--token` here only resolve `--range` — the sandbox's own real install always uses its package manager's normal `.npmrc` auth, unaffected by `--token`. |
 | `--bisect` | Binary-search the pass/fail boundary instead of testing every version (fewer runs). Re-confirms the boundary once to catch flakiness/non-monotonicity, falling back to a full linear scan if the confirmation disagrees — never trusts a fast-but-wrong answer. |
 | `--group <pkgs>` | Comma-separated peer packages to pin to the **same** version as `<pkg>` in every run (NestJS's `@nestjs/*` family, or any set that must move in lockstep). Without this, only `<pkg>` moves — its declared peers stay wherever your `package.json` already has them, which usually isn't a combination anyone actually ships. |
 | `--snapshot-dir <dir>` | Save a hashed copy of each version's resolved lockfile — the target version pins exactly, but its *own* dependencies still resolve by range, so the same target version can mean a different dependency tree across two runs. Point repeated runs at the same directory to build a diffable history. |
@@ -147,22 +165,42 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 
 ## 🧬 `packdev dupes <pkg>`
 
-Walks the real `node_modules` tree (not the declared dependency graph) for every distinct place `<pkg>` actually resolves — the thing that breaks `instanceof` checks and DI singletons when hoisting goes wrong.
+Walks the real `node_modules` tree (not the declared dependency graph) for every distinct place `<pkg>` actually resolves — the thing that breaks `instanceof` checks and DI singletons when hoisting goes wrong. **Two copies of the *same* version still count** — Node caches modules by realpath, so a different physical directory is always a different object, even at an identical version string.
 
 ```bash
 packdev dupes commander --json
-# {"command":"dupes","package":"commander","duplicate":false,"resolutions":[{"path":"node_modules/commander","version":"14.0.1"}]}
+# {"command":"dupes","package":"commander","duplicate":false,"resolutions":[{"path":"node_modules/commander","realpath":"/abs/…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[],"resolvedViaParent":null}
 ```
 
-Three honest outcomes, all exit `0` — this is a diagnostic, not a pass/fail check:
+**Workspace-aware by default.** In an npm/yarn/pnpm workspaces monorepo, hoisting is partial: a workspace whose range can't be satisfied by the hoisted version gets its own private nested copy — the single most common source of duplicate-copy bugs, and invisible if only the root's own `node_modules` is scanned. `dupes` detects `package.json` `workspaces` (array or `{packages: [...]}` form) and `pnpm-workspace.yaml`, and scans every matched workspace's `node_modules` too, not just the root's:
 
-| `resolutions` | `duplicate` | Meaning |
-|---|---|---|
-| One entry | `false` | Single resolution — nothing to worry about. |
-| 2+ entries, different versions | `true` | Real duplication — `instanceof`/DI singletons may break across the copies. |
-| `[]` | `false` | Not installed anywhere in the tree (not an error). |
+```console
+$ packdev dupes @acme/shared-lib --json
+{"duplicate":true,"resolutions":[
+  {"path":"node_modules/@acme/shared-lib","version":"1.0.0","workspace":"."},
+  {"path":"apps/checkout/node_modules/@acme/shared-lib","version":"1.0.199-abc123","workspace":"apps/checkout"}
+], "workspacesDetected":["apps/checkout","apps/api"], "scannedWorkspaces":["apps/checkout","apps/api"]}
+```
 
-`--root <dir>` sets the search root (default `.`).
+A common real cause: a **prerelease** pinned in some workspaces (`1.0.199-abc123`) can never satisfy the caret ranges (`^1.0.0`) the rest of the monorepo uses, so it can never hoist — every workspace pinned to it gets a private, non-interchangeable copy even though nothing about it looks wrong in a build or test run.
+
+| Flag | Purpose |
+|---|---|
+| `--root <dir>` | Search root (default `.`). |
+| `--no-workspaces` | Skip the workspace scan even if a workspaces config is found — root-only, for speed on very large monorepos. When set, `scannedWorkspaces` stays `[]` while `workspacesDetected` still lists what was skipped, so the verdict is visibly hedged rather than silently claiming a clean bill of health. |
+
+Four honest outcomes:
+
+| `resolutions` | `duplicate` | Exit | Meaning |
+|---|---|---|---|
+| One entry | `false` | `0` | Single resolution — nothing to worry about. |
+| 2+ entries (any versions, even identical) | `true` | `5` | Real duplication — `instanceof`/DI singletons may break across the copies. |
+| `[]`, `resolvedViaParent` set | `false` | `0` | Not nested here, but resolves fine via Node's normal upward `node_modules` walk from a parent directory — distinct from not being a dependency at all. |
+| `[]`, `resolvedViaParent: null` | `false` | `0` | Genuinely not installed anywhere reachable from `--root` (or a typo'd package name) — not an error. |
+
+Exit code **`5`** on `duplicate: true` makes `dupes` usable directly as a CI guard (`packdev dupes <pkg> || fail-the-build`); every other outcome above is `0`.
+
+Each resolution includes `realpath` (fully resolved, symlinks followed) alongside `path`, since realpath is what actually determines Node's module-identity — two `path`s that look different can still be the same realpath (a symlink), and vice versa.
 
 ## Exit codes (all four commands)
 
@@ -171,6 +209,7 @@ Three honest outcomes, all exit `0` — this is a diagnostic, not a pass/fail ch
 | `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` resolutions). |
 | `1` | Generic error — see the `error` field in `--json` output for the actual message. |
 | `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
+| `5` | `dupes` found `duplicate: true` — usable directly as a CI guard. |
 
 ## 🤖 Agent/scripting notes
 
@@ -178,3 +217,5 @@ Three honest outcomes, all exit `0` — this is a diagnostic, not a pass/fail ch
 - Budget-conscious ordering: run `api-diff` first (cheap, no install) to narrow a version range down to plausible candidates, then `compat` (expensive, real installs) only on the survivors — don't run `compat --range` across a wide range as a first move.
 - `success: false` + a human-readable `error` string appears in every command's JSON on failure, in addition to the exit code — branch on either, but the exit code is the stable contract across versions.
 - `--introspect` executes third-party code. Treat it the same as running the package's own code directly — don't enable it by default in an automated pipeline against untrusted packages.
+- First-party, mid-migration packages living behind a private registry are exactly the ones most worth checking with `api-diff`/`compat` — and the ones your `.npmrc` already knows how to authenticate to for real installs. Point `--app` at the project whose `.npmrc` has the right `@scope:registry`/`_authToken` lines and skip `--registry`/`--token` entirely; only reach for `--token` (or `NPM_TOKEN`/`NODE_AUTH_TOKEN`) when running somewhere without that `.npmrc` on disk, e.g. a bare CI job.
+- `dupes` exits `5` on `duplicate: true` — wire it into CI as a guard (`packdev dupes <pkg> || exit 1`) rather than only reading `--json`'s `duplicate` field by hand.

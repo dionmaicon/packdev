@@ -53,6 +53,7 @@ export interface CompatOptions {
   appDir: string;
   testCommand: string;
   registryUrl: string;
+  token?: string | undefined;
   includePrerelease?: boolean | undefined;
   includeDeprecated?: boolean | undefined;
   group?: string[] | undefined;
@@ -70,7 +71,12 @@ export async function resolveCandidateVersions(
   pkgName: string,
   options: Pick<
     CompatOptions,
-    "range" | "versions" | "registryUrl" | "includePrerelease" | "includeDeprecated"
+    | "range"
+    | "versions"
+    | "registryUrl"
+    | "token"
+    | "includePrerelease"
+    | "includeDeprecated"
   >,
 ): Promise<string[]> {
   if (options.versions && options.versions.length > 0) {
@@ -85,7 +91,11 @@ export async function resolveCandidateVersions(
     throw new Error("Either --range or --versions must be provided");
   }
 
-  const metadata = await fetchPackageMetadata(pkgName, options.registryUrl);
+  const metadata = await fetchPackageMetadata(
+    pkgName,
+    options.registryUrl,
+    options.token,
+  );
   return listVersionsInRange(metadata, options.range, {
     includePrerelease: options.includePrerelease,
     includeDeprecated: options.includeDeprecated,

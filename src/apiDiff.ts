@@ -45,6 +45,7 @@ export interface ApiDiffOptions {
   range: string;
   appDir: string;
   registryUrl: string;
+  token?: string | undefined;
   includePrerelease?: boolean;
   includeDeprecated?: boolean;
 }
@@ -67,6 +68,7 @@ async function resolveExportsForVersion(
   packageDir: string,
   packageInfo: PackageInfo,
   registryUrl: string,
+  token: string | undefined,
 ): Promise<ResolvedExports> {
   const bundled = await resolvePackageExportMap(packageDir, packageInfo);
   if (bundled.hasTypes) {
@@ -77,12 +79,13 @@ async function resolveExportsForVersion(
     pkgName,
     version,
     registryUrl,
+    token,
   );
   if (!typesMatch) {
     return { exports: [], typesSource: "none" };
   }
 
-  const typesBuffer = await downloadTarball(typesMatch.tarball);
+  const typesBuffer = await downloadTarball(typesMatch.tarball, token);
   const { packageDir: typesPkgDir, cleanupDir: typesCleanupDir } =
     await extractTarball(typesBuffer);
 
@@ -113,12 +116,13 @@ async function diffOneVersion(
   tarballUrl: string,
   usedSymbols: Set<string>,
   registryUrl: string,
+  token: string | undefined,
 ): Promise<{
   missingSymbols: string[];
   exportCount: number;
   typesSource: TypesSource;
 }> {
-  const buffer = await downloadTarball(tarballUrl);
+  const buffer = await downloadTarball(tarballUrl, token);
   const { packageDir, cleanupDir } = await extractTarball(buffer);
   let extraCleanupDir: string | undefined;
 
@@ -138,6 +142,7 @@ async function diffOneVersion(
       packageDir,
       packageInfo,
       registryUrl,
+      token,
     );
     extraCleanupDir = resolved.extraCleanupDir;
 
@@ -167,7 +172,11 @@ export async function runApiDiff(
     pkgName,
   );
 
-  const metadata = await fetchPackageMetadata(pkgName, options.registryUrl);
+  const metadata = await fetchPackageMetadata(
+    pkgName,
+    options.registryUrl,
+    options.token,
+  );
   const versionsInRange = listVersionsInRange(metadata, options.range, {
     includePrerelease: options.includePrerelease,
     includeDeprecated: options.includeDeprecated,
@@ -184,6 +193,7 @@ export async function runApiDiff(
       dist.tarball,
       symbols,
       options.registryUrl,
+      options.token,
     );
 
     versions.push({

@@ -270,9 +270,10 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 # {"minimumCompatibleVersion":"2.0.0","recommendedVersion":"3.0.1", ...}
 # apiCompatible (step 1) and PASSED (step 2) are different claims — shape match ≠ behavior match
 
-# 3. Suspect instanceof/DI weirdness from a hoisting mismatch?
-packdev dupes is-odd --json
-# {"duplicate":false,"resolutions":[{"path":"node_modules/is-odd","version":"3.0.1"}]}
+# 3. Suspect instanceof/DI weirdness from a hoisting mismatch? Workspace-aware by
+#    default, exits 5 on a real duplicate — usable as a CI guard.
+packdev dupes commander --json
+# {"duplicate":false,"resolutions":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
 ```
 
 📖 **[Full API Compatibility Guide →](docs/API-COMPATIBILITY.md)** — decision table, every flag, real captured output, exit codes, and agent/scripting notes.

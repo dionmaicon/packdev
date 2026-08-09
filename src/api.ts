@@ -308,6 +308,101 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
   return results;
 }
 
+export interface RawExportHint {
+  name: string;
+  note: string;
+}
+
+/**
+ * Best-effort fallback for when extractExportMap's checker-based walk
+ * legitimately finds nothing — e.g. a barrel `.d.ts` built from generic
+ * factory wrappers (`export const Foo = EventClass<{...}>()`) whose
+ * resulting type the checker can't reduce to a nameable signature, or a
+ * pure re-export (`export * from "./generated"`) whose target file isn't
+ * resolvable in this isolated single-file program. This is a syntax-only
+ * scan (no type checker, no module resolution) so it can't fail the way
+ * extractExportMap's checker-based walk does — it always finds *something*
+ * if there's any top-level `export` syntax in the file at all. It never
+ * claims signatures, only that a name exists and roughly what kind of
+ * declaration produced it, so callers must not treat this as equivalent to
+ * a resolved export (in particular: api-diff must never use this, since an
+ * unresolved hint is not a verified "this symbol exists").
+ */
+export function extractRawExportHints(typesPath: string): RawExportHint[] {
+  const sourceText = ts.sys.readFile(typesPath);
+  if (!sourceText) return [];
+
+  const sourceFile = ts.createSourceFile(
+    typesPath,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+
+  const hints: RawExportHint[] = [];
+  const hasExportModifier = (node: ts.Node): boolean =>
+    ts.canHaveModifiers(node) &&
+    (ts.getModifiers(node) ?? []).some(
+      (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+    );
+
+  for (const stmt of sourceFile.statements) {
+    if (ts.isExportDeclaration(stmt)) {
+      const from = stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+        ? stmt.moduleSpecifier.text
+        : null;
+      if (!stmt.exportClause) {
+        if (from) hints.push({ name: "*", note: `re-exported from "${from}"` });
+        continue;
+      }
+      if (ts.isNamedExports(stmt.exportClause)) {
+        for (const el of stmt.exportClause.elements) {
+          hints.push({
+            name: el.name.text,
+            note: from ? `re-exported from "${from}"` : "re-exported",
+          });
+        }
+      }
+      continue;
+    }
+
+    if (ts.isExportAssignment(stmt)) {
+      hints.push({
+        name: "default",
+        note: "export = assignment (complex expression, not statically resolved)",
+      });
+      continue;
+    }
+
+    if (!hasExportModifier(stmt)) continue;
+
+    if (ts.isFunctionDeclaration(stmt) && stmt.name) {
+      hints.push({ name: stmt.name.text, note: "function" });
+    } else if (ts.isClassDeclaration(stmt) && stmt.name) {
+      hints.push({ name: stmt.name.text, note: "class" });
+    } else if (ts.isInterfaceDeclaration(stmt)) {
+      hints.push({ name: stmt.name.text, note: "interface" });
+    } else if (ts.isTypeAliasDeclaration(stmt)) {
+      hints.push({ name: stmt.name.text, note: "type" });
+    } else if (ts.isEnumDeclaration(stmt)) {
+      hints.push({ name: stmt.name.text, note: "enum" });
+    } else if (ts.isModuleDeclaration(stmt) && ts.isIdentifier(stmt.name)) {
+      hints.push({ name: stmt.name.text, note: "namespace" });
+    } else if (ts.isVariableStatement(stmt)) {
+      for (const decl of stmt.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name)) {
+          hints.push({
+            name: decl.name.text,
+            note: "const (complex/generic type not statically resolved)",
+          });
+        }
+      }
+    }
+  }
+
+  return hints;
+}
+
 export async function getInstalledVersion(
   pkgDir: string,
 ): Promise<string | null> {

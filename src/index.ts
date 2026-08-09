@@ -18,7 +18,9 @@ import {
   resolvePackageExportMap,
   resolveEntryPoint,
   getInstalledVersion,
+  extractRawExportHints,
   type ExportedSymbolWithSubpath,
+  type RawExportHint,
 } from "./api";
 import {
   introspectModuleRuntime,
@@ -26,6 +28,7 @@ import {
 } from "./runtimeIntrospect";
 import { readJsonFile, groupBy, type PackageInfo } from "./utils";
 import { runApiDiff } from "./apiDiff";
+import { loadNpmrcConfig, resolveRegistryForPackage, resolveAuthToken } from "./registry";
 import {
   runCompat,
   runCompatBisect,
@@ -103,6 +106,7 @@ const EXIT_CODE = {
   CONFIG_NOT_FOUND: 2,
   PACKAGE_JSON_NOT_FOUND: 3,
   PACKAGE_NOT_INSTALLED: 4,
+  DUPLICATE_FOUND: 5,
 } as const;
 
 function exitCodeFor(error?: string): number {
@@ -390,7 +394,7 @@ program
   .argument("<package>", "Package name to inspect")
   .option(
     "--introspect",
-    "When no static types are found, fall back to executing the installed package and reflecting its runtime shape (executes third-party code — opt-in only)",
+    "When static analysis finds no usable exports (no types, or types that resolve to zero exports — e.g. a barrel/generic-wrapper .d.ts), fall back to executing the installed package and reflecting its runtime shape (executes third-party code — opt-in only)",
     false,
   )
   .option(
@@ -429,8 +433,25 @@ program
       const version =
         (await getInstalledVersion(pkgDir)) || packageInfo.version;
 
+      // Types exist (hasTypes:true) but the checker-based walk found nothing —
+      // common for barrel .d.ts files built from generic factory wrappers or
+      // re-exports the isolated single-file program can't resolve. Rather
+      // than flatly claiming "no exported symbols", fall back to a syntax-only
+      // scan that can still name what's there, even without a signature.
+      let rawExportHints: RawExportHint[] | null = null;
+      if (hasTypes && exportsList.length === 0) {
+        const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+        if (typesPath) {
+          const hints = extractRawExportHints(typesPath);
+          if (hints.length > 0) rawExportHints = hints;
+        }
+      }
+
+      // Introspection is opt-in and only kicks in when static analysis found
+      // nothing usable — either no types at all, or types that resolved to
+      // zero real exports (the barrel/generic-wrapper case above).
       let runtimeIntrospection: { exports: RuntimeExportedSymbol[] } | null = null;
-      if (!hasTypes && options.introspect) {
+      if (exportsList.length === 0 && options.introspect) {
         const { jsPath } = await resolveEntryPoint(pkgDir, packageInfo);
         const introspected = await introspectModuleRuntime(
           jsPath,
@@ -447,6 +468,7 @@ program
           resolvedPath: pkgDir,
           hasTypes,
           exports: exportsList,
+          rawExportHints,
           runtimeIntrospection,
         },
         () => {
@@ -455,25 +477,39 @@ program
             console.log(
               "\n⚠️  No type declarations found for this package (pure JS, or types could not be resolved).",
             );
-            if (runtimeIntrospection) {
+          } else if (exportsList.length === 0) {
+            if (rawExportHints) {
               console.log(
-                "\n⚠️  Runtime introspection (executed package code) — less precise than static types:",
+                "\n⚠️  Types exist but couldn't be statically resolved to full signatures " +
+                  "(likely a barrel export or generic factory wrapper). Names found by a raw syntax scan:",
               );
-              printExportsByKind(
-                runtimeIntrospection.exports.map((e) => ({ ...e, subpath: "." })),
-              );
-            } else if (options.introspect) {
-              console.log(
-                "\n⚠️  Runtime introspection failed, timed out, or found nothing.",
-              );
+              for (const hint of rawExportHints) {
+                console.log(`  ${hint.name}  — ${hint.note}`);
+              }
+            } else {
+              console.log("\n(no exported symbols found)");
             }
+          } else {
+            printExportsByKind(exportsList);
             return;
           }
-          if (exportsList.length === 0) {
-            console.log("\n(no exported symbols found)");
-            return;
+
+          if (runtimeIntrospection) {
+            console.log(
+              "\n⚠️  Runtime introspection (executed package code) — less precise than static types:",
+            );
+            printExportsByKind(
+              runtimeIntrospection.exports.map((e) => ({ ...e, subpath: "." })),
+            );
+          } else if (options.introspect) {
+            console.log(
+              "\n⚠️  Runtime introspection failed, timed out, or found nothing.",
+            );
+          } else {
+            console.log(
+              "\n💡 For a runtime-reflected shape instead, re-run with --introspect.",
+            );
           }
-          printExportsByKind(exportsList);
         },
       );
     } catch (error) {
@@ -501,15 +537,27 @@ program
     'Version range to check, e.g. ">=1.0.0 <3.0.0"',
   )
   .option("--app <dir>", "App directory to scan for usage", ".")
-  .option("--registry <url>", "npm registry URL", "https://registry.npmjs.org")
+  .option(
+    "--registry <url>",
+    "npm registry URL (defaults to .npmrc's @scope:registry mapping, then its registry line, then the public npm registry)",
+  )
+  .option(
+    "--token <token>",
+    "Bearer token for a private registry (defaults to NPM_TOKEN/NODE_AUTH_TOKEN env, then .npmrc's //<host>/:_authToken)",
+  )
   .option("--include-prerelease", "Include prerelease versions", false)
   .option("--include-deprecated", "Include deprecated versions", false)
   .action(async (packageName: string, options) => {
     try {
+      const npmrc = await loadNpmrcConfig(options.app);
+      const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
+      const token = resolveAuthToken(registryUrl, npmrc, options.token);
+
       const report = await runApiDiff(packageName, {
         range: options.range,
         appDir: options.app,
-        registryUrl: options.registry,
+        registryUrl,
+        token,
         includePrerelease: !!options.includePrerelease,
         includeDeprecated: !!options.includeDeprecated,
       });
@@ -590,8 +638,11 @@ program
   .option("--app <dir>", "App directory to test", ".")
   .option(
     "--registry <url>",
-    "npm registry URL (also passed to the sandbox install)",
-    "https://registry.npmjs.org",
+    "npm registry URL, also passed to the sandbox install (defaults to .npmrc's @scope:registry mapping, then its registry line, then the public npm registry)",
+  )
+  .option(
+    "--token <token>",
+    "Bearer token for a private registry, used to resolve --range (the sandbox install itself uses its own package manager's .npmrc auth) — defaults to NPM_TOKEN/NODE_AUTH_TOKEN env, then .npmrc's //<host>/:_authToken",
   )
   .option("--include-prerelease", "Include prerelease versions with --range", false)
   .option("--include-deprecated", "Include deprecated versions with --range", false)
@@ -627,6 +678,10 @@ program
         throw new Error("--range and --versions are mutually exclusive");
       }
 
+      const npmrc = await loadNpmrcConfig(options.app);
+      const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
+      const token = resolveAuthToken(registryUrl, npmrc, options.token);
+
       const compatOptions = {
         range: options.range,
         versions: options.versions
@@ -637,7 +692,8 @@ program
           : undefined,
         appDir: options.app,
         testCommand: options.test,
-        registryUrl: options.registry,
+        registryUrl,
+        token,
         includePrerelease: !!options.includePrerelease,
         includeDeprecated: !!options.includeDeprecated,
         group: options.group
@@ -721,42 +777,80 @@ program
 program
   .command("dupes")
   .description(
-    "Find every distinct copy of a package resolved in the dependency tree",
+    "Find every distinct copy of a package resolved in the dependency tree. " +
+      "Note: two copies of the SAME version still break instanceof checks and " +
+      "DI singletons (NestJS tokens, Symbol registries) — Node caches modules " +
+      "by realpath, so same version at a different path is still a different object.",
   )
   .argument("<package>", "Package name to check")
   .option("--root <dir>", "Directory to search from", ".")
+  .option(
+    "--no-workspaces",
+    "Skip scanning workspace-nested node_modules even if a workspaces config is found under --root",
+  )
   .action(async (packageName: string, options) => {
     try {
-      const resolutions = await findDuplicateResolutions(
-        packageName,
-        options.root,
-      );
+      const report = await findDuplicateResolutions(packageName, options.root, {
+        scanWorkspaces: options.workspaces !== false,
+      });
+      const { resolutions, workspacesDetected, scannedWorkspaces, resolvedViaParent } = report;
       const distinctVersions = new Set(resolutions.map((r) => r.version));
-      const duplicate = resolutions.length > 1 && distinctVersions.size > 1;
+      // Any two distinct physical copies are a duplicate, even at the same
+      // version — Node caches by realpath, so identity checks break either way.
+      const duplicate = resolutions.length > 1;
+      const hedged =
+        workspacesDetected.length > 0 && scannedWorkspaces.length < workspacesDetected.length;
 
       output(
-        { command: "dupes", package: packageName, duplicate, resolutions },
+        {
+          command: "dupes",
+          package: packageName,
+          duplicate,
+          resolutions,
+          workspacesDetected,
+          scannedWorkspaces,
+          resolvedViaParent,
+        },
         () => {
           console.log(`📦 ${packageName}`);
           if (resolutions.length === 0) {
-            console.log("  (not found anywhere in the tree)");
+            if (resolvedViaParent) {
+              console.log(
+                `  resolved via parent: ${resolvedViaParent.path}  (${resolvedViaParent.version})`,
+              );
+              console.log(
+                "  ℹ️  not a nested copy — this workspace resolves the package via Node's normal upward node_modules walk.",
+              );
+            } else {
+              console.log("  (not found anywhere in the tree)");
+            }
             return;
           }
           for (const r of resolutions) {
-            console.log(`  ${r.path}  (${r.version})`);
+            const label = r.workspace === "." ? "" : ` [${r.workspace}]`;
+            console.log(`  ${r.path}${label}  (${r.version})`);
           }
           console.log("");
           if (duplicate) {
+            const versionNote =
+              distinctVersions.size > 1
+                ? `${distinctVersions.size} distinct versions`
+                : "the same version at different paths";
             console.log(
-              `⚠️  ${distinctVersions.size} distinct versions found — instanceof/DI singletons may break across copies`,
+              `⚠️  ${resolutions.length} distinct copies found (${versionNote}) — instanceof/DI singletons may break across copies`,
             );
-          } else if (resolutions.length === 1) {
-            console.log("✅ single resolution");
           } else {
-            console.log("✅ all resolutions are the same version");
+            console.log("✅ single resolution");
+          }
+          if (hedged) {
+            console.log(
+              `⚠️  ${workspacesDetected.length - scannedWorkspaces.length} workspace(s) were not scanned (--no-workspaces) — this verdict may be incomplete.`,
+            );
           }
         },
       );
+
+      if (duplicate) process.exit(EXIT_CODE.DUPLICATE_FOUND);
     } catch (error) {
       output(
         {

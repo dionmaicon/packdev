@@ -67,11 +67,11 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 - **Audience**: All users, especially teams
 - **Key Topics**: Configuration persistence, safety features, advanced workflows
 
-### [API Compatibility Guide](./API-COMPATIBILITY.md) (180 lines)
+### [API Compatibility Guide](./API-COMPATIBILITY.md) (220+ lines)
 - **Purpose**: Checking API/behavioral compatibility across published versions before upgrading
 - **Contains**: `api`/`api-diff`/`compat`/`dupes` command reference, decision table, real captured output, exit codes
 - **Audience**: All users, especially those scripting or using coding agents
-- **Key Topics**: Static vs runtime compatibility checks, lockfile drift auditing, peer-group version pinning
+- **Key Topics**: Static vs runtime compatibility checks, lockfile drift auditing, peer-group version pinning, workspace-aware duplicate detection, private-registry auth (.npmrc/token)
 
 ### [Packaging Guide](./PACKAGING.md) (316+ lines)
 - **Purpose**: Building and distributing packages
@@ -224,7 +224,7 @@ When updating documentation:
 ## 📊 Documentation Stats
 
 - **Total Documents**: 6 comprehensive guides
-- **Total Lines**: 2,080+ lines of documentation
+- **Total Lines**: 2,120+ lines of documentation
 - **Coverage**: Complete workflow, packaging, safety, package manager support, and API compatibility
 - **Maintenance**: Actively maintained and tested
 

@@ -27,15 +27,161 @@ export interface RegistryMetadata {
   versions: Record<string, RegistryVersionInfo>;
 }
 
+// --- .npmrc / auth resolution -------------------------------------------
+//
+// A private scope (GitHub Packages, Artifactory, Verdaccio, ...) is the
+// common case for the packages this tool is actually most useful against —
+// first-party, mid-migration, least well-understood. Bare `fetch(url)` with
+// no Authorization header always 401s there. This reads the same places npm
+// itself does, so `--registry` usually doesn't even need to be passed by
+// hand once a project's .npmrc already maps the scope.
+
+export interface NpmrcConfig {
+  /** host (e.g. "npm.pkg.github.com") -> bearer token */
+  authTokens: Record<string, string>;
+  /** "@scope" -> registry base URL */
+  scopeRegistries: Record<string, string>;
+  defaultRegistry?: string;
+}
+
+function interpolateEnvVars(value: string): string {
+  return value.replace(/\$\{([A-Za-z0-9_]+)\}/g, (_, name) => process.env[name] ?? "");
+}
+
+async function parseNpmrcFile(filePath: string): Promise<NpmrcConfig> {
+  const config: NpmrcConfig = { authTokens: {}, scopeRegistries: {} };
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, "utf-8");
+  } catch {
+    return config;
+  }
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+
+    const key = line.slice(0, eq).trim();
+    const rawValue = line.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    const value = interpolateEnvVars(rawValue);
+
+    const authTokenMatch = key.match(/^\/\/(.+)\/:_authToken$/);
+    if (authTokenMatch?.[1]) {
+      config.authTokens[authTokenMatch[1]] = value;
+      continue;
+    }
+
+    const scopeMatch = key.match(/^(@[^:]+):registry$/);
+    if (scopeMatch?.[1]) {
+      config.scopeRegistries[scopeMatch[1]] = value.replace(/\/+$/, "");
+      continue;
+    }
+
+    if (key === "registry") {
+      config.defaultRegistry = value.replace(/\/+$/, "");
+    }
+  }
+
+  return config;
+}
+
+function mergeNpmrc(base: NpmrcConfig, override: NpmrcConfig): NpmrcConfig {
+  const merged: NpmrcConfig = {
+    authTokens: { ...base.authTokens, ...override.authTokens },
+    scopeRegistries: { ...base.scopeRegistries, ...override.scopeRegistries },
+  };
+  const defaultRegistry = override.defaultRegistry ?? base.defaultRegistry;
+  if (defaultRegistry) merged.defaultRegistry = defaultRegistry;
+  return merged;
+}
+
+/**
+ * Load and merge .npmrc config the way npm itself does for the values this
+ * tool cares about: user-level (~/.npmrc) first, then project-level
+ * (<cwd>/.npmrc) overriding it.
+ */
+export async function loadNpmrcConfig(cwd: string = process.cwd()): Promise<NpmrcConfig> {
+  const userConfig = await parseNpmrcFile(path.join(os.homedir(), ".npmrc"));
+  const projectConfig = await parseNpmrcFile(path.join(cwd, ".npmrc"));
+  return mergeNpmrc(userConfig, projectConfig);
+}
+
+/**
+ * Pick the registry for `pkgName`: an explicit `--registry` always wins;
+ * otherwise a scoped package (`@scope/name`) checks .npmrc's
+ * `@scope:registry` mapping before falling back to .npmrc's own default
+ * `registry` line, then the public npm registry.
+ */
+export function resolveRegistryForPackage(
+  pkgName: string,
+  npmrc: NpmrcConfig,
+  explicitRegistry?: string | undefined,
+): string {
+  if (explicitRegistry) return explicitRegistry;
+  const scopeMatch = pkgName.match(/^(@[^/]+)\//);
+  if (scopeMatch?.[1]) {
+    const scoped = npmrc.scopeRegistries[scopeMatch[1]];
+    if (scoped) return scoped;
+  }
+  return npmrc.defaultRegistry ?? "https://registry.npmjs.org";
+}
+
+/**
+ * Resolve the bearer token for `registryUrl`, in priority order: an
+ * explicit `--token` flag, then the CI-conventional `NPM_TOKEN` /
+ * `NODE_AUTH_TOKEN` env vars, then .npmrc's `//<host>/:_authToken`.
+ * Returns undefined when nothing is configured — a public registry never
+ * needs one and this is not an error.
+ */
+export function resolveAuthToken(
+  registryUrl: string,
+  npmrc: NpmrcConfig,
+  explicitToken?: string | undefined,
+): string | undefined {
+  if (explicitToken) return explicitToken;
+  if (process.env["NPM_TOKEN"]) return process.env["NPM_TOKEN"];
+  if (process.env["NODE_AUTH_TOKEN"]) return process.env["NODE_AUTH_TOKEN"];
+  try {
+    const host = new URL(registryUrl).host;
+    return npmrc.authTokens[host];
+  } catch {
+    return undefined;
+  }
+}
+
+function authHeaders(token?: string | undefined): Record<string, string> {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function unauthorizedHint(url: string, token: string | undefined): string {
+  if (token) {
+    return " — a token was sent but the registry rejected it; check it's valid and not expired.";
+  }
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = url;
+  }
+  return (
+    ` — private registry? packdev found no token for this host. Pass --token, ` +
+    `set NPM_TOKEN or NODE_AUTH_TOKEN, or add "//${host}/:_authToken=<token>" to .npmrc.`
+  );
+}
+
 export async function fetchPackageMetadata(
   pkgName: string,
   registryUrl: string,
+  token?: string | undefined,
 ): Promise<RegistryMetadata> {
   const url = `${registryUrl.replace(/\/+$/, "")}/${encodeURIComponent(pkgName).replace(/^%40/, "@")}`;
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: authHeaders(token) });
   if (!response.ok) {
+    const hint = response.status === 401 ? unauthorizedHint(url, token) : "";
     throw new Error(
-      `Registry request failed for "${pkgName}" (${response.status} ${response.statusText}) at ${url}`,
+      `Registry request failed for "${pkgName}" (${response.status} ${response.statusText}) at ${url}${hint}`,
     );
   }
   const body = (await response.json()) as {
@@ -99,12 +245,13 @@ export async function resolveTypesPackageTarball(
   pkgName: string,
   pkgVersion: string,
   registryUrl: string,
+  token?: string | undefined,
 ): Promise<TypesPackageMatch | null> {
   const typesPkgName = toTypesPackageName(pkgName);
 
   let metadata: RegistryMetadata;
   try {
-    metadata = await fetchPackageMetadata(typesPkgName, registryUrl);
+    metadata = await fetchPackageMetadata(typesPkgName, registryUrl, token);
   } catch {
     return null;
   }
@@ -126,11 +273,15 @@ export async function resolveTypesPackageTarball(
   return { version: chosen, tarball: dist.tarball };
 }
 
-export async function downloadTarball(tarballUrl: string): Promise<Buffer> {
-  const response = await fetch(tarballUrl);
+export async function downloadTarball(
+  tarballUrl: string,
+  token?: string | undefined,
+): Promise<Buffer> {
+  const response = await fetch(tarballUrl, { headers: authHeaders(token) });
   if (!response.ok) {
+    const hint = response.status === 401 ? unauthorizedHint(tarballUrl, token) : "";
     throw new Error(
-      `Failed to download tarball (${response.status} ${response.statusText}) from ${tarballUrl}`,
+      `Failed to download tarball (${response.status} ${response.statusText}) from ${tarballUrl}${hint}`,
     );
   }
   const arrayBuffer = await response.arrayBuffer();

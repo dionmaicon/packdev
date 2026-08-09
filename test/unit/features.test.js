@@ -28,9 +28,13 @@ function log(message, color = 'reset') {
 
 // Run the CLI in `cwd`, resolving with { code, stdout, stderr }. stdout is kept
 // separate so JSON-mode purity can be asserted.
-function runPackdev(cwd, args = []) {
+function runPackdev(cwd, args = [], env = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn('node', [BINARY_PATH, ...args], { stdio: 'pipe', cwd });
+    const child = spawn('node', [BINARY_PATH, ...args], {
+      stdio: 'pipe',
+      cwd,
+      env: { ...process.env, ...env },
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => (stdout += d.toString()));
@@ -119,6 +123,52 @@ function startFakeRegistry(packages) {
             // packument manifest, not by inspecting the extracted tarball —
             // omitting `scripts` here silently skips postinstall etc.
             ...(info.scripts ? { scripts: info.scripts } : {}),
+          };
+        }
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ name: pkgName, versions }));
+        return;
+      }
+
+      const match = url.match(/^\/tarballs\/(.+)\/(.+)\.tgz$/);
+      const info = match && packages[match[1]] && packages[match[1]][match[2]];
+      if (info) {
+        res.setHeader('content-type', 'application/octet-stream');
+        res.end(info.tarballBuffer);
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve(server);
+    });
+  });
+}
+
+// Same shape as startFakeRegistry, but 401s any request whose Authorization
+// header isn't exactly `Bearer <expectedToken>` — for exercising packdev's
+// registry auth (--token / NPM_TOKEN / NODE_AUTH_TOKEN / .npmrc) end to end.
+function startAuthGatedRegistry(packages, expectedToken) {
+  return new Promise((resolve) => {
+    let port;
+    const server = http.createServer((req, res) => {
+      if (req.headers.authorization !== `Bearer ${expectedToken}`) {
+        res.statusCode = 401;
+        res.end('Unauthorized');
+        return;
+      }
+
+      const url = decodeURIComponent(req.url);
+      const pkgName = Object.keys(packages).find((name) => url === `/${name}`);
+      if (pkgName) {
+        const versionsMap = packages[pkgName];
+        const versions = {};
+        for (const [version, info] of Object.entries(versionsMap)) {
+          versions[version] = {
+            version,
+            dist: { tarball: `http://127.0.0.1:${port}/tarballs/${encodeURIComponent(pkgName)}/${version}.tgz` },
           };
         }
         res.setHeader('content-type', 'application/json');
@@ -520,6 +570,40 @@ class FeatureTests {
       const json = parseJson(r.stdout, 'api');
       assert.strictEqual(json.hasTypes, false);
       assert.deepStrictEqual(json.exports, []);
+    });
+  }
+
+  async testApiFallsBackToRawHintsOnUnresolvableBarrelExport() {
+    await this.run('api falls back to raw export hints when types exist but resolve to zero exports (barrel re-export)', async () => {
+      const dir = this.tmp('api-barrel-fallback');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      // A pure `export * from "./sibling"` where the sibling module itself
+      // declares nothing statically resolvable — checker.getExportsOfModule
+      // legitimately returns [] here even though hasTypes is true, which
+      // used to render as a flatly wrong "no exported symbols found".
+      writeNodeModulesPackage(
+        dir,
+        'barrel-lib',
+        { name: 'barrel-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = {};',
+          'index.d.ts': 'export * from "./sibling";\n',
+          'sibling.d.ts': '',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'barrel-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(json.hasTypes, true);
+      assert.deepStrictEqual(json.exports, []);
+      assert.ok(json.rawExportHints, 'expected a non-null rawExportHints fallback');
+      assert.strictEqual(json.rawExportHints[0].name, '*');
+      assert.match(json.rawExportHints[0].note, /re-exported from "\.\/sibling"/);
+
+      const human = await runPackdev(dir, ['api', 'barrel-lib']);
+      assert.match(human.stdout, /couldn't be statically resolved/);
+      assert.match(human.stdout, /re-exported from "\.\/sibling"/);
+      assert.doesNotMatch(human.stdout, /\(no exported symbols found\)/);
     });
   }
 
@@ -1000,6 +1084,105 @@ class FeatureTests {
         'mockThing is exported from the ./testing subpath and should not show up as missing',
       );
       assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+    });
+  }
+
+  // --- registry auth (--token / NPM_TOKEN / NODE_AUTH_TOKEN / .npmrc) ------
+
+  async testApiDiffFailsWithHintOnPrivateRegistryWithoutToken() {
+    await this.run('api-diff fails with a clear hint against a private registry when no token is configured', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(): void;',
+      });
+      const server = await startAuthGatedRegistry({ 'fake-lib': { '1.0.0': { tarballBuffer: v1 } } }, 'secret-token');
+      this.servers.push(server);
+      const registryUrl = `http://127.0.0.1:${server.address().port}`;
+
+      const appDir = this.tmp('api-diff-auth-missing');
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.match(json.error, /401/);
+      assert.match(json.error, /packdev found no token for this host/i);
+    });
+  }
+
+  async testApiDiffAuthenticatesWithTokenFlag() {
+    await this.run('api-diff authenticates against a private registry with --token', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(): void;',
+      });
+      const server = await startAuthGatedRegistry({ 'fake-lib': { '1.0.0': { tarballBuffer: v1 } } }, 'secret-token');
+      this.servers.push(server);
+      const registryUrl = `http://127.0.0.1:${server.address().port}`;
+
+      const appDir = this.tmp('api-diff-auth-flag');
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--token', 'secret-token', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].version, '1.0.0');
+    });
+  }
+
+  async testApiDiffAuthenticatesWithNpmTokenEnv() {
+    await this.run('api-diff authenticates against a private registry via NPM_TOKEN env var', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(): void;',
+      });
+      const server = await startAuthGatedRegistry({ 'fake-lib': { '1.0.0': { tarballBuffer: v1 } } }, 'env-token');
+      this.servers.push(server);
+      const registryUrl = `http://127.0.0.1:${server.address().port}`;
+
+      const appDir = this.tmp('api-diff-auth-env');
+      const r = await runPackdev(
+        appDir,
+        ['api-diff', 'fake-lib', '--range', '>=1.0.0', '--app', appDir, '--registry', registryUrl, '--json'],
+        { NPM_TOKEN: 'env-token' },
+      );
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].version, '1.0.0');
+    });
+  }
+
+  async testApiDiffAutoDetectsRegistryAndTokenFromNpmrc() {
+    await this.run('api-diff auto-detects the scope registry and auth token from .npmrc, no --registry needed', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: '@myscope/fake-lib', version: '1.0.0' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(): void;',
+      });
+      const server = await startAuthGatedRegistry(
+        { '@myscope/fake-lib': { '1.0.0': { tarballBuffer: v1 } } },
+        'npmrc-token',
+      );
+      this.servers.push(server);
+      const registryUrl = `http://127.0.0.1:${server.address().port}`;
+      const host = new URL(registryUrl).host;
+
+      const appDir = this.tmp('api-diff-auth-npmrc');
+      fs.writeFileSync(
+        path.join(appDir, '.npmrc'),
+        `@myscope:registry=${registryUrl}\n//${host}/:_authToken=npmrc-token\n`,
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', '@myscope/fake-lib', '--range', '>=1.0.0', '--app', appDir, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].version, '1.0.0');
     });
   }
 
@@ -1632,12 +1815,14 @@ class FeatureTests {
       writeNodeModulesPackage(path.join(dir, 'node_modules', 'some-dep'), 'left-pad', { name: 'left-pad', version: '1.1.2' });
 
       const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // Exit code 5 (DUPLICATE_FOUND) so `dupes` can be used as a CI guard.
+      assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, true);
       assert.strictEqual(json.resolutions.length, 2);
       const versions = json.resolutions.map((res) => res.version).sort();
       assert.deepStrictEqual(versions, ['1.1.2', '1.3.0']);
+      assert.ok(json.resolutions.every((res) => typeof res.realpath === 'string'));
     });
   }
 
@@ -1679,9 +1864,104 @@ class FeatureTests {
       fs.symlinkSync(path.join(dir, 'node_modules'), cyclePath, 'dir');
 
       const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
-      assert.strictEqual(r.code, 0, `expected exit 0 (no hang/crash), got ${r.code}: ${r.stderr}`);
+      // Two real distinct copies -> exit 5 (DUPLICATE_FOUND), but the key
+      // assertion here is that it terminated at all (no hang/crash on the cycle).
+      assert.strictEqual(r.code, 5, `expected exit 5 (no hang/crash), got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.resolutions.length, 2, 'should still find both real resolutions despite the cycle');
+    });
+  }
+
+  async testDupesWorkspaceAware() {
+    await this.run('dupes scans workspace-nested node_modules by default', async () => {
+      const dir = this.tmp('dupes-workspaces');
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'root', workspaces: ['apps/*'] }),
+      );
+      fs.mkdirSync(path.join(dir, 'apps', 'a'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'apps', 'a', 'package.json'),
+        JSON.stringify({ name: 'a', dependencies: { 'shared-lib': '^2.0.0' } }),
+      );
+      writeNodeModulesPackage(dir, 'shared-lib', { name: 'shared-lib', version: '1.0.0' });
+      writeNodeModulesPackage(path.join(dir, 'apps', 'a'), 'shared-lib', { name: 'shared-lib', version: '2.0.0' });
+
+      // Root-only scan used to report a false "single resolution" here —
+      // the whole point of this test is that it no longer does.
+      const r = await runPackdev(dir, ['dupes', 'shared-lib', '--json']);
+      assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, true);
+      assert.strictEqual(json.resolutions.length, 2);
+      assert.deepStrictEqual(json.scannedWorkspaces.length, 1);
+      const versions = json.resolutions.map((res) => res.version).sort();
+      assert.deepStrictEqual(versions, ['1.0.0', '2.0.0']);
+    });
+  }
+
+  async testDupesNoWorkspacesFlagHedgesVerdict() {
+    await this.run('dupes --no-workspaces skips workspace scan and hedges the verdict', async () => {
+      const dir = this.tmp('dupes-no-workspaces');
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: 'root', workspaces: ['apps/*'] }),
+      );
+      fs.mkdirSync(path.join(dir, 'apps', 'a'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'apps', 'a', 'package.json'), JSON.stringify({ name: 'a' }));
+      writeNodeModulesPackage(dir, 'shared-lib', { name: 'shared-lib', version: '1.0.0' });
+      writeNodeModulesPackage(path.join(dir, 'apps', 'a'), 'shared-lib', { name: 'shared-lib', version: '2.0.0' });
+
+      const r = await runPackdev(dir, ['dupes', 'shared-lib', '--no-workspaces', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0 (workspace copy not scanned), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, false);
+      assert.strictEqual(json.resolutions.length, 1);
+      assert.strictEqual(json.workspacesDetected.length, 1);
+      assert.strictEqual(json.scannedWorkspaces.length, 0);
+    });
+  }
+
+  async testDupesSameVersionDifferentPathIsDuplicate() {
+    await this.run('dupes treats same-version copies at different paths as a duplicate', async () => {
+      const dir = this.tmp('dupes-same-version');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+      writeNodeModulesPackage(path.join(dir, 'node_modules', 'some-dep'), 'left-pad', { name: 'left-pad', version: '1.3.0' });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--json']);
+      assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.duplicate, true, 'same version at two different realpaths is still a duplicate');
+      assert.strictEqual(json.resolutions.length, 2);
+    });
+  }
+
+  async testDupesResolvedViaParent() {
+    await this.run('dupes distinguishes resolved-via-parent from not-a-dependency', async () => {
+      const dir = this.tmp('dupes-resolved-via-parent');
+      writeNodeModulesPackage(dir, 'left-pad', { name: 'left-pad', version: '1.3.0' });
+      const childDir = path.join(dir, 'child');
+      fs.mkdirSync(childDir, { recursive: true });
+
+      const r = await runPackdev(dir, ['dupes', 'left-pad', '--root', childDir, '--json']);
+      assert.strictEqual(r.code, 0);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.resolutions.length, 0);
+      assert.ok(json.resolvedViaParent, 'should report the parent resolution instead of a bare empty result');
+      assert.strictEqual(json.resolvedViaParent.version, '1.3.0');
+    });
+  }
+
+  async testDupesGenuinelyNotADependency() {
+    await this.run('dupes reports resolvedViaParent: null when the package is nowhere at all', async () => {
+      const dir = this.tmp('dupes-genuinely-missing');
+      fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
+
+      const r = await runPackdev(dir, ['dupes', 'totally-nonexistent-pkg-xyz', '--json']);
+      assert.strictEqual(r.code, 0);
+      const json = parseJson(r.stdout, 'dupes');
+      assert.strictEqual(json.resolutions.length, 0);
+      assert.strictEqual(json.resolvedViaParent, null);
     });
   }
 
@@ -1860,6 +2140,7 @@ class FeatureTests {
       await this.testApiResolvesExportEqualsAsDefault();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
+      await this.testApiFallsBackToRawHintsOnUnresolvableBarrelExport();
       await this.testApiIntrospectFindsPrototypeMethods();
       await this.testApiIntrospectWorksThroughProxy();
       await this.testApiIntrospectIsOptInOnly();
@@ -1878,6 +2159,10 @@ class FeatureTests {
       await this.testApiDiffFallsBackToTypesPackage();
       await this.testApiDiffTypesSourceNoneWhenNoTypesAnywhere();
       await this.testApiDiffCountsSubpathExportsAsUsage();
+      await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
+      await this.testApiDiffAuthenticatesWithTokenFlag();
+      await this.testApiDiffAuthenticatesWithNpmTokenEnv();
+      await this.testApiDiffAutoDetectsRegistryAndTokenFromNpmrc();
       await this.testCompatPassFailPerVersion();
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatCleansUpSandboxOnSuccess();
@@ -1899,6 +2184,11 @@ class FeatureTests {
       await this.testDupesSingleResolution();
       await this.testDupesNotInstalled();
       await this.testDupesSymlinkCycleSafety();
+      await this.testDupesWorkspaceAware();
+      await this.testDupesNoWorkspacesFlagHedgesVerdict();
+      await this.testDupesSameVersionDifferentPathIsDuplicate();
+      await this.testDupesResolvedViaParent();
+      await this.testDupesGenuinelyNotADependency();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();
