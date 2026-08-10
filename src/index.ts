@@ -108,6 +108,7 @@ const EXIT_CODE = {
   PACKAGE_NOT_INSTALLED: 4,
   DUPLICATE_FOUND: 5,
   NOTHING_TESTED: 6,
+  COMPAT_FAILED: 7,
 } as const;
 
 function exitCodeFor(error?: string): number {
@@ -639,7 +640,7 @@ program
   .argument("<package>", "Package name to check")
   .requiredOption(
     "--test <cmd>",
-    'Command to run in each sandboxed version, e.g. "npm test"',
+    'Command to run in each sandboxed version, e.g. "npm run build" — should include a type-check or build step; a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version',
   )
   .option(
     "--range <semver>",
@@ -728,6 +729,14 @@ program
       const nothingTested =
         report.versions.length > 0 &&
         report.versions.every((v) => v.status === "SKIPPED");
+      // Only meaningful for a linear scan: bisect's per-step FAILED results
+      // are expected search mechanics (that's how it finds the boundary),
+      // not a verdict — so a FAILED entry there must not flip the exit code.
+      const hasFailure =
+        !isCompatBisectReport(report) &&
+        report.versions.some(
+          (v) => v.status === "FAILED" || v.status === "INSTALL_FAILED",
+        );
 
       output({ command: "compat", ...report }, () => {
         console.log(`📦 ${report.package} — runtime compatibility`);
@@ -743,6 +752,9 @@ program
           console.log(`⚡ Concurrency: ${report.concurrency}`);
         }
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
+        if (report.testCommandCaveat) {
+          console.log(`⚠️  ${report.testCommandCaveat}`);
+        }
         console.log("");
 
         for (const v of report.versions) {
@@ -802,6 +814,7 @@ program
       });
 
       if (nothingTested) process.exit(EXIT_CODE.NOTHING_TESTED);
+      if (hasFailure) process.exit(EXIT_CODE.COMPAT_FAILED);
     } catch (error) {
       output(
         {

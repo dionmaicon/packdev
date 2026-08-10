@@ -1301,7 +1301,9 @@ class FeatureTests {
         '--test', 'node check.js',
         '--json',
       ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // Exit 7 (COMPAT_FAILED): v1.0.0 genuinely FAILED, so the run can't be
+      // exit 0 — see testCompatExitsNonZeroOnFailure for the dedicated test.
+      assert.strictEqual(r.code, 7, `expected exit 7, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       const v1Result = json.versions.find((v) => v.version === '1.0.0');
       const v2Result = json.versions.find((v) => v.version === '2.0.0');
@@ -1331,7 +1333,8 @@ class FeatureTests {
       const r = await runPackdev(appDir, [
         'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
       ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // Exit 7 (COMPAT_FAILED): INSTALL_FAILED counts as a real failure too.
+      assert.strictEqual(r.code, 7, `expected exit 7, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.strictEqual(json.versions[0].status, 'INSTALL_FAILED');
     });
@@ -1406,7 +1409,11 @@ class FeatureTests {
       const r = await runPackdev(appDir, [
         'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
       ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // npm doesn't understand the workspace: protocol at all, so this
+      // fixture can't reach PASSED — it genuinely INSTALL_FAILED, which is
+      // now a real failure (exit 7), not the SKIPPED bug this test guards
+      // against (that would have been exit 6/0 with no install attempted).
+      assert.strictEqual(r.code, 7, `expected exit 7, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.notStrictEqual(json.versions[0].status, 'SKIPPED', 'a real install must have been attempted, not skipped, once a monorepo root is discoverable');
     });
@@ -1433,6 +1440,94 @@ class FeatureTests {
       assert.strictEqual(r.code, 6, `expected exit 6 (NOTHING_TESTED), got ${r.code}: ${r.stderr}`);
       assert.match(r.stdout, /nothing was actually tested/i);
       assert.doesNotMatch(r.stdout, /No version in range passed the test command/);
+    });
+  }
+
+  async testCompatExitsNonZeroOnFailure() {
+    await this.run('compat exits 7 (COMPAT_FAILED) when a candidate genuinely FAILED, so it can guard a CI job', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { special: false };',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-exit-on-failure');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'process.exit(require("fake-lib").special ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 7, `expected exit 7 (COMPAT_FAILED), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'FAILED');
+
+      // --bisect's per-step FAILED results are search mechanics, not a
+      // verdict — must not trip the same exit code.
+      const bisectAppDir = this.tmp('compat-exit-bisect-unaffected');
+      writeJson(path.join(bisectAppDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { special: true };',
+      });
+      const bisectRegistryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+      fs.writeFileSync(
+        path.join(bisectAppDir, 'check.js'),
+        'process.exit(require("fake-lib").special ? 0 : 1);\n',
+      );
+      const bisectResult = await runPackdev(bisectAppDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', bisectAppDir, '--registry', bisectRegistryUrl,
+        '--test', 'node check.js', '--bisect',
+      ]);
+      assert.strictEqual(bisectResult.code, 0, `expected exit 0 for --bisect despite an interim FAILED step, got ${bisectResult.code}: ${bisectResult.stderr}`);
+    });
+  }
+
+  async testCompatWarnsOnTranspileOnlyTestSetup() {
+    await this.run('compat surfaces a caveat when --test looks like a transpile-only jest run', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-transpile-only-caveat');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        jest: { transform: { '^.+\\.ts$': ['ts-jest', { isolatedModules: true }] } },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Not a real jest invocation (jest isn't installed in this fixture) —
+      // just needs the word "jest" in the command for the heuristic to fire,
+      // while actually running check.js so the version still PASSES.
+      const jestLikeCommand = 'node check.js # jest --silent';
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.testCommandCaveat, /isolatedModules/);
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand,
+      ]);
+      assert.match(human.stdout, /isolatedModules/);
+
+      // A build/type-check command shouldn't trigger the caveat at all.
+      const r2 = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json2 = parseJson(r2.stdout, 'compat');
+      assert.strictEqual(json2.testCommandCaveat, null);
     });
   }
 
@@ -1744,7 +1839,8 @@ class FeatureTests {
       const r = await runPackdev(appDir, [
         'compat', 'fake-core', '--versions', '2.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
       ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      // Exit 7 (COMPAT_FAILED): the mismatch is a real FAILED result.
+      assert.strictEqual(r.code, 7, `expected exit 7, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.strictEqual(json.versions[0].status, 'FAILED', 'pinning only fake-core should leave the family mismatched');
     });
@@ -2448,6 +2544,8 @@ class FeatureTests {
       await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
       await this.testCompatAttemptsRealInstallWhenMonorepoRootFound();
       await this.testCompatNothingTestedExitCodeAndMessage();
+      await this.testCompatExitsNonZeroOnFailure();
+      await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();

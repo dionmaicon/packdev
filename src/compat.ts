@@ -45,6 +45,7 @@ export interface CompatReport {
   group?: string[] | undefined;
   snapshotDir: string;
   concurrency: number;
+  testCommandCaveat: string | null;
 }
 
 export interface CompatOptions {
@@ -549,6 +550,52 @@ async function runWithConcurrencyLimit<T, R>(
   return results;
 }
 
+/**
+ * PASSED/FAILED from compat is only as trustworthy as the --test command
+ * itself: a transpile-only jest setup (ts-jest isolatedModules, babel-jest,
+ * @swc/jest with no separate type-check step) never actually reads the
+ * dependency's .d.ts, so a version with a genuinely broken type surface can
+ * still "pass" a test suite that never type-checks. This is a best-effort
+ * heuristic over the app's jest config — false negatives (missing a real
+ * transpile-only setup) are expected and fine; it only needs to catch the
+ * common cases well enough to warn.
+ */
+async function detectTranspileOnlyTestSetup(
+  appDir: string,
+  testCommand: string,
+): Promise<string | null> {
+  if (!/\bjest\b/i.test(testCommand)) return null;
+
+  const configCandidates = [
+    "jest.config.js",
+    "jest.config.cjs",
+    "jest.config.mjs",
+    "jest.config.ts",
+    "jest.config.json",
+  ];
+
+  const sources: string[] = [];
+  for (const name of configCandidates) {
+    const configPath = path.join(appDir, name);
+    if (await fileExists(configPath)) {
+      sources.push(await fs.readFile(configPath, "utf-8"));
+    }
+  }
+  const pkgJsonPath = path.join(appDir, "package.json");
+  if (await fileExists(pkgJsonPath)) {
+    sources.push(await fs.readFile(pkgJsonPath, "utf-8"));
+  }
+
+  const combined = sources.join("\n");
+  if (/isolatedModules["']?\s*:\s*true/.test(combined)) {
+    return "jest config uses ts-jest with isolatedModules:true — this transpiles TypeScript without type-checking it, so a version with a broken type surface can still pass";
+  }
+  if (/@swc\/jest|babel-jest/.test(combined)) {
+    return "jest config transforms TypeScript via @swc/jest or babel-jest — these transpile without type-checking, so a version with a broken type surface can still pass";
+  }
+  return null;
+}
+
 export async function runCompat(
   pkgName: string,
   options: CompatOptions,
@@ -560,6 +607,10 @@ export async function runCompat(
     await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
+  const testCommandCaveat = await detectTranspileOnlyTestSetup(
+    options.appDir,
+    options.testCommand,
+  );
 
   const versions = await runWithConcurrencyLimit(
     candidateVersions,
@@ -591,6 +642,7 @@ export async function runCompat(
     group: options.group,
     snapshotDir,
     concurrency,
+    testCommandCaveat,
   };
 }
 
@@ -609,6 +661,7 @@ function finishBisect(
   recommendedVersion: string | null,
   fellBackToLinearScan: boolean,
   snapshotDir: string,
+  testCommandCaveat: string | null,
   group?: string[] | undefined,
 ): CompatBisectReport {
   return {
@@ -624,6 +677,7 @@ function finishBisect(
     group,
     snapshotDir,
     concurrency: 1,
+    testCommandCaveat,
   };
 }
 
@@ -642,8 +696,22 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
+  const testCommandCaveat = await detectTranspileOnlyTestSetup(
+    options.appDir,
+    options.testCommand,
+  );
   if (candidateVersions.length === 0) {
-    return finishBisect(pkgName, candidateVersions, [], null, null, false, snapshotDir, options.group);
+    return finishBisect(
+      pkgName,
+      candidateVersions,
+      [],
+      null,
+      null,
+      false,
+      snapshotDir,
+      testCommandCaveat,
+      options.group,
+    );
   }
 
   const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath } =
@@ -670,7 +738,17 @@ export async function runCompatBisect(
   if (topResult.status !== "PASSED") {
     // Nothing in range is presumed compatible under the monotonic
     // assumption — bisect makes no claim beyond the top version.
-    return finishBisect(pkgName, candidateVersions, tested, null, null, false, snapshotDir, options.group);
+    return finishBisect(
+      pkgName,
+      candidateVersions,
+      tested,
+      null,
+      null,
+      false,
+      snapshotDir,
+      testCommandCaveat,
+      options.group,
+    );
   }
 
   if (candidateVersions.length === 1) {
@@ -682,6 +760,7 @@ export async function runCompatBisect(
       topVersion,
       false,
       snapshotDir,
+      testCommandCaveat,
       options.group,
     );
   }
@@ -697,6 +776,7 @@ export async function runCompatBisect(
       topVersion,
       false,
       snapshotDir,
+      testCommandCaveat,
       options.group,
     );
   }
@@ -742,6 +822,7 @@ export async function runCompatBisect(
     topVersion,
     false,
     snapshotDir,
+    testCommandCaveat,
     options.group,
   );
 }
