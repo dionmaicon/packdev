@@ -1169,6 +1169,18 @@ export async function setupGitHooks(
       }
     }
 
+    // Absolute path to the packdev binary currently running `setup-hooks` —
+    // baked into the generated hook so its auto-commit fallback can find
+    // this exact installation regardless of the hook's cwd at commit time,
+    // instead of guessing a cwd-relative path (which broke whenever the
+    // hook ran from a directory nested differently than assumed) or falling
+    // through to `npx packdev`, which fetches whatever the local
+    // package.json's own declared version happens to be when run inside
+    // packdev's own repo — a real published-version race, not a fallback.
+    const selfBinaryPath = (require.main?.filename ?? process.argv[1] ?? "")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
+
     // Create the check script
     const checkScript = `#!/usr/bin/env node
 /**
@@ -1364,9 +1376,9 @@ async function executeAutoCommitFlow() {
     // Find packdev binary - try common locations
     let packdevCmd = 'packdev';
     const possiblePaths = [
-      'node ../dist/index.js',  // Relative to test directory
-      'npx packdev',            // Global install
-      'packdev'                 // PATH
+      'node "${selfBinaryPath}"', // The exact installation that generated this hook
+      'npx packdev',              // Global install
+      'packdev'                   // PATH
     ];
 
     // Find working packdev command

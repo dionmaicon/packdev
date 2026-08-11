@@ -2488,6 +2488,28 @@ class FeatureTests {
     });
   }
 
+  async testSetupHooksBakesAbsoluteBinaryPath() {
+    await this.run('setup-hooks bakes an absolute path to the running packdev binary into the generated hook, not a cwd-relative guess', async () => {
+      const dir = this.tmp('setup-hooks-absolute-path');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      const { execSync } = require('child_process');
+      execSync('git init', { cwd: dir, stdio: 'pipe' });
+      execSync('git config user.email "t@t.com" && git config user.name "t"', { cwd: dir, stdio: 'pipe' });
+
+      const r = await runPackdev(dir, ['setup-hooks', '--force', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+
+      const hookScript = fs.readFileSync(path.join(dir, '.git', 'hooks', 'check-local-deps.js'), 'utf8');
+      // The old bug: a hardcoded, cwd-relative guess that only happened to
+      // resolve correctly for one specific test-runner directory depth.
+      assert.doesNotMatch(hookScript, /'node \.\.\/dist\/index\.js'/);
+      // The fix: the exact absolute path of the packdev binary that
+      // generated this hook, valid regardless of the hook's cwd at commit
+      // time.
+      assert.match(hookScript, new RegExp(`node "${BINARY_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`));
+    });
+  }
+
   async testStaleBackupDetected() {
     await this.run('status flags a stale backup (backup present, not in dev mode)', async () => {
       const dir = this.tmp('stale');
@@ -2608,6 +2630,7 @@ class FeatureTests {
       await this.testWatchOnce();
       await this.testRestoreNoBackup();
       await this.testRestoreRecoversAndClears();
+      await this.testSetupHooksBakesAbsoluteBinaryPath();
       await this.testStaleBackupDetected();
       await this.testCleanInitNoStaleWarning();
 
