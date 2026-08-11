@@ -786,6 +786,33 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffMissingSymbolsAreSortedAlphabetically() {
+    await this.run('api-diff sorts missingSymbols alphabetically, not in scan/insertion order, so lists are diffable across versions', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-sorted-missing');
+      // Import order is deliberately NOT alphabetical (zeta before alpha
+      // before mid), so a passing test here proves the output is sorted
+      // rather than just happening to match insertion order.
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { zeta, alpha, mid } from "fake-lib";\nzeta();\nalpha();\nmid();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, ['alpha', 'mid', 'zeta']);
+    });
+  }
+
   async testApiDiffDoesNotFalseNegativeOnExportEquals() {
     await this.run('api-diff does not false-negative a default import against a TS "export = X" package', async () => {
       const v1 = await buildFakeTarball({
@@ -2522,6 +2549,7 @@ class FeatureTests {
       await this.testApiPackageNotInstalled();
       await this.testApiHoistedResolution();
       await this.testApiDiffRangeEnumerationAndDiff();
+      await this.testApiDiffMissingSymbolsAreSortedAlphabetically();
       await this.testApiDiffDoesNotFalseNegativeOnExportEquals();
       await this.testApiDiffExcludesPrereleaseByDefault();
       await this.testApiDiffExcludesDeprecatedByDefault();

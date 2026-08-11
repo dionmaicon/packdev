@@ -195,10 +195,16 @@ async function diffOneVersion(
     // false negative (worse than the pre-registry-auth 401 this replaced:
     // it now runs and looks authoritative). Report them as unresolved
     // instead, never as missing, when resolution itself couldn't verify.
+    // Sorted alphabetically (not scan/insertion order) so the same symbol
+    // lands in the same relative position across every version's list —
+    // that's what makes two versions' missing/unresolved lists diffable at
+    // a glance instead of needing to be re-read symbol-by-symbol each time.
     const missingSymbols = resolved.unresolved
       ? []
-      : [...usedSymbols].filter((symbol) => !exportedNames.has(symbol));
-    const unresolvedSymbols = resolved.unresolved ? [...usedSymbols] : [];
+      : [...usedSymbols].filter((symbol) => !exportedNames.has(symbol)).sort();
+    const unresolvedSymbols = resolved.unresolved
+      ? [...usedSymbols].sort()
+      : [];
 
     return {
       missingSymbols,
