@@ -957,14 +957,6 @@ export interface EsmCheckContext {
 
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
-// Cap on fan-out consumer test commands run concurrently within ONE
-// version's sandbox. Deliberately separate from --concurrency (which caps
-// how many VERSIONS/sandboxes run at once, each a full install) — this
-// controls a lighter-weight resource (test-command subprocesses against an
-// already-installed sandbox), and multiplying it together with
-// --concurrency would let total in-flight processes grow unboundedly.
-const CONSUMER_TEST_CONCURRENCY = 4;
-
 async function testOneVersion(
   pkgName: string,
   version: string,
@@ -1092,26 +1084,23 @@ async function testOneVersion(
           output: testResult.success ? undefined : testResult.output,
         },
       ];
-      // Each consumer's test command runs against its own already-installed
-      // sandbox subdirectory — fully independent of every other consumer —
-      // so run them concurrently instead of one at a time. Results come
-      // back in the same order as consumerTargets (runWithConcurrencyLimit
-      // writes by index), so the "first failure" reduction below stays
-      // deterministic regardless of which subprocess actually finishes first.
-      const sandboxDirForConsumers = sandboxDir;
-      const consumerResults = await runWithConcurrencyLimit(
-        consumerTargets,
-        CONSUMER_TEST_CONCURRENCY,
-        async (consumer) => {
-          const consumerCwd = path.join(sandboxDirForConsumers, consumer.relativePath);
-          const [consumerResult, consumerPackageJson] = await Promise.all([
-            runTestCommand(consumerCwd, effectiveTestCommand),
-            readJsonFile<PackageJson & { name?: string }>(path.join(consumerCwd, "package.json")),
-          ]);
-          return { consumer, consumerResult, consumerPackageJson };
-        },
-      );
-      for (const { consumer, consumerResult, consumerPackageJson } of consumerResults) {
+      // Deliberately serial, not concurrent: every consumer's test command
+      // runs against a subdirectory of the SAME sandbox as the primary and
+      // every other consumer, not an isolated copy. A shared workspace
+      // root can have shared mutable state a test/build script writes to
+      // (a root-level cache dir, coverage output, an incremental build-info
+      // file, a dev-server port) — running these concurrently would trade
+      // wall-clock time for a chance of nondeterministic cross-consumer
+      // interference, which is a bad trade for a tool whose entire value is
+      // a trustworthy pass/fail signal. (Testing different VERSIONS is
+      // still parallel via --concurrency — each version gets its own fully
+      // independent sandbox, so there's no shared state across versions.)
+      for (const consumer of consumerTargets) {
+        const consumerCwd = path.join(sandboxDir, consumer.relativePath);
+        const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
+        const consumerPackageJson = await readJsonFile<PackageJson & { name?: string }>(
+          path.join(consumerCwd, "package.json"),
+        );
         consumers.push({
           dir: consumer.relativePath,
           name: consumerPackageJson?.name ?? null,
@@ -1227,11 +1216,28 @@ async function resolveRunContext(
               string
             >)[wrapperName]) ??
           "*";
+        // wrapper.dir is relative to the monorepo root (that's what
+        // findWorkspacesDeclaring resolved it against), but a --app value
+        // the user types is resolved from the CURRENT WORKING DIRECTORY —
+        // often the consumer itself, not the monorepo root. Re-anchor it to
+        // cwd so the suggested command is actually copy-pasteable from the
+        // failing invocation, not silently wrong whenever cwd != monorepo
+        // root.
+        const monorepoRootForHint = await findMonorepoRoot(options.appDir);
+        const wrapperPathForCli = monorepoRootForHint
+          ? path.relative(process.cwd(), path.join(monorepoRootForHint, wrapper.dir)) || "."
+          : wrapper.dir;
         throw new Error(
           `"${missingName}" is not declared in ${options.appDir}, but it reaches it through ` +
-            `${wrapper.name} (${wrapperSpec}). Use:\n` +
-            `  --app ${wrapper.dir},${options.appDir}\n` +
-            `  or --fan-out to test the wrapper's consumers automatically.`,
+            `${wrapper.name} (${wrapperSpec}). Use one of:\n` +
+            `  --app ${wrapperPathForCli},${options.appDir}\n` +
+            `  --app ${wrapperPathForCli} --fan-out\n` +
+            // Both suggestions above put --app on the WRAPPER, not the
+            // current (non-declaring) --app value — just appending
+            // --fan-out to the original invocation would still fail here,
+            // since the primary would still be the non-declaring consumer.
+            `(pointing --app at the wrapper — appending --fan-out to this exact command won't help, ` +
+            `since the primary here would still be the non-declaring target)`,
         );
       }
       throw new Error(

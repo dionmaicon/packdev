@@ -3127,8 +3127,12 @@ class FeatureTests {
       ]);
       const json = parseJson(r.stdout, 'compat');
       assert.match(json.error, /reaches it through wrapper \(workspace:\*\)/);
-      assert.match(json.error, /--app packages\/wrapper,/);
-      assert.match(json.error, /--fan-out/);
+      // cwd for this invocation IS consumerDir (runPackdev's cwd arg), which
+      // is NOT the monorepo root — so the suggested wrapper path must be
+      // re-anchored to cwd ("../wrapper"), not left as the monorepo-root-
+      // relative "packages/wrapper", which would be wrong to paste from here.
+      assert.match(json.error, /--app \.\.\/wrapper,/);
+      assert.match(json.error, /--app \.\.\/wrapper --fan-out/);
       // Must NOT fall back to the generic "declared in these workspaces"
       // phrasing, which would point back at the wrapper as if pointing
       // --app there were the fix (it isn't — that reproduces the false green).
