@@ -83,22 +83,6 @@ packdev --json compat <pkg> --versions <list> --app <dir> --test "<your CI comma
 - **`dupes` catches what tests can't see:** two copies of the same package silently break
   `instanceof`, DI singletons, and Symbol registries. One tree walk, no install.
 
-### Add this to your agent instructions
-
-Drop this into `AGENTS.md` / `CLAUDE.md` / `.cursorrules` so the discipline travels with the tool
-instead of depending on someone remembering to invoke it correctly:
-
-```markdown
-### Dependency upgrades
-Before proposing any dependency upgrade, verify it:
-1. `packdev --json api-diff <pkg> --range ">=<next-major>"` — cheap static screen, no install.
-2. `packdev --json compat <pkg> --versions <installed>,<candidate> --app <workspace>
-   --test "<the exact CI command>"` — the installed version is the control.
-3. If the control fails, the harness is broken, not the package. Report that, don't upgrade.
-4. `packdev dupes <pkg>` before and after. A copy count that goes up is a regression.
-Never claim an upgrade is safe without a passing control.
-```
-
 ### Install as an MCP server
 
 `packdev mcp` runs the same three checks as MCP tools (`api_diff`, `compat`, `dupes`) over stdio, so
@@ -113,6 +97,27 @@ machine — your dependency tree is never uploaded anywhere.
     "packdev": { "command": "npx", "args": ["-y", "packdev", "mcp"] }
   }
 }
+```
+
+### Add this to your agent instructions
+
+Drop this into `AGENTS.md` / `CLAUDE.md` / `.cursorrules` so the discipline travels with the tool
+instead of depending on someone remembering to invoke it correctly — it works whether the agent
+has the MCP server configured or is just shelling out to the CLI:
+
+```markdown
+### Dependency upgrades
+Before proposing any dependency upgrade, verify it — use the `api_diff`/`compat`/`dupes` MCP
+tools if configured, otherwise the equivalent CLI commands:
+1. Static screen, no install: `api_diff` tool, or
+   `packdev --json api-diff <pkg> --range ">=<next-major>"`.
+2. Real install + real test, control included: `compat` tool, or
+   `packdev --json compat <pkg> --versions <installed>,<candidate> --app <workspace>
+   --test "<the exact CI command>"` — the installed version is the control.
+3. If the control fails, the harness is broken, not the package. Report that, don't upgrade.
+4. `dupes` tool, or `packdev dupes <pkg>`, before and after. A copy count that goes up is a
+   regression.
+Never claim an upgrade is safe without a passing control.
 ```
 
 ## Use it in CI
