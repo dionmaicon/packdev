@@ -304,25 +304,43 @@ export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
  * outside any discoverable workspaces config), which is the only situation
  * compat still has to report SKIPPED for.
  */
+// True when `spec` (a dependency's declared specifier) actually resolves to
+// a local workspace rather than a same-named registry/alias/git package.
+// Local-workspace linking isn't gated on the `workspace:` protocol string —
+// npm/yarn classic auto-link a same-named local workspace off a plain "*"
+// or matching semver range too — but a plain semver range only links
+// locally when the local package's own version actually satisfies it;
+// otherwise the package manager installs a separate copy from the
+// registry, and an `npm:`/git/URL specifier never resolves locally at all
+// regardless of name. `localVersion` undefined (no "version" field on the
+// candidate) falls back to permissive — this is expected to be rare enough
+// in practice that failing open beats a false negative.
+function specifierLinksToLocalWorkspace(spec: string, localVersion: string | undefined): boolean {
+  if (spec.startsWith("workspace:") || spec.startsWith("file:") || spec.startsWith("link:")) {
+    return true;
+  }
+  if (spec.startsWith("npm:") || /^(git\+|git:|github:|https?:)/.test(spec)) {
+    return false;
+  }
+  if (localVersion === undefined) return true;
+  return semver.validRange(spec) !== null && semver.satisfies(localVersion, spec);
+}
+
 // Dependency keys (in any of dependencies/devDependencies/peerDependencies)
-// that name a workspace in `candidateNames`, regardless of the specifier
-// used to declare it. Local-workspace linking isn't gated on the
-// `workspace:` protocol string — npm/yarn classic auto-link a same-named
-// local workspace off a plain "*" or matching semver range just as
-// yarn berry/pnpm do off `workspace:*` — so the specifier is incidental
-// package-manager idiom, not the signal that matters for "is this an
-// intra-monorepo dependency."
+// that name a workspace in `candidateVersions` AND whose declared specifier
+// actually links to that local workspace (see specifierLinksToLocalWorkspace).
 function findDependencyNamesAmong(
   packageJson: PackageJson,
-  candidateNames: Set<string>,
+  candidateVersions: Map<string, string | undefined>,
 ): string[] {
   const sections: DependencySection[] = ["dependencies", "devDependencies", "peerDependencies"];
   const found = new Set<string>();
   for (const section of sections) {
     const entries = packageJson[section] as Record<string, string> | undefined;
     if (!entries) continue;
-    for (const name of Object.keys(entries)) {
-      if (candidateNames.has(name)) found.add(name);
+    for (const [name, spec] of Object.entries(entries)) {
+      if (!candidateVersions.has(name)) continue;
+      if (specifierLinksToLocalWorkspace(spec, candidateVersions.get(name))) found.add(name);
     }
   }
   return [...found];
@@ -364,6 +382,29 @@ export function resolvePinTargets(
   });
 }
 
+/**
+ * Like resolvePinTargets, but for a fan-out consumer that isn't required to
+ * declare pkgName (or every --group member) itself: pins whichever of
+ * [pkgName, ...group] this workspace actually declares, instead of
+ * all-or-nothing. All-or-nothing would silently drop the pin even for a
+ * consumer that DOES declare pkgName directly, just because it's missing
+ * one unrelated lockstep group member — leaving that consumer's own
+ * dependency at its original version and defeating the point of testing it.
+ */
+function resolveAvailablePinTargets(
+  pkgName: string,
+  group: string[] | undefined,
+  packageJson: PackageJson,
+): PinTarget[] {
+  const names = [...new Set([pkgName, ...(group ?? [])])];
+  const targets: PinTarget[] = [];
+  for (const name of names) {
+    const section = findDependencySection(packageJson, name);
+    if (section) targets.push({ name, section });
+  }
+  return targets;
+}
+
 // Cap on in-flight package.json reads / AST scans during workspace
 // discovery (findWorkspacesDeclaring, resolveFanOutConsumers). This is
 // lightweight fs+parse work, not a full install/test process, so a higher
@@ -382,6 +423,10 @@ interface DeclaringWorkspace {
   name: string;
   // Monorepo-relative dir — usable directly in a suggested --app value.
   dir: string;
+  // package.json "version" — needed to check whether a dependency on this
+  // workspace (by name) actually resolves locally (specifierLinksToLocalWorkspace)
+  // rather than to a same-named registry/alias/git package.
+  version: string | undefined;
 }
 
 async function findWorkspacesDeclaring(
@@ -405,7 +450,7 @@ async function findWorkspacesDeclaring(
       );
       if (!packageJson || !findDependencySection(packageJson, pkgName)) return null;
       const relDir = path.relative(monorepoRoot, dir);
-      return { name: packageJson.name ?? relDir, dir: relDir };
+      return { name: packageJson.name ?? relDir, dir: relDir, version: packageJson.version };
     },
   );
   return entries
@@ -429,15 +474,23 @@ export interface ConsumerTarget {
  *   tier 0 — every workspace under monorepoRoot (other than appDir) that
  *            directly declares pkgName in dependencies/devDependencies/
  *            peerDependencies.
- *   tier 1 — every workspace that depends (via a `workspace:` specifier) on
- *            a tier-0 workspace, but does not itself declare pkgName. This
- *            is the one hop that makes a wrapper's own consumers
- *            discoverable — going deeper (consumer-of-a-consumer) would
- *            risk pulling in the whole repo, so it stops here.
+ *   tier 1 — every workspace that depends on a tier-0 workspace by name,
+ *            with a specifier that actually resolves locally (`workspace:`,
+ *            `file:`/`link:`, or a plain/semver range the tier-0
+ *            workspace's own version satisfies — see
+ *            specifierLinksToLocalWorkspace; excludes `npm:` aliases, git,
+ *            and URL specifiers, and a semver range the local version
+ *            doesn't actually satisfy, since a package manager would
+ *            install a separate registry copy for those, not link the
+ *            wrapper this fan-out is trying to reach) — but does not itself
+ *            declare pkgName. This is the one hop that makes a wrapper's
+ *            own consumers discoverable — going deeper
+ *            (consumer-of-a-consumer) would risk pulling in the whole repo,
+ *            so it stops here.
  *
  * A workspace that only gets pkgName through hoisting (imports it but
- * doesn't declare it, and doesn't depend on a declarer via workspace:)
- * isn't eligible in either tier — pinning requires either a section to pin
+ * doesn't declare it, and doesn't depend locally on a declarer) isn't
+ * eligible in either tier — pinning requires either a section to pin
  * pkgName into directly (tier 0) or a wrapper whose own pin already carries
  * the version through (tier 1).
  *
@@ -520,27 +573,43 @@ export async function resolveFanOutConsumers(
   const tier0Names = new Set(
     tier0.map((w) => w.packageJson.name).filter((n): n is string => !!n),
   );
+  // name -> declared version, so a tier-1 dependency on it can be checked
+  // for actual semver compatibility (specifierLinksToLocalWorkspace) rather
+  // than matched on name alone.
+  const tier0Versions = new Map<string, string | undefined>(
+    tier0
+      .filter((w): w is typeof w & { packageJson: { name: string } } => !!w.packageJson.name)
+      .map((w) => [w.packageJson.name, w.packageJson.version]),
+  );
 
   const tier0Candidates = await runWithConcurrencyLimit(
     tier0.filter((w) => path.resolve(w.dir) !== resolvedAppDir),
     DISCOVERY_CONCURRENCY,
     async (w): Promise<FanOutCandidate> => {
-      const { symbols } = await scanImportedSymbols(w.dir, pkgName, scanCache);
-      return { dir: w.dir, tier: 0, symbolCount: symbols.size, hasObjectArg: false };
+      const [{ symbols }, optionKeys] = await Promise.all([
+        scanImportedSymbols(w.dir, pkgName, scanCache),
+        scanPassedOptionKeys(w.dir, pkgName, scanCache),
+      ]);
+      return {
+        dir: w.dir,
+        tier: 0,
+        symbolCount: symbols.size,
+        hasObjectArg: optionKeys.size > 0,
+      };
     },
   );
 
   const tier1Inputs = workspaces.filter((w) => {
     if (path.resolve(w.dir) === resolvedAppDir) return false;
     if (tier0Names.has(w.packageJson.name ?? "")) return false; // already tier 0
-    return findDependencyNamesAmong(w.packageJson, tier0Names).length > 0;
+    return findDependencyNamesAmong(w.packageJson, tier0Versions).length > 0;
   });
 
   const tier1Candidates = await runWithConcurrencyLimit(
     tier1Inputs,
     DISCOVERY_CONCURRENCY,
     async (w): Promise<FanOutCandidate> => {
-      const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Names);
+      const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Versions);
       let symbolCount = 0;
       let hasObjectArg = false;
       for (const wrapperName of wrapperNames) {
@@ -1139,9 +1208,14 @@ async function resolveRunContext(
       // through a dependency on exactly one of these declarers, that
       // declarer is a wrapper, and naming it beats a generic "declared in
       // these workspaces" list that would otherwise point the user right
-      // back at the workspace whose build already passes.
-      const declaringNames = new Set(declaringWorkspaces.map((w) => w.name));
-      const wrapperName = findDependencyNamesAmong(appPackageJson, declaringNames)[0];
+      // back at the workspace whose build already passes. If the primary
+      // reaches it through MORE than one declarer, naming just the first
+      // one found would be an arbitrary, possibly wrong guess — fall back
+      // to the generic list instead of picking one.
+      const declaringVersions = new Map(declaringWorkspaces.map((w) => [w.name, w.version]));
+      const reachableWrapperNames = findDependencyNamesAmong(appPackageJson, declaringVersions);
+      const wrapperName =
+        reachableWrapperNames.length === 1 ? reachableWrapperNames[0] : undefined;
       const wrapper = wrapperName
         ? declaringWorkspaces.find((w) => w.name === wrapperName)
         : undefined;
@@ -1219,17 +1293,18 @@ async function resolveRunContext(
       }
       // Unlike the primary, a consumer doesn't have to declare pkgName (or
       // every --group member) itself — the wrapper pattern this fan-out
-      // widening exists to reach is exactly the case where it doesn't. A
-      // non-declaring consumer just has nothing pinned in its own
-      // package.json; it still gets copied into the sandbox and tested,
-      // and sees whatever version the primary's pin resolves to through
-      // the workspace link.
-      let consumerPinTargets: PinTarget[];
-      try {
-        consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
-      } catch {
-        consumerPinTargets = [];
-      }
+      // widening exists to reach is exactly the case where it doesn't. Pin
+      // whichever of pkgName/group members it actually declares (possibly
+      // none): a consumer with nothing to pin just gets copied into the
+      // sandbox and tested as-is, seeing whatever version the primary's own
+      // pin resolves to through the workspace link — but a consumer that
+      // DOES declare pkgName itself must still get that pin, even if it's
+      // missing an unrelated --group member.
+      const consumerPinTargets = resolveAvailablePinTargets(
+        pkgName,
+        options.group,
+        consumerPackageJson,
+      );
       consumerTargets.push({
         relativePath: consumer.relativeDir,
         pinTargets: consumerPinTargets,

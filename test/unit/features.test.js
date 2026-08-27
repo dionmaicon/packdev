@@ -3256,6 +3256,93 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutExcludesConsumerWithIncompatibleSemverRangeOnWrapper() {
+    await this.run('compat --fan-out excludes a workspace whose dependency on the wrapper is a semver range the wrapper\'s own version cannot satisfy', async () => {
+      // A dependency KEY matching a tier-0 workspace's name isn't enough —
+      // if the declared range doesn't actually admit the wrapper's own
+      // version, npm/yarn install a separate registry copy instead of
+      // linking the local workspace, so this "consumer" would never
+      // observe the primary's pinned version at all.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-incompatible-range');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        // Wrapper is at 1.0.0 — a consumer requiring ^2.0.0 of it can never
+        // resolve to this local copy.
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const incompatibleDir = path.join(monorepoRoot, 'packages', 'incompatible-consumer');
+      fs.mkdirSync(incompatibleDir, { recursive: true });
+      writeJson(path.join(incompatibleDir, 'package.json'), {
+        name: 'incompatible-consumer', version: '1.0.0', dependencies: { wrapper: '^2.0.0' },
+      });
+
+      const compatibleDir = path.join(monorepoRoot, 'packages', 'compatible-consumer');
+      fs.mkdirSync(compatibleDir, { recursive: true });
+      writeJson(path.join(compatibleDir, 'package.json'), {
+        name: 'compatible-consumer', version: '1.0.0', dependencies: { wrapper: '^1.0.0' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/compatible-consumer']);
+    });
+  }
+
+  async testCompatFanOutPrimaryReachingMultipleWrappersUsesGenericMessage() {
+    await this.run('compat falls back to the generic "declared in these workspaces" message when the primary reaches the package through more than one wrapper', async () => {
+      // Naming a single wrapper in the error would be an arbitrary (and
+      // possibly wrong) guess when the primary actually has a real local
+      // dependency on TWO different declaring workspaces.
+      const monorepoRoot = this.tmp('compat-fanout-ambiguous-wrapper');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperADir = path.join(monorepoRoot, 'packages', 'wrapper-a');
+      fs.mkdirSync(wrapperADir, { recursive: true });
+      writeJson(path.join(wrapperADir, 'package.json'), {
+        name: 'wrapper-a', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const wrapperBDir = path.join(monorepoRoot, 'packages', 'wrapper-b');
+      fs.mkdirSync(wrapperBDir, { recursive: true });
+      writeJson(path.join(wrapperBDir, 'package.json'), {
+        name: 'wrapper-b', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0',
+        dependencies: { 'wrapper-a': '^1.0.0', 'wrapper-b': '^1.0.0' },
+      });
+
+      const r = await runPackdev(consumerDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', consumerDir,
+        '--test', 'node -e "process.exit(0)"', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /declared in these workspaces: wrapper-a, wrapper-b/);
+      assert.match(json.error, /Point --app at one of them instead/);
+      assert.doesNotMatch(json.error, /reaches it through/);
+    });
+  }
+
   async testCompatNothingTestedExitCodeAndMessage() {
     await this.run('compat exits 6 and says nothing was tested when every version is SKIPPED (not "no version passed")', async () => {
       const v1 = await buildFakeTarball({
@@ -5510,6 +5597,8 @@ module.exports = { realEntry };
       await this.testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper();
       await this.testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage();
       await this.testCompatFanOutCatchesAWrapperOnlyBreakInvisibleToDirectDiscovery();
+      await this.testCompatFanOutExcludesConsumerWithIncompatibleSemverRangeOnWrapper();
+      await this.testCompatFanOutPrimaryReachingMultipleWrappersUsesGenericMessage();
       await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
