@@ -16,7 +16,13 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as semver from "semver";
-import { fileExists, readJsonFile, writeJsonFile, type PackageInfo } from "./utils";
+import {
+  fileExists,
+  readJsonFile,
+  writeJsonFile,
+  runWithConcurrencyLimit,
+  type PackageInfo,
+} from "./utils";
 import {
   detectPackageManager,
   LOCK_FILE_BY_MANAGER,
@@ -27,7 +33,7 @@ import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
 import { esmOnlyAdvisory } from "./apiDiff";
-import { scanImportedSymbols, scanPassedOptionKeys } from "./appScan";
+import { scanImportedSymbols, scanPassedOptionKeys, createScanCache } from "./appScan";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -358,6 +364,14 @@ export function resolvePinTargets(
   });
 }
 
+// Cap on in-flight package.json reads / AST scans during workspace
+// discovery (findWorkspacesDeclaring, resolveFanOutConsumers). This is
+// lightweight fs+parse work, not a full install/test process, so a higher
+// cap than the version-testing --concurrency default is fine — it's not
+// user-configurable because there's no comparable per-workspace resource
+// cost to tune against.
+const DISCOVERY_CONCURRENCY = 8;
+
 // When --app doesn't declare the package, a monorepo often has some sibling
 // workspace that does — this is usually the actual fix (point --app there),
 // not evidence the package name is wrong. Scans every workspace's own
@@ -378,18 +392,25 @@ async function findWorkspacesDeclaring(
   if (!monorepoRoot) return [];
 
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
-  const declaring: DeclaringWorkspace[] = [];
-  for (const dir of workspaceDirs) {
-    if (path.resolve(dir) === path.resolve(appDir)) continue;
-    const packageJson = await readJsonFile<PackageJson & { name?: string }>(
-      path.join(dir, "package.json"),
-    );
-    if (packageJson && findDependencySection(packageJson, pkgName)) {
+  const resolvedAppDir = path.resolve(appDir);
+  // Independent per-workspace package.json reads — no ordering dependency
+  // between them, so run them off the same concurrency-limited pool used
+  // for everything else in this file rather than one at a time.
+  const entries = await runWithConcurrencyLimit(
+    workspaceDirs.filter((dir) => path.resolve(dir) !== resolvedAppDir),
+    DISCOVERY_CONCURRENCY,
+    async (dir): Promise<DeclaringWorkspace | null> => {
+      const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(dir, "package.json"),
+      );
+      if (!packageJson || !findDependencySection(packageJson, pkgName)) return null;
       const relDir = path.relative(monorepoRoot, dir);
-      declaring.push({ name: packageJson.name ?? relDir, dir: relDir });
-    }
-  }
-  return declaring.sort((a, b) => a.name.localeCompare(b.name));
+      return { name: packageJson.name ?? relDir, dir: relDir };
+    },
+  );
+  return entries
+    .filter((e): e is DeclaringWorkspace => e !== null)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export interface ConsumerTarget {
@@ -467,50 +488,74 @@ export async function resolveFanOutConsumers(
 ): Promise<ConsumerTarget[]> {
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
   const resolvedAppDir = path.resolve(appDir);
+  // Scoped to exactly this call — file-list/AST reuse across the tier-0 and
+  // tier-1 scans below (and across scanImportedSymbols/scanPassedOptionKeys,
+  // which otherwise each re-glob and re-parse the same directory), never
+  // held past this function returning. See createScanCache's own doc for
+  // why this can't be a module-level cache (the MCP server is long-lived
+  // and source files can change between separate tool calls).
+  const scanCache = createScanCache();
 
   // Read every workspace, INCLUDING appDir — appDir itself may be the
   // direct declarer (the common case: --app points at the wrapper), and
   // its name has to be in tier0Names for tier-1 detection to find anything
   // that depends on it. appDir is excluded only when building the actual
-  // candidate list below, never from this name-resolution pass.
-  const workspaces: { dir: string; packageJson: PackageJson & { name?: string } }[] = [];
-  for (const dir of workspaceDirs) {
-    const packageJson = await readJsonFile<PackageJson & { name?: string }>(
-      path.join(dir, "package.json"),
-    );
-    if (packageJson) workspaces.push({ dir, packageJson });
-  }
+  // candidate list below, never from this name-resolution pass. Each read
+  // is independent, so run them concurrently rather than one at a time.
+  const workspaceEntries = await runWithConcurrencyLimit(
+    workspaceDirs,
+    DISCOVERY_CONCURRENCY,
+    async (dir): Promise<{ dir: string; packageJson: PackageJson & { name?: string } } | null> => {
+      const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(dir, "package.json"),
+      );
+      return packageJson ? { dir, packageJson } : null;
+    },
+  );
+  const workspaces = workspaceEntries.filter(
+    (w): w is { dir: string; packageJson: PackageJson & { name?: string } } => w !== null,
+  );
 
   const tier0 = workspaces.filter((w) => findDependencySection(w.packageJson, pkgName));
   const tier0Names = new Set(
     tier0.map((w) => w.packageJson.name).filter((n): n is string => !!n),
   );
 
-  const candidates: FanOutCandidate[] = [];
-  for (const w of tier0) {
-    if (path.resolve(w.dir) === resolvedAppDir) continue;
-    const { symbols } = await scanImportedSymbols(w.dir, pkgName);
-    candidates.push({ dir: w.dir, tier: 0, symbolCount: symbols.size, hasObjectArg: false });
-  }
+  const tier0Candidates = await runWithConcurrencyLimit(
+    tier0.filter((w) => path.resolve(w.dir) !== resolvedAppDir),
+    DISCOVERY_CONCURRENCY,
+    async (w): Promise<FanOutCandidate> => {
+      const { symbols } = await scanImportedSymbols(w.dir, pkgName, scanCache);
+      return { dir: w.dir, tier: 0, symbolCount: symbols.size, hasObjectArg: false };
+    },
+  );
 
-  for (const w of workspaces) {
-    if (path.resolve(w.dir) === resolvedAppDir) continue;
-    if (tier0Names.has(w.packageJson.name ?? "")) continue; // already tier 0
-    const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Names);
-    if (wrapperNames.length === 0) continue;
+  const tier1Inputs = workspaces.filter((w) => {
+    if (path.resolve(w.dir) === resolvedAppDir) return false;
+    if (tier0Names.has(w.packageJson.name ?? "")) return false; // already tier 0
+    return findDependencyNamesAmong(w.packageJson, tier0Names).length > 0;
+  });
 
-    let symbolCount = 0;
-    let hasObjectArg = false;
-    for (const wrapperName of wrapperNames) {
-      const { symbols } = await scanImportedSymbols(w.dir, wrapperName);
-      symbolCount += symbols.size;
-      if (!hasObjectArg) {
-        const optionKeys = await scanPassedOptionKeys(w.dir, wrapperName);
-        if (optionKeys.size > 0) hasObjectArg = true;
+  const tier1Candidates = await runWithConcurrencyLimit(
+    tier1Inputs,
+    DISCOVERY_CONCURRENCY,
+    async (w): Promise<FanOutCandidate> => {
+      const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Names);
+      let symbolCount = 0;
+      let hasObjectArg = false;
+      for (const wrapperName of wrapperNames) {
+        const { symbols } = await scanImportedSymbols(w.dir, wrapperName, scanCache);
+        symbolCount += symbols.size;
+        if (!hasObjectArg) {
+          const optionKeys = await scanPassedOptionKeys(w.dir, wrapperName, scanCache);
+          if (optionKeys.size > 0) hasObjectArg = true;
+        }
       }
-    }
-    candidates.push({ dir: w.dir, tier: 1, symbolCount, hasObjectArg });
-  }
+      return { dir: w.dir, tier: 1, symbolCount, hasObjectArg };
+    },
+  );
+
+  const candidates: FanOutCandidate[] = [...tier0Candidates, ...tier1Candidates];
 
   candidates.sort(
     (a, b) =>
@@ -818,12 +863,22 @@ async function collectDupeCounts(
     : [];
 
   const namesToCheck = [...new Set([pkgName, ...directDeps])];
-  const counts: Record<string, number> = {};
-  for (const name of namesToCheck) {
-    const report = await findDuplicateResolutions(name, sandboxRoot);
-    counts[name] = report.resolutions.length;
-  }
-  return counts;
+  // sandboxRoot's workspace layout is fixed for the lifetime of this
+  // already-installed sandbox — resolve it once and hand it to every
+  // per-name call below instead of letting findDuplicateResolutions
+  // re-walk the identical layout once per name. The per-name walks
+  // themselves are independent (each over its own node_modules subtree),
+  // so run them concurrently too.
+  const workspaceDirs = await resolveWorkspaceDirs(sandboxRoot);
+  const entries = await runWithConcurrencyLimit(
+    namesToCheck,
+    DISCOVERY_CONCURRENCY,
+    async (name): Promise<[string, number]> => {
+      const report = await findDuplicateResolutions(name, sandboxRoot, { workspaceDirs });
+      return [name, report.resolutions.length];
+    },
+  );
+  return Object.fromEntries(entries);
 }
 
 export interface EsmCheckContext {
@@ -833,6 +888,14 @@ export interface EsmCheckContext {
 
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
+// Cap on fan-out consumer test commands run concurrently within ONE
+// version's sandbox. Deliberately separate from --concurrency (which caps
+// how many VERSIONS/sandboxes run at once, each a full install) — this
+// controls a lighter-weight resource (test-command subprocesses against an
+// already-installed sandbox), and multiplying it together with
+// --concurrency would let total in-flight processes grow unboundedly.
+const CONSUMER_TEST_CONCURRENCY = 4;
+
 async function testOneVersion(
   pkgName: string,
   version: string,
@@ -960,12 +1023,26 @@ async function testOneVersion(
           output: testResult.success ? undefined : testResult.output,
         },
       ];
-      for (const consumer of consumerTargets) {
-        const consumerCwd = path.join(sandboxDir, consumer.relativePath);
-        const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
-        const consumerPackageJson = await readJsonFile<PackageJson & { name?: string }>(
-          path.join(consumerCwd, "package.json"),
-        );
+      // Each consumer's test command runs against its own already-installed
+      // sandbox subdirectory — fully independent of every other consumer —
+      // so run them concurrently instead of one at a time. Results come
+      // back in the same order as consumerTargets (runWithConcurrencyLimit
+      // writes by index), so the "first failure" reduction below stays
+      // deterministic regardless of which subprocess actually finishes first.
+      const sandboxDirForConsumers = sandboxDir;
+      const consumerResults = await runWithConcurrencyLimit(
+        consumerTargets,
+        CONSUMER_TEST_CONCURRENCY,
+        async (consumer) => {
+          const consumerCwd = path.join(sandboxDirForConsumers, consumer.relativePath);
+          const [consumerResult, consumerPackageJson] = await Promise.all([
+            runTestCommand(consumerCwd, effectiveTestCommand),
+            readJsonFile<PackageJson & { name?: string }>(path.join(consumerCwd, "package.json")),
+          ]);
+          return { consumer, consumerResult, consumerPackageJson };
+        },
+      );
+      for (const { consumer, consumerResult, consumerPackageJson } of consumerResults) {
         consumers.push({
           dir: consumer.relativePath,
           name: consumerPackageJson?.name ?? null,
@@ -1173,33 +1250,6 @@ async function resolveRunContext(
     sandboxMode,
     consumerTargets,
   };
-}
-
-/**
- * Run `worker` over `items` with at most `limit` calls in flight at once.
- * Results are written back by index, so the returned order always matches
- * `items`' order regardless of which call finished first — every command's
- * report stays deterministically ordered whether or not concurrency is on.
- */
-async function runWithConcurrencyLimit<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let cursor = 0;
-
-  async function runLane(): Promise<void> {
-    for (;;) {
-      const index = cursor++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index]!);
-    }
-  }
-
-  const laneCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
-  return results;
 }
 
 const JEST_CONFIG_CANDIDATES = [

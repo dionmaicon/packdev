@@ -338,6 +338,16 @@ export async function resolveWorkspaceDirs(rootDir: string): Promise<string[]> {
 export interface FindDuplicateResolutionsOptions {
   /** Discover and scan workspace-nested node_modules too. Default true. */
   scanWorkspaces?: boolean;
+  /**
+   * Skip the internal resolveWorkspaceDirs(rootDir) walk and use this list
+   * instead — for a caller that's about to call findDuplicateResolutions
+   * many times against the SAME rootDir (e.g. compat's --check-dupes,
+   * checking a dozen-plus dependency names in one already-installed
+   * sandbox), re-walking the identical, unchanging workspace layout on
+   * every call is pure waste. Only safe when rootDir's workspace layout is
+   * known not to change between calls (it can't, mid-sandbox).
+   */
+  workspaceDirs?: string[];
 }
 
 async function findDeclaredRange(
@@ -438,7 +448,7 @@ export async function findDuplicateResolutions(
   const visited = new Set<string>();
   await walk(path.join(resolvedRoot, "node_modules"), pkgName, ".", results, visited);
 
-  const workspacesDetected = await resolveWorkspaceDirs(resolvedRoot);
+  const workspacesDetected = options.workspaceDirs ?? (await resolveWorkspaceDirs(resolvedRoot));
   const scannedWorkspaces: string[] = [];
 
   if (scanWorkspaces) {

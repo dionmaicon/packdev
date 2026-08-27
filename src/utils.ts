@@ -438,6 +438,33 @@ export async function resolveLocalPackage(
   return matches;
 }
 
+/**
+ * Run `worker` over `items` with at most `limit` calls in flight at once.
+ * Results are written back by index, so the returned order always matches
+ * `items`' order regardless of which call finished first — a caller's
+ * report stays deterministically ordered whether or not concurrency is on.
+ */
+export async function runWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  async function runLane(): Promise<void> {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]!);
+    }
+  }
+
+  const laneCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
+  return results;
+}
+
 // Array and object utilities
 export function groupBy<T, K extends string | number | symbol>(
   array: T[],
