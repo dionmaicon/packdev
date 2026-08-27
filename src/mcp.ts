@@ -211,7 +211,18 @@ export function createPackdevMcpServer(): McpServer {
           .optional()
           .describe(
             "After each install, fail a version whose duplicate-copy count for the package " +
-              "or its direct dependencies increased relative to the control",
+              "or its direct dependencies increased relative to the control — pair with " +
+              "seedLockfile, otherwise a fresh solve can re-flatten away exactly the nested-" +
+              "fork duplicate this is meant to catch",
+          ),
+        seedLockfile: z
+          .boolean()
+          .optional()
+          .describe(
+            "Copy the app's own lockfile into every sandbox before install, reproducing real " +
+              "resolution stickiness instead of a fresh solve. Less hermetic (a stale lockfile " +
+              "can mask a resolution a clean install would surface), but the condition " +
+              "checkDupes needs to see a nested-fork regression.",
           ),
         mode: z
           .enum(["hermetic", "workspace"])
@@ -260,6 +271,7 @@ export function createPackdevMcpServer(): McpServer {
           ...(args.concurrency !== undefined ? { concurrency: args.concurrency } : {}),
           ...(args.preferOffline !== undefined ? { preferOffline: args.preferOffline } : {}),
           ...(args.checkDupes !== undefined ? { checkDupes: args.checkDupes } : {}),
+          ...(args.seedLockfile !== undefined ? { seedLockfile: args.seedLockfile } : {}),
           ...(args.mode !== undefined ? { mode: args.mode } : {}),
           ...(args.packageManager !== undefined ? { packageManager: args.packageManager } : {}),
         };

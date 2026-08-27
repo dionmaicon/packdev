@@ -2292,6 +2292,90 @@ class FeatureTests {
     });
   }
 
+  async testCompatSeedLockfileCopiesLockfileIntoSandbox() {
+    await this.run('createSandbox copies the source lockfile into the sandbox only when seedLockfileName is passed', async () => {
+      const compat = require('../../dist/compat.js');
+      const srcDir = this.tmp('seed-lockfile-source');
+      writeJson(path.join(srcDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(srcDir, 'package-lock.json'), '{"marker":"seed-me"}\n');
+
+      const seededDir = await compat.createSandbox(
+        srcDir, '1.0.0', [{ name: 'fake-lib', section: 'dependencies' }], '',
+        undefined, 'package-lock.json',
+      );
+      try {
+        assert.ok(
+          fs.existsSync(path.join(seededDir, 'package-lock.json')),
+          'expected package-lock.json to be copied into the sandbox when seedLockfileName is set',
+        );
+        assert.strictEqual(
+          fs.readFileSync(path.join(seededDir, 'package-lock.json'), 'utf-8'),
+          '{"marker":"seed-me"}\n',
+        );
+      } finally {
+        await compat.cleanupSandbox(seededDir);
+      }
+
+      const unseededDir = await compat.createSandbox(
+        srcDir, '1.0.0', [{ name: 'fake-lib', section: 'dependencies' }], '',
+      );
+      try {
+        assert.ok(
+          !fs.existsSync(path.join(unseededDir, 'package-lock.json')),
+          'expected package-lock.json to stay excluded when seedLockfileName is not set',
+        );
+      } finally {
+        await compat.cleanupSandbox(unseededDir);
+      }
+    });
+  }
+
+  async testCompatSeedLockfileReportFields() {
+    await this.run('compat reports seededLockfile + lockfileSeedNote for the three states: off, on, and check-dupes-without-seed', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-seed-lockfile-report');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'package-lock.json'), JSON.stringify({
+        name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: {},
+      }));
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Neither flag: no note.
+      const rNeither = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const jsonNeither = parseJson(rNeither.stdout, 'compat');
+      assert.strictEqual(jsonNeither.seededLockfile, false);
+      assert.strictEqual(jsonNeither.lockfileSeedNote, null);
+
+      // --seed-lockfile alone: hermeticity-reduced note.
+      const rSeeded = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--seed-lockfile', '--json',
+      ]);
+      const jsonSeeded = parseJson(rSeeded.stdout, 'compat');
+      assert.strictEqual(jsonSeeded.seededLockfile, true);
+      assert.match(jsonSeeded.lockfileSeedNote, /less hermetic/);
+
+      // --check-dupes without --seed-lockfile: recommends turning it on.
+      const rCheckDupesOnly = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--check-dupes', '--json',
+      ]);
+      const jsonCheckDupesOnly = parseJson(rCheckDupesOnly.stdout, 'compat');
+      assert.strictEqual(jsonCheckDupesOnly.seededLockfile, false);
+      assert.match(jsonCheckDupesOnly.lockfileSeedNote, /Add --seed-lockfile/);
+    });
+  }
+
   async testCompatRejectsBisectWithCheckDupes() {
     await this.run('compat rejects --bisect combined with --check-dupes rather than silently ignoring the regression check', async () => {
       const appDir = this.tmp('compat-bisect-check-dupes-rejected');
@@ -4119,6 +4203,8 @@ class FeatureTests {
       await this.testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion();
       await this.testCompatRejectsBisectWithCheckDupes();
       await this.testCompatWithoutCheckDupesFlagDoesNotComputeDupeCounts();
+      await this.testCompatSeedLockfileCopiesLockfileIntoSandbox();
+      await this.testCompatSeedLockfileReportFields();
       await this.testCompatReportsHermeticModeAndDetectedPackageManager();
       await this.testCompatHonoursPackageManagerFieldPin();
       await this.testCompatAncestorPackageManagerFieldBeatsACloserLockfile();

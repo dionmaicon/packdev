@@ -695,6 +695,11 @@ program
     false,
   )
   .option(
+    "--seed-lockfile",
+    "Copy the app's own lockfile into every sandbox before install, reproducing real resolution stickiness instead of a fresh solve — recommended with --check-dupes, which otherwise under-reports nested-fork duplicates a fresh solve re-flattens away. Less hermetic: a stale lockfile can mask a resolution a clean install would surface.",
+    false,
+  )
+  .option(
     "--mode <mode>",
     "Force sandbox mode: hermetic (copy only --app) or workspace (copy the whole discovered monorepo root) — overrides automatic workspace:-protocol detection",
   )
@@ -742,6 +747,7 @@ program
         concurrency: Number(options.concurrency) || 1,
         preferOffline: !!options.preferOffline,
         checkDupes: !!options.checkDupes,
+        seedLockfile: !!options.seedLockfile,
         mode: options.mode as "hermetic" | "workspace" | undefined,
         packageManager: options.packageManager,
       };
@@ -780,6 +786,9 @@ program
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
         for (const caveat of report.testCommandCaveats) {
           console.log(`⚠️  ${caveat.message}`);
+        }
+        if (report.lockfileSeedNote) {
+          console.log(`⚠️  ${report.lockfileSeedNote}`);
         }
         console.log("");
 

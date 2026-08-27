@@ -110,6 +110,18 @@ export interface CompatReport {
   // "yarn@1.22.22" or "npm" when no version could be pinned down. Traces a
   // recommendation back to what actually produced it.
   packageManager: string;
+  // True when --seed-lockfile copied the source app's own lockfile into
+  // every sandbox before install, reproducing real resolution stickiness —
+  // the pinned candidate then forces a minimal update against that existing
+  // tree instead of a fresh solve.
+  seededLockfile: boolean;
+  // Non-null exactly when there's something worth saying about that choice:
+  // a reduced-hermeticity warning when seededLockfile is true (a stale
+  // lockfile can mask a resolution a fresh solve would have surfaced), or a
+  // recommendation to turn it on when checkDupes is set without it (nested-
+  // fork duplicates are systematically under-reported against a fresh
+  // solve, which re-flattens the tree checkDupes was built to catch).
+  lockfileSeedNote: string | null;
 }
 
 export interface CompatOptions {
@@ -126,6 +138,12 @@ export interface CompatOptions {
   concurrency?: number | undefined;
   preferOffline?: boolean | undefined;
   checkDupes?: boolean | undefined;
+  // Copy the source app's own lockfile into every sandbox before install,
+  // reproducing real resolution stickiness instead of a fresh solve. Off by
+  // default (a fresh solve is more hermetic — no chance of a stale lockfile
+  // masking a resolution the fresh solve would surface), but the condition
+  // --check-dupes actually needs to see a nested-fork regression.
+  seedLockfile?: boolean | undefined;
   // Force sandboxing to only appDir ("hermetic") or the whole discovered
   // monorepo root ("workspace"), overriding the automatic workspace:-protocol
   // detection. Errors if "workspace" is requested but no root is found.
@@ -343,13 +361,25 @@ export async function createSandbox(
   // was only ever reflected in the JSON report, never in which binary
   // actually ran the install.
   packageManagerPin?: { manager: PackageManagerInfo["manager"]; version: string },
+  // The detected package manager's own lock file name (e.g. "yarn.lock"),
+  // only when --seed-lockfile is on. Copying it in reproduces the real
+  // repo's resolution stickiness — the pinned version then forces a minimal
+  // update against that existing tree instead of a fresh solve, which is
+  // the condition under which --check-dupes can actually see a nested-fork
+  // regression. Undefined/other lockfiles stay excluded either way; a
+  // pnpm-lock.yaml has no business in an npm sandbox regardless.
+  seedLockfileName?: string,
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
 
   await fs.cp(sourceDir, sandboxDir, {
     recursive: true,
-    filter: (source: string) => !EXCLUDED_COPY_NAMES.has(path.basename(source)),
+    filter: (source: string) => {
+      const base = path.basename(source);
+      if (seedLockfileName && base === seedLockfileName) return true;
+      return !EXCLUDED_COPY_NAMES.has(base);
+    },
   });
 
   const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
@@ -617,6 +647,7 @@ async function testOneVersion(
       packageManagerInfo.version !== undefined
         ? { manager: packageManagerInfo.manager, version: packageManagerInfo.version }
         : undefined,
+      options.seedLockfile ? packageManagerInfo.lockFile : undefined,
     );
 
     const installResult = await runInstall(
@@ -1000,6 +1031,24 @@ function applyDupesRegressions(
   }
 }
 
+function computeLockfileSeedNote(options: CompatOptions): string | null {
+  if (options.seedLockfile) {
+    return (
+      "--seed-lockfile is on: every sandbox started from the app's own lockfile, so the " +
+      "install is less hermetic than a fresh solve — a resolution a clean install would have " +
+      "surfaced can stay masked if the seeded lockfile is already stale."
+    );
+  }
+  if (options.checkDupes) {
+    return (
+      "--check-dupes is on without --seed-lockfile: a fresh solve re-flattens the dependency " +
+      "tree, which can hide exactly the nested-fork duplicate class --check-dupes was built to " +
+      "catch. Add --seed-lockfile to reproduce the real repo's resolution stickiness."
+    );
+  }
+  return null;
+}
+
 export async function runCompat(
   pkgName: string,
   options: CompatOptions,
@@ -1071,6 +1120,8 @@ export async function runCompat(
     controlFailed,
     sandboxMode,
     packageManager: formatPackageManager(packageManagerInfo),
+    seededLockfile: !!options.seedLockfile,
+    lockfileSeedNote: computeLockfileSeedNote(options),
   };
 }
 
@@ -1094,6 +1145,8 @@ function finishBisect(
   control: CompatVersionResult | null,
   sandboxMode: "hermetic" | "workspace",
   packageManagerInfo: PackageManagerInfo,
+  seededLockfile: boolean,
+  lockfileSeedNote: string | null,
 ): CompatBisectReport {
   const controlFailed = control !== null && control.status !== "PASSED";
   return {
@@ -1115,6 +1168,8 @@ function finishBisect(
     controlFailed,
     sandboxMode,
     packageManager: formatPackageManager(packageManagerInfo),
+    seededLockfile,
+    lockfileSeedNote,
   };
 }
 
@@ -1184,6 +1239,8 @@ export async function runCompatBisect(
       control,
       sandboxMode,
       packageManagerInfo,
+      !!options.seedLockfile,
+      computeLockfileSeedNote(options),
     );
   };
 

@@ -149,7 +149,8 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
     { "version": "3.0.1", "status": "PASSED", "exitCode": 0, "durationMs": 630,
       "lockfileHash": "394e9906…", "lockfileSnapshotPath": "/tmp/packdev-compat-snapshots-.../is-odd-3.0.1-npm-package-lock.json" }
   ],
-  "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1, "testCommandCaveat": null, "testCommandCaveats": []
+  "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1, "testCommandCaveat": null, "testCommandCaveats": [],
+  "seededLockfile": false, "lockfileSeedNote": null
 }
 ```
 
@@ -163,6 +164,8 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 | `--snapshot-dir <dir>` | Save a hashed copy of each version's resolved lockfile — the target version pins exactly, but its *own* dependencies still resolve by range, so the same target version can mean a different dependency tree across two runs. Point repeated runs at the same directory to build a diffable history. |
 | `--concurrency <n>` | Test up to `n` versions in parallel (linear scan only — `--bisect`'s binary search is inherently sequential, this is a documented no-op there). |
 | `--prefer-offline` | Pass `--prefer-offline` through to the sandbox's package manager install. |
+| `--check-dupes` | After each sandboxed install, check for duplicate resolved copies of `<pkg>` and its direct dependencies; fail a version whose copy count increased relative to the control (`dupesRegression` on that version). |
+| `--seed-lockfile` | Copy the app's own lockfile into every sandbox before install, so the pin forces a minimal update against real resolution stickiness instead of a fresh solve. Recommended with `--check-dupes` — off by default because it's less hermetic: a stale lockfile can mask a resolution a clean install would surface. |
 
 - `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem) / `"SKIPPED"` (couldn't even be sandboxed — see below).
 - **`workspace:`-protocol dependencies are handled, not just diagnosed**: if the app's `package.json` declares a `workspace:`-protocol dependency (`"workspace:*"`, `"workspace:^"`, the yarn/pnpm workspaces convention), `compat` finds the monorepo root (walking up for a `package.json` with `workspaces` or a `pnpm-workspace.yaml`) and sandboxes the **whole monorepo**, not just the app — so sibling workspace packages physically exist in the sandbox and those specifiers resolve normally. The install runs at the sandboxed monorepo root; the test command runs at the sandboxed app's own directory within it. This needs a package manager that actually understands `workspace:` (Yarn Berry / pnpm — npm and Yarn Classic don't); if the app's own detected manager doesn't, expect `INSTALL_FAILED` with that manager's real error, not a silent skip.
@@ -178,6 +181,7 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
   - **Per-version `esmMismatch`** (on each `CompatVersionResult`, not a report-level caveat — a package can go ESM-only in exactly one candidate, not the whole range): fires only when the app's own `--test` is a jest run that's CJS-blind to that candidate specifically (no evidence jest's default `transformIgnorePatterns` was customized) **and** the candidate looks ESM-only relative to the control (adds `"type":"module"`, or drops the CJS `require`/`default` export condition from its `exports` map). This is the one class of break a type-check-only `--test` structurally cannot see even with a real test suite configured, because Node's module loader and jest's CJS transform behave differently from `tsc` here.
 
   `testCommandCaveat` (the first caveat's message, `null` if none) is kept for back-compat; `testCommandCaveats` is the full list of `{ code, severity, message }`. Both print in human output.
+- **`seededLockfile`/`lockfileSeedNote`**: `seededLockfile` is `true` when `--seed-lockfile` was on. `lockfileSeedNote` is non-null exactly when there's something worth saying about that choice — a reduced-hermeticity warning when seeding is on, or a recommendation to turn it on when `--check-dupes` is set without it (a fresh solve re-flattens the tree, which can hide exactly the nested-fork duplicate class `--check-dupes` was built to catch).
 - **Non-zero exit on a real failure** (linear scan only): if any version comes back `FAILED` or `INSTALL_FAILED`, `compat` exits **`7`**, so it can gate a CI job the same way `dupes` gates on `5`. This does **not** apply to `--bisect` — its per-step `FAILED` results while narrowing the boundary are expected search mechanics, not a verdict, so they never flip the exit code; check `minimumCompatibleVersion`/`recommendedVersion` instead for a bisected run.
 
 **Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.), `6` every version was `SKIPPED` (nothing was actually tested), `7` at least one version genuinely `FAILED`/`INSTALL_FAILED` (linear scan only, not `--bisect`).
