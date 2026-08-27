@@ -3053,6 +3053,72 @@ class FeatureTests {
     });
   }
 
+  // --- mcp --------------------------------------------------------------
+
+  async testMcpServerListsAllThreeTools() {
+    await this.run('mcp lists api_diff/compat/dupes as MCP tools over stdio', async () => {
+      const dir = this.tmp('mcp-list-tools');
+      const child = spawn('node', [BINARY_PATH, 'mcp'], { stdio: 'pipe', cwd: dir });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
+
+      const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+      send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0.0.1' } },
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+      await new Promise((r) => setTimeout(r, 500));
+      child.kill();
+
+      assert.ok(!stderr.trim(), `expected no stderr output, got: ${stderr}`);
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      const responses = lines.map((l) => JSON.parse(l));
+      const listResponse = responses.find((r) => r.id === 2);
+      assert.ok(listResponse, `expected a tools/list response, got: ${stdout}`);
+      const toolNames = listResponse.result.tools.map((t) => t.name).sort();
+      assert.deepStrictEqual(toolNames, ['api_diff', 'compat', 'dupes']);
+    });
+  }
+
+  async testMcpDupesToolMatchesCliOutput() {
+    await this.run('mcp dupes tool call returns the same shape as `packdev dupes --json`', async () => {
+      const dir = this.tmp('mcp-call-dupes');
+      writeJson(path.join(dir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: {} });
+
+      const child = spawn('node', [BINARY_PATH, 'mcp'], { stdio: 'pipe', cwd: dir });
+      let stdout = '';
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+      send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0.0.1' } },
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      send({
+        jsonrpc: '2.0', id: 2, method: 'tools/call',
+        params: { name: 'dupes', arguments: { package: 'totally-nonexistent-pkg-xyz', root: dir } },
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      child.kill();
+
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      const responses = lines.map((l) => JSON.parse(l));
+      const callResponse = responses.find((r) => r.id === 2);
+      assert.ok(callResponse, `expected a tools/call response, got: ${stdout}`);
+      const payload = JSON.parse(callResponse.result.content[0].text);
+      assert.strictEqual(payload.command, 'dupes');
+      assert.strictEqual(payload.duplicate, false);
+      assert.deepStrictEqual(payload.copies, []);
+      assert.strictEqual(payload.resolvedViaParent, null);
+    });
+  }
+
   // --- git dependencies -----------------------------------------------------
 
   async testGitFileUrlClassified() {
@@ -3331,6 +3397,8 @@ class FeatureTests {
       await this.testDupesNoPrereleaseNoteWhenAllSameVersion();
       await this.testDupesResolvedViaParent();
       await this.testDupesGenuinelyNotADependency();
+      await this.testMcpServerListsAllThreeTools();
+      await this.testMcpDupesToolMatchesCliOutput();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

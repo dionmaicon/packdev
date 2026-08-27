@@ -1302,5 +1302,18 @@ program
     }
   });
 
+program
+  .command("mcp")
+  .description(
+    "Run packdev as a local MCP (Model Context Protocol) server over stdio, exposing " +
+      "api-diff/compat/dupes as tools for a coding agent. Reads node_modules/lockfiles and " +
+      "runs sandboxed installs on this machine — never a hosted server, never uploads your " +
+      "dependency tree.",
+  )
+  .action(async () => {
+    const { startMcpServer } = await import("./mcp");
+    await startMcpServer();
+  });
+
 // Parse command line arguments
 program.parse();

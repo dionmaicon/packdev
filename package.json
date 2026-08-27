@@ -1,7 +1,7 @@
 {
   "name": "packdev",
   "version": "0.3.7",
-  "description": "PackDev - A TypeScript-based CLI tool for managing package dependencies during development using local paths or git repositories",
+  "description": "Find out which dependency versions actually work before you install them — per-version compatibility matrices, duplicate detection, and JSON verdicts for humans and agents.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -34,11 +34,28 @@
     "validate-docs": "node scripts/validate-docs.js"
   },
   "keywords": [
-    "cli",
-    "typescript",
-    "development",
-    "package",
-    "tools"
+    "dependency-upgrade",
+    "breaking-changes",
+    "compatibility",
+    "semver",
+    "npm-outdated",
+    "dependency-audit",
+    "duplicate-dependencies",
+    "peer-dependencies",
+    "monorepo",
+    "yarn",
+    "pnpm",
+    "workspaces",
+    "ai-agent",
+    "agent-tools",
+    "mcp",
+    "llm-tooling",
+    "renovate",
+    "dependabot",
+    "npm-check-updates",
+    "npm-link-alternative",
+    "yalc-alternative",
+    "local-development"
   ],
   "author": "Dion",
   "license": "MIT",
@@ -70,9 +87,11 @@
     "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "commander": "^14.0.1",
     "semver": "^7.8.5",
     "tar": "^7.5.22",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "zod": "^4.4.3"
   }
 }
