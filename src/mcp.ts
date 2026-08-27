@@ -172,8 +172,12 @@ export function createPackdevMcpServer(): McpServer {
           .string()
           .describe(
             'Command to run in each sandboxed version, e.g. "npm run build && npm test" — ' +
-              "should include your real test suite, not just a type check, which cannot see " +
-              "runtime-only failures",
+              "should include your real test suite, not just a type check: a bare `tsc --noEmit` " +
+              "can see a broken type surface but nothing runtime-only (an ESM-only bump, a " +
+              "duplicate-copy regression, an actual behavior change), while a transpile-only " +
+              "jest setup (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the " +
+              "dependency's types at all. The response's testCommandCaveats[] reports which of " +
+              "these it detected for this exact command.",
           ),
         registry: z.string().optional().describe("npm registry URL, used for the sandboxed install"),
         token: z

@@ -645,7 +645,7 @@ program
   .argument("<package>", "Package name to check")
   .requiredOption(
     "--test <cmd>",
-    'Command to run in each sandboxed version, e.g. "npm run build" — should include a type-check or build step; a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version',
+    'Command to run in each sandboxed version, e.g. "npm run build && npm test" — should include your real test suite, not just a type check: a bare `tsc --noEmit` can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change), while a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version — compat warns on both, see testCommandCaveats in --json',
   )
   .option(
     "--range <semver>",
@@ -778,8 +778,8 @@ program
         }
         console.log(`🧪 Sandbox mode: ${report.sandboxMode}, package manager: ${report.packageManager}`);
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
-        if (report.testCommandCaveat) {
-          console.log(`⚠️  ${report.testCommandCaveat}`);
+        for (const caveat of report.testCommandCaveats) {
+          console.log(`⚠️  ${caveat.message}`);
         }
         console.log("");
 
@@ -812,6 +812,9 @@ program
                 `      ⚠️  ${r.package} copies ${r.controlCopies} → ${r.candidateCopies} after install`,
               );
             }
+          }
+          if (v.esmMismatch) {
+            console.log(`      ⚠️  ${v.esmMismatch}`);
           }
         }
 

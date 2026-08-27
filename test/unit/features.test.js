@@ -2731,6 +2731,103 @@ class FeatureTests {
     });
   }
 
+  async testCompatWarnsOnPassWithNoTests() {
+    await this.run('compat surfaces a PASS_WITH_NO_TESTS caveat when --passWithNoTests is set', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-pass-with-no-tests-caveat');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Not a real jest invocation — just needs "jest" and "--passWithNoTests"
+      // in the command for the heuristic to fire, while actually running
+      // check.js so the version still PASSES.
+      const jestLikeCommand = 'node check.js # jest --passWithNoTests';
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+    });
+  }
+
+  async testCompatWarnsOnTypeCheckOnlyTestCommand() {
+    await this.run('compat surfaces a TYPE_CHECK_ONLY caveat when --test is bare tsc', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-type-check-only-caveat');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'npx tsc --noEmit', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('TYPE_CHECK_ONLY'), `expected TYPE_CHECK_ONLY in ${JSON.stringify(codes)}`);
+
+      // A command that chains a real runner after tsc isn't type-check-only.
+      const r2 = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'tsc --noEmit && node -e "process.exit(0)"', '--json',
+      ]);
+      const json2 = parseJson(r2.stdout, 'compat');
+      const codes2 = json2.testCommandCaveats.map((c) => c.code);
+      assert.ok(!codes2.includes('TYPE_CHECK_ONLY'), `did not expect TYPE_CHECK_ONLY in ${JSON.stringify(codes2)}`);
+    });
+  }
+
+  async testCompatWarnsOnEsmMismatchAgainstCjsBlindJest() {
+    await this.run('compat surfaces a per-version esmMismatch when a candidate goes ESM-only under a CJS-blind jest command', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', type: 'module', main: 'index.js' }),
+        'index.js': 'export default {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('compat-esm-mismatch');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '1.0.0' },
+      });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const jestLikeCommand = 'node check.js # jest --silent';
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand, '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.ok(v2Result.esmMismatch, 'expected 2.0.0 to carry an esmMismatch advisory');
+      assert.match(v2Result.esmMismatch, /type.*module/i);
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      assert.strictEqual(v1Result.esmMismatch, undefined, 'control-identical version should not carry an esmMismatch');
+    });
+  }
+
   async testCompatCleansUpSandboxOnSuccess() {
     await this.run('compat leaves no packdev-compat-sandbox-* dirs behind after a normal run', async () => {
       const v1 = await buildFakeTarball({
@@ -4035,6 +4132,9 @@ class FeatureTests {
       await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
+      await this.testCompatWarnsOnPassWithNoTests();
+      await this.testCompatWarnsOnTypeCheckOnlyTestCommand();
+      await this.testCompatWarnsOnEsmMismatchAgainstCjsBlindJest();
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();

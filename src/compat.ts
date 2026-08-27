@@ -16,7 +16,7 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as semver from "semver";
-import { fileExists, readJsonFile, writeJsonFile } from "./utils";
+import { fileExists, readJsonFile, writeJsonFile, type PackageInfo } from "./utils";
 import {
   detectPackageManager,
   LOCK_FILE_BY_MANAGER,
@@ -26,6 +26,7 @@ import {
 import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
+import { esmOnlyAdvisory } from "./apiDiff";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -53,6 +54,23 @@ export interface CompatVersionResult {
   // the repo declares, nesting a second copy). Never computed for the control
   // itself, only for candidates compared against it.
   dupesRegression?: DupesRegressionEntry[] | undefined;
+  // Set only when this candidate looks ESM-only relative to the control AND
+  // the app's own test command is a CJS-blind jest run (see
+  // detectEsmMismatch) — unlike the other testCommandCaveats, this is
+  // necessarily per-version: a package can go ESM-only in exactly one
+  // candidate, not the whole range.
+  esmMismatch?: string | undefined;
+}
+
+export type TestHarnessCaveatCode =
+  | "TRANSPILE_ONLY"
+  | "TYPE_CHECK_ONLY"
+  | "PASS_WITH_NO_TESTS";
+
+export interface TestHarnessCaveat {
+  code: TestHarnessCaveatCode;
+  severity: "warning";
+  message: string;
 }
 
 export interface CompatReport {
@@ -64,7 +82,14 @@ export interface CompatReport {
   group?: string[] | undefined;
   snapshotDir: string;
   concurrency: number;
+  // The first entry of testCommandCaveats' message, or null — kept for
+  // back-compat with agents/scripts already reading this scalar field.
   testCommandCaveat: string | null;
+  // Every static caveat detected about the app's own --test command/harness
+  // (transpile-only jest, type-check-only, --passWithNoTests). Does NOT
+  // include esmMismatch, which is per-candidate and lives on each version's
+  // own CompatVersionResult instead.
+  testCommandCaveats: TestHarnessCaveat[];
   // The currently-installed version of the package, tested the same way as
   // every candidate — null when it isn't resolvable in appDir's node_modules
   // (e.g. never installed, or a workspace-hoisted layout compat can't see).
@@ -538,6 +563,11 @@ async function collectDupeCounts(
   return counts;
 }
 
+export interface EsmCheckContext {
+  consumerIsCjsBlind: boolean;
+  controlInfo: PackageInfo | null;
+}
+
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
 async function testOneVersion(
@@ -550,6 +580,7 @@ async function testOneVersion(
   workspaceProtocolDeps: string[],
   monorepoRoot: string | null,
   appRelativePath: string,
+  esmCheck: EsmCheckContext,
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
 
@@ -618,6 +649,19 @@ async function testOneVersion(
       ? await collectDupeCounts(pkgName, sandboxDir, testCwdRelative)
       : undefined;
 
+    const esmMismatch = esmCheck.consumerIsCjsBlind
+      ? await (async () => {
+          const candidateDir = await resolveInstalledPackage(
+            pkgName,
+            path.join(sandboxDir!, testCwdRelative),
+          );
+          const candidateInfo = candidateDir
+            ? await readJsonFile<PackageInfo>(path.join(candidateDir, "package.json"))
+            : null;
+          return detectEsmMismatch(true, esmCheck.controlInfo, candidateInfo);
+        })()
+      : undefined;
+
     const testCwd = path.join(sandboxDir, testCwdRelative);
     const testResult = await runTestCommand(testCwd, options.testCommand);
     return {
@@ -629,6 +673,7 @@ async function testOneVersion(
       lockfileHash: snapshot.hash,
       lockfileSnapshotPath: snapshot.path,
       dupeCounts,
+      esmMismatch,
     };
   } finally {
     if (sandboxDir) await cleanupSandbox(sandboxDir);
@@ -737,32 +782,17 @@ async function runWithConcurrencyLimit<T, R>(
   return results;
 }
 
-/**
- * PASSED/FAILED from compat is only as trustworthy as the --test command
- * itself: a transpile-only jest setup (ts-jest isolatedModules, babel-jest,
- * @swc/jest with no separate type-check step) never actually reads the
- * dependency's .d.ts, so a version with a genuinely broken type surface can
- * still "pass" a test suite that never type-checks. This is a best-effort
- * heuristic over the app's jest config — false negatives (missing a real
- * transpile-only setup) are expected and fine; it only needs to catch the
- * common cases well enough to warn.
- */
-async function detectTranspileOnlyTestSetup(
-  appDir: string,
-  testCommand: string,
-): Promise<string | null> {
-  if (!/\bjest\b/i.test(testCommand)) return null;
+const JEST_CONFIG_CANDIDATES = [
+  "jest.config.js",
+  "jest.config.cjs",
+  "jest.config.mjs",
+  "jest.config.ts",
+  "jest.config.json",
+];
 
-  const configCandidates = [
-    "jest.config.js",
-    "jest.config.cjs",
-    "jest.config.mjs",
-    "jest.config.ts",
-    "jest.config.json",
-  ];
-
+async function readJestConfigSources(appDir: string): Promise<string[]> {
   const sources: string[] = [];
-  for (const name of configCandidates) {
+  for (const name of JEST_CONFIG_CANDIDATES) {
     const configPath = path.join(appDir, name);
     if (await fileExists(configPath)) {
       sources.push(await fs.readFile(configPath, "utf-8"));
@@ -772,15 +802,109 @@ async function detectTranspileOnlyTestSetup(
   if (await fileExists(pkgJsonPath)) {
     sources.push(await fs.readFile(pkgJsonPath, "utf-8"));
   }
+  return sources;
+}
 
-  const combined = sources.join("\n");
-  if (/isolatedModules["']?\s*:\s*true/.test(combined)) {
-    return "jest config uses ts-jest with isolatedModules:true — this transpiles TypeScript without type-checking it, so a version with a broken type surface can still pass";
+/**
+ * PASSED/FAILED from compat is only as trustworthy as the --test command
+ * itself. This is a best-effort heuristic over the app's test command and
+ * jest config — false negatives are expected and fine; it only needs to
+ * catch the common cases well enough to warn:
+ *
+ * - TRANSPILE_ONLY: a transpile-only jest setup (ts-jest isolatedModules,
+ *   babel-jest, @swc/jest with no separate type-check step) never actually
+ *   reads the dependency's .d.ts, so a version with a genuinely broken type
+ *   surface can still "pass".
+ * - TYPE_CHECK_ONLY: the exact mirror — a bare `tsc --noEmit` and nothing
+ *   else can see a broken type surface, but nothing runtime-only (an
+ *   ESM-only bump, a duplicate-copy regression, a behavior change).
+ * - PASS_WITH_NO_TESTS: jest's --passWithNoTests makes a suite that matches
+ *   zero test files exit 0 — PASSED then asserts nothing at all.
+ */
+export async function analyzeTestHarness(
+  appDir: string,
+  testCommand: string,
+): Promise<TestHarnessCaveat[]> {
+  const caveats: TestHarnessCaveat[] = [];
+  const isJest = /\bjest\b/i.test(testCommand);
+
+  if (isJest) {
+    const combined = (await readJestConfigSources(appDir)).join("\n");
+    if (/isolatedModules["']?\s*:\s*true/.test(combined)) {
+      caveats.push({
+        code: "TRANSPILE_ONLY",
+        severity: "warning",
+        message:
+          "jest config uses ts-jest with isolatedModules:true — this transpiles TypeScript without type-checking it, so a version with a broken type surface can still pass",
+      });
+    } else if (/@swc\/jest|babel-jest/.test(combined)) {
+      caveats.push({
+        code: "TRANSPILE_ONLY",
+        severity: "warning",
+        message:
+          "jest config transforms TypeScript via @swc/jest or babel-jest — these transpile without type-checking, so a version with a broken type surface can still pass",
+      });
+    }
+    if (/--passWithNoTests\b/.test(testCommand) || /passWithNoTests["']?\s*:\s*true/.test(combined)) {
+      caveats.push({
+        code: "PASS_WITH_NO_TESTS",
+        severity: "warning",
+        message:
+          "--passWithNoTests is set — a run that matches zero test files still exits 0, so PASSED here may mean the suite never actually ran against this version",
+      });
+    }
   }
-  if (/@swc\/jest|babel-jest/.test(combined)) {
-    return "jest config transforms TypeScript via @swc/jest or babel-jest — these transpile without type-checking, so a version with a broken type surface can still pass";
+
+  // Only a bare `tsc`/`tsc --noEmit` counts — a command that pipes into or
+  // chains after a real runner (`tsc --noEmit && jest`, `npm test`) isn't
+  // type-check-only, and testCommand is a whole shell command, not just
+  // the binary name, so this must anchor rather than substring-match.
+  if (/^\s*(npx\s+)?tsc(\s+--\S+)*\s*$/i.test(testCommand.trim())) {
+    caveats.push({
+      code: "TYPE_CHECK_ONLY",
+      severity: "warning",
+      message:
+        "--test only runs tsc — this can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change); include your real test suite for ground-truth coverage",
+    });
   }
-  return null;
+
+  return caveats;
+}
+
+/**
+ * True when the app's own test command is a jest run that will choke on an
+ * ESM-only dependency: not itself "type":"module" (an ESM package can import
+ * another ESM package fine) and no evidence the app customized jest's
+ * default transformIgnorePatterns (['/node_modules/']), which otherwise
+ * leaves every package under node_modules untransformed. Best-effort by
+ * design — a custom transformIgnorePatterns override that still blocks this
+ * particular package is a false negative this can't see, and that's fine.
+ */
+async function isConsumerCjsBlindToEsm(appDir: string, testCommand: string): Promise<boolean> {
+  if (!/\bjest\b/i.test(testCommand)) return false;
+
+  const appPackageJson = await readJsonFile<PackageJson>(path.join(appDir, "package.json"));
+  if ((appPackageJson as { type?: string } | null)?.type === "module") return false;
+
+  const combined = (await readJestConfigSources(appDir)).join("\n");
+  return !/transformIgnorePatterns/.test(combined);
+}
+
+/**
+ * Per-candidate ESM-only advisory: fires only when the app's test harness is
+ * CJS-blind to jest's default node_modules transform-skip AND this specific
+ * candidate looks ESM-only relative to the control. Unlike
+ * analyzeTestHarness's caveats, this can't be computed once up front — a
+ * package can go ESM-only in exactly one candidate version, not the whole
+ * tested range.
+ */
+async function detectEsmMismatch(
+  consumerIsCjsBlind: boolean,
+  controlInfo: PackageInfo | null,
+  candidateInfo: PackageInfo | null,
+): Promise<string | undefined> {
+  if (!consumerIsCjsBlind || !controlInfo || !candidateInfo) return undefined;
+  return esmOnlyAdvisory(controlInfo, candidateInfo);
 }
 
 // The version currently resolved in appDir's node_modules — null when it
@@ -809,6 +933,7 @@ async function resolveControlResult(
   monorepoRoot: string | null,
   appRelativePath: string,
   alreadyTested: CompatVersionResult[],
+  esmCheck: EsmCheckContext,
 ): Promise<CompatVersionResult | null> {
   const controlVersion = await resolveControlVersion(pkgName, options.appDir);
   if (!controlVersion) return null;
@@ -826,7 +951,25 @@ async function resolveControlResult(
     workspaceProtocolDeps,
     monorepoRoot,
     appRelativePath,
+    esmCheck,
   );
+}
+
+// Resolves once per run: whether the app's own test command is CJS-blind to
+// an ESM-only jest transform gap, and — only if so — the control's package.json,
+// since detectEsmMismatch needs both to say anything.
+async function resolveEsmCheckContext(
+  pkgName: string,
+  options: CompatOptions,
+): Promise<EsmCheckContext> {
+  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, options.testCommand);
+  if (!consumerIsCjsBlind) return { consumerIsCjsBlind: false, controlInfo: null };
+
+  const controlDir = await resolveInstalledPackage(pkgName, options.appDir);
+  const controlInfo = controlDir
+    ? await readJsonFile<PackageInfo>(path.join(controlDir, "package.json"))
+    : null;
+  return { consumerIsCjsBlind: true, controlInfo };
 }
 
 // Mutates `versions` in place: for each one with dupeCounts, compares each
@@ -868,10 +1011,8 @@ export async function runCompat(
     await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
-  const testCommandCaveat = await detectTranspileOnlyTestSetup(
-    options.appDir,
-    options.testCommand,
-  );
+  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options);
 
   const versions = await runWithConcurrencyLimit(
     candidateVersions,
@@ -887,6 +1028,7 @@ export async function runCompat(
         workspaceProtocolDeps,
         monorepoRoot,
         appRelativePath,
+        esmCheck,
       ),
   );
 
@@ -900,6 +1042,7 @@ export async function runCompat(
     monorepoRoot,
     appRelativePath,
     versions,
+    esmCheck,
   );
   if (options.checkDupes) applyDupesRegressions(versions, control);
   const controlFailed = control !== null && control.status !== "PASSED";
@@ -922,7 +1065,8 @@ export async function runCompat(
     group: options.group,
     snapshotDir,
     concurrency,
-    testCommandCaveat,
+    testCommandCaveat: testCommandCaveats[0]?.message ?? null,
+    testCommandCaveats,
     control,
     controlFailed,
     sandboxMode,
@@ -945,7 +1089,7 @@ function finishBisect(
   recommendedVersion: string | null,
   fellBackToLinearScan: boolean,
   snapshotDir: string,
-  testCommandCaveat: string | null,
+  testCommandCaveats: TestHarnessCaveat[],
   group: string[] | undefined,
   control: CompatVersionResult | null,
   sandboxMode: "hermetic" | "workspace",
@@ -965,7 +1109,8 @@ function finishBisect(
     group,
     snapshotDir,
     concurrency: 1,
-    testCommandCaveat,
+    testCommandCaveat: testCommandCaveats[0]?.message ?? null,
+    testCommandCaveats,
     control,
     controlFailed,
     sandboxMode,
@@ -1004,10 +1149,8 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
-  const testCommandCaveat = await detectTranspileOnlyTestSetup(
-    options.appDir,
-    options.testCommand,
-  );
+  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options);
   const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
     await resolveRunContext(pkgName, options);
 
@@ -1026,6 +1169,7 @@ export async function runCompatBisect(
       monorepoRoot,
       appRelativePath,
       tested,
+      esmCheck,
     );
     return finishBisect(
       pkgName,
@@ -1035,7 +1179,7 @@ export async function runCompatBisect(
       recommendedVersion,
       false,
       snapshotDir,
-      testCommandCaveat,
+      testCommandCaveats,
       options.group,
       control,
       sandboxMode,
@@ -1058,6 +1202,7 @@ export async function runCompatBisect(
       workspaceProtocolDeps,
       monorepoRoot,
       appRelativePath,
+      esmCheck,
     );
 
   const topIndex = candidateVersions.length - 1;

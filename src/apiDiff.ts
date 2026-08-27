@@ -234,7 +234,7 @@ function hasConditionDeep(node: unknown, condition: string): boolean {
 // entry both count as reachable — only an object-form exports map that
 // declares conditions but omits "require"/"default" among them actually
 // blocks require() for the root.
-function hasCjsRootEntry(packageInfo: PackageInfo): boolean {
+export function hasCjsRootEntry(packageInfo: PackageInfo): boolean {
   const exportsField = packageInfo.exports;
   if (exportsField === undefined || exportsField === null) return true;
   if (typeof exportsField === "string") return true;
@@ -250,7 +250,7 @@ function hasCjsRootEntry(packageInfo: PackageInfo): boolean {
 // either of the two ways a package goes ESM-only: adding "type":"module", or
 // — for an already dual-mode package — dropping the CJS "require"/"default"
 // condition from its "exports" map without touching "type" at all.
-function esmOnlyAdvisory(
+export function esmOnlyAdvisory(
   controlInfo: PackageInfo | null,
   candidateInfo: PackageInfo,
 ): string | undefined {
