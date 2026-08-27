@@ -190,10 +190,10 @@ packdev finish                           # Back to npm version
 | **CI/CD ready** | ✅ | ❌ | ✅ | ⚠️ |
 | **Multi-project safe** | ✅ | ❌ Conflicts | ✅ | ⚠️ Shared store |
 
-**When to use PackDev**: Direct package.json manipulation, git URLs, built-in safety
-**When to use npm link**: Quick one-off symlink testing
-**When to use Verdaccio**: Team needs full private npm registry with authentication
-**When to use Yalc**: Prefer publish/push workflow, need package copying over file: links
+- **When to use PackDev**: direct package.json manipulation, git URLs, built-in safety
+- **When to use npm link**: quick one-off symlink testing
+- **When to use Verdaccio**: team needs a full private npm registry with authentication
+- **When to use Yalc**: prefer a publish/push workflow, need package copying over `file:` links
 
 📖 **[Detailed Comparison →](docs/WORKFLOW.md#-detailed-comparison-with-alternatives)**
 
