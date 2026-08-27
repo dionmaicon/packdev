@@ -124,7 +124,7 @@ export async function resolveEntryPoint(
   // fall back to the untainted default rather than a path outside the
   // sandbox.
   const jsPath =
-    resolveContainedPath(pkgDir, packageInfo.main || "index.js") ??
+    (await resolveContainedPath(pkgDir, packageInfo.main || "index.js")) ??
     path.join(pkgDir, "index.js");
 
   const candidates: string[] = [];
@@ -147,7 +147,7 @@ export async function resolveEntryPoint(
 
   let typesPath: string | null = null;
   for (const candidate of candidates) {
-    const absolute = resolveContainedPath(pkgDir, candidate);
+    const absolute = await resolveContainedPath(pkgDir, candidate);
     if (absolute && (await fileExists(absolute))) {
       typesPath = absolute;
       break;
@@ -164,7 +164,7 @@ export async function resolveEntryPoint(
         path.join(typesPkgDir, "package.json"),
       );
       const entry = typesPkgInfo?.types || typesPkgInfo?.typings || "index.d.ts";
-      const absolute = resolveContainedPath(typesPkgDir, entry);
+      const absolute = await resolveContainedPath(typesPkgDir, entry);
       if (absolute && (await fileExists(absolute))) typesPath = absolute;
     }
   }
@@ -198,7 +198,7 @@ async function resolveSubpathTypesPath(
   const exportsField = packageInfo.exports as Record<string, unknown>;
   const condition = findTypesCondition(exportsField[subpath]);
   if (!condition) return null;
-  const absolute = resolveContainedPath(pkgDir, condition);
+  const absolute = await resolveContainedPath(pkgDir, condition);
   if (!absolute) return null;
   return (await fileExists(absolute)) ? absolute : null;
 }

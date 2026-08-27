@@ -107,13 +107,13 @@ export function parseVersionRange(version: string): {
 }
 
 /**
- * Resolve `candidate` (typically a value read from a downloaded package's
- * own manifest — "main"/"types"/"typings"/an "exports" condition — which is
- * untrusted content from the registry, not from the local user) against
- * `baseDir`, but only if the result stays within `baseDir`. Returns null
- * when it would escape, so callers can treat it exactly as if the field had
- * been absent instead of joining it into a path and reading/requiring
- * whatever it points to.
+ * Resolve `candidate` (typically a value read from a package's own
+ * manifest — "main"/"types"/"typings"/an "exports" condition — which is
+ * untrusted content: it comes from whatever was downloaded/installed, not
+ * from the local user) against `baseDir`, but only if the result stays
+ * within `baseDir`. Returns null when it would escape, so callers can treat
+ * it exactly as if the field had been absent instead of joining it into a
+ * path and reading/requiring whatever it points to.
  *
  * Without this, a malicious/compromised package's manifest containing e.g.
  * `"main": "../../../../etc/passwd"` would let api/api-diff/behavior-diff
@@ -121,20 +121,47 @@ export function parseVersionRange(version: string): {
  * require() arbitrary files anywhere on disk — well beyond the
  * already-accepted risk of running the downloaded package's own code.
  *
- * A plain lexical containment check (no realpath/symlink resolution) is
- * enough here: every caller only ever applies this to paths under a
- * tarball this process itself just extracted (registry.ts's
- * extractTarball), and node-tar's default extraction (no preservePaths)
- * already strips/refuses entries whose own path or symlink target would
- * land outside the extraction root.
+ * Checked twice: a lexical check first (cheap, and the only signal
+ * available for a candidate that doesn't exist yet — callers gate on
+ * fileExists afterward), then, when both sides exist, a realpath-resolved
+ * check too. The lexical check alone isn't enough for every caller: this
+ * is applied both to a tarball this process just extracted (registry.ts's
+ * extractTarball — node-tar's default extraction already refuses entries
+ * whose own path or symlink target lands outside the root, so lexical
+ * containment there is provably real containment) AND to an
+ * already-installed node_modules package (api.ts's `packdev api`, not just
+ * `api-diff`), where symlinks are routine and not attacker-exotic — pnpm's
+ * node_modules layout links every package in from a central store by
+ * design. A lexical check alone could be fooled there: baseDir or an
+ * ancestor of the resolved candidate being a symlink can make a
+ * string-contained path resolve to a real location outside baseDir.
  */
-export function resolveContainedPath(baseDir: string, candidate: string): string | null {
+export async function resolveContainedPath(
+  baseDir: string,
+  candidate: string,
+): Promise<string | null> {
   const resolvedBase = path.resolve(baseDir);
   const resolved = path.resolve(resolvedBase, candidate);
   const rel = path.relative(resolvedBase, resolved);
   if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     return null;
   }
+
+  try {
+    const [realBase, realResolved] = await Promise.all([
+      fs.realpath(resolvedBase),
+      fs.realpath(resolved),
+    ]);
+    const realRel = path.relative(realBase, realResolved);
+    if (realRel === ".." || realRel.startsWith(`..${path.sep}`) || path.isAbsolute(realRel)) {
+      return null;
+    }
+  } catch {
+    // candidate (or an ancestor) doesn't exist yet — nothing to resolve;
+    // the lexical check above is the only signal available, and every
+    // caller gates on fileExists afterward regardless.
+  }
+
   return resolved;
 }
 

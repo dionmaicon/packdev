@@ -717,7 +717,7 @@ program
     "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
       "monorepo root (other than --app) that directly declares <package>, plus — one hop out — " +
       "every workspace with a dependency (by name, any specifier that actually resolves " +
-      "locally — workspace:, file:/link:, or a plain/semver range the target's own version " +
+      "locally — workspace:, file:, link:, or a plain/semver range the target's own version " +
       "satisfies) on one of those (the wrapper pattern: a lib wraps <package>, apps depend on " +
       "the lib). Ranked by distinct symbols imported from whichever of those makes it eligible, " +
       "then by whether it passes an object into that import, capped at --top. Testing only the " +

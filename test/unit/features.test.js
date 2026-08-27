@@ -3182,6 +3182,115 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutUnnamedTier0WorkspaceIsNotDuplicatedIntoTier1() {
+    await this.run('compat --fan-out does not duplicate an unnamed tier-0 workspace into tier 1, even if it also depends on a named tier-0 wrapper', async () => {
+      // The "already tier 0" exclusion when building tier-1 candidates used
+      // to be keyed by NAME (tier0Names.has(w.packageJson.name ?? "")).
+      // package.json "name" is optional — for a tier-0 workspace with no
+      // name at all, that check silently degrades to tier0Names.has(""),
+      // which is always false, so it was never excluded. If that same
+      // unnamed workspace ALSO happens to depend on some other NAMED
+      // tier-0 wrapper, it would qualify for tier 1 too: the same
+      // directory listed twice, once per tier.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-unnamed-tier0-dup');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // No "name" field at all — still a valid tier-0 declarer (declares
+      // fake-lib directly) AND also depends on "wrapper".
+      const unnamedDir = path.join(monorepoRoot, 'packages', 'unnamed');
+      fs.mkdirSync(unnamedDir, { recursive: true });
+      writeJson(path.join(unnamedDir, 'package.json'), {
+        version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0', wrapper: '*' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"',
+        '--fan-out', '--top', '10', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const occurrences = json.fanOutConsumers.filter((d) => d === 'packages/unnamed');
+      assert.strictEqual(
+        occurrences.length, 1,
+        `expected "packages/unnamed" exactly once, got: ${JSON.stringify(json.fanOutConsumers)}`,
+      );
+    });
+  }
+
+  async testCompatFanOutFileSpecifierMustResolveToTheActualWorkspaceNotJustShareItsName() {
+    await this.run('compat --fan-out validates a file:/link: dependency actually resolves to the discovered wrapper, not just shares its name', async () => {
+      // Matching purely on dependency KEY was enough for a "*"/semver
+      // range (those are validated separately, by version compatibility),
+      // but a file:/link: specifier is a literal filesystem path — it can
+      // point ANYWHERE while its key still happens to equal a real tier-0
+      // workspace's name (a vendored copy, a decoy). Only a path that
+      // actually resolves to the discovered workspace's own directory
+      // should count.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-file-spec-validation');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // A decoy directory OUTSIDE the workspaces glob, same name as the
+      // real tier-0 workspace but a different location entirely (e.g. a
+      // vendored copy).
+      const decoyDir = path.join(monorepoRoot, 'vendor', 'wrapper');
+      fs.mkdirSync(decoyDir, { recursive: true });
+      writeJson(path.join(decoyDir, 'package.json'), { name: 'wrapper', version: '9.9.9' });
+
+      const decoyConsumerDir = path.join(monorepoRoot, 'packages', 'decoy-consumer');
+      fs.mkdirSync(decoyConsumerDir, { recursive: true });
+      writeJson(path.join(decoyConsumerDir, 'package.json'), {
+        name: 'decoy-consumer', version: '1.0.0',
+        // Key matches the real tier-0 workspace's name, but the path
+        // resolves to the decoy, not packages/wrapper.
+        dependencies: { wrapper: 'file:../../vendor/wrapper' },
+      });
+
+      // Control: a consumer whose file: path DOES correctly resolve to the
+      // real wrapper workspace — must still be discovered.
+      const realConsumerDir = path.join(monorepoRoot, 'packages', 'real-consumer');
+      fs.mkdirSync(realConsumerDir, { recursive: true });
+      writeJson(path.join(realConsumerDir, 'package.json'), {
+        name: 'real-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'file:../wrapper' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/real-consumer']);
+    });
+  }
+
   async testCompatFanOutExplicitListAcceptsNonDeclaringConsumer() {
     await this.run('compat --app wrapper,consumer accepts a consumer that never declares the package itself', async () => {
       // This is the escape-hatch half of the same gap: before the fix, an
@@ -5772,6 +5881,8 @@ module.exports = { realEntry };
       await this.testCompatFanOutRejectsConsumerOutsideMonorepoRoot();
       await this.testCompatFanOutDiscoversOneHopWrapperConsumers();
       await this.testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot();
+      await this.testCompatFanOutUnnamedTier0WorkspaceIsNotDuplicatedIntoTier1();
+      await this.testCompatFanOutFileSpecifierMustResolveToTheActualWorkspaceNotJustShareItsName();
       await this.testCompatFanOutExplicitListAcceptsNonDeclaringConsumer();
       await this.testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper();
       await this.testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage();

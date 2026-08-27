@@ -567,8 +567,8 @@ export async function runBehaviorDiff(
     // "../../../../etc/passwd" must not escape the extracted tarball and
     // get its content read into this diff; resolveContainedPath rejects
     // that the same way an unresolvable entry already degrades below.
-    const fromEntryAbs = resolveContainedPath(fromExtracted.packageDir, fromEntryRel);
-    const toEntryAbs = resolveContainedPath(toExtracted.packageDir, toEntryRel);
+    const fromEntryAbs = await resolveContainedPath(fromExtracted.packageDir, fromEntryRel);
+    const toEntryAbs = await resolveContainedPath(toExtracted.packageDir, toEntryRel);
 
     if (
       !fromEntryAbs ||

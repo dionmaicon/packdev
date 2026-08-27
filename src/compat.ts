@@ -304,34 +304,59 @@ export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
  * outside any discoverable workspaces config), which is the only situation
  * compat still has to report SKIPPED for.
  */
-// True when `spec` (a dependency's declared specifier) actually resolves to
-// a local workspace rather than a same-named registry/alias/git package.
-// Local-workspace linking isn't gated on the `workspace:` protocol string —
-// npm/yarn classic auto-link a same-named local workspace off a plain "*"
-// or matching semver range too — but a plain semver range only links
-// locally when the local package's own version actually satisfies it;
-// otherwise the package manager installs a separate copy from the
-// registry, and an `npm:`/git/URL specifier never resolves locally at all
-// regardless of name. `localVersion` undefined (no "version" field on the
-// candidate) falls back to permissive — this is expected to be rare enough
-// in practice that failing open beats a false negative.
-function specifierLinksToLocalWorkspace(spec: string, localVersion: string | undefined): boolean {
-  if (spec.startsWith("workspace:") || spec.startsWith("file:") || spec.startsWith("link:")) {
-    return true;
+// Everything needed about a tier-0 candidate to check whether some OTHER
+// workspace's dependency on it (by name) actually resolves locally.
+interface LocalLinkTarget {
+  version: string | undefined;
+  // Absolute directory — needed to validate a file:/link: specifier
+  // actually points AT this workspace, not just to something sharing its
+  // name.
+  dir: string;
+}
+
+// True when `spec` (a dependency's declared specifier, declared in a
+// package.json at `consumerDir`) actually resolves to `target` rather than
+// a same-named registry/alias/git package, or a `file:`/`link:` path that
+// merely happens to share the name. Local-workspace linking isn't gated on
+// the `workspace:` protocol string — npm/yarn classic auto-link a
+// same-named local workspace off a plain "*" or matching semver range too
+// — but a plain semver range only links locally when the local package's
+// own version actually satisfies it; otherwise the package manager
+// installs a separate copy from the registry, and an `npm:`/git/URL
+// specifier never resolves locally at all regardless of name. A
+// `file:`/`link:` specifier is a literal filesystem path — resolving it
+// relative to consumerDir and checking it lands ON target.dir is the only
+// way to tell "linked to the discovered workspace" apart from "linked to
+// some other, unrelated directory that happens to be named the same" (a
+// vendored copy, a decoy). `target.version` undefined (no "version" field
+// on the candidate) falls back to permissive for the plain-semver-range
+// case — this is expected to be rare enough in practice that failing open
+// beats a false negative.
+function specifierLinksToLocalWorkspace(
+  spec: string,
+  consumerDir: string,
+  target: LocalLinkTarget,
+): boolean {
+  if (spec.startsWith("workspace:")) return true;
+  if (spec.startsWith("file:") || spec.startsWith("link:")) {
+    const targetPath = spec.slice(spec.indexOf(":") + 1);
+    return path.resolve(consumerDir, targetPath) === path.resolve(target.dir);
   }
   if (spec.startsWith("npm:") || /^(git\+|git:|github:|https?:)/.test(spec)) {
     return false;
   }
-  if (localVersion === undefined) return true;
-  return semver.validRange(spec) !== null && semver.satisfies(localVersion, spec);
+  if (target.version === undefined) return true;
+  return semver.validRange(spec) !== null && semver.satisfies(target.version, spec);
 }
 
 // Dependency keys (in any of dependencies/devDependencies/peerDependencies)
-// that name a workspace in `candidateVersions` AND whose declared specifier
-// actually links to that local workspace (see specifierLinksToLocalWorkspace).
+// declared in a package.json at `consumerDir` that name a workspace in
+// `candidates` AND whose declared specifier actually links to that local
+// workspace (see specifierLinksToLocalWorkspace).
 function findDependencyNamesAmong(
   packageJson: PackageJson,
-  candidateVersions: Map<string, string | undefined>,
+  consumerDir: string,
+  candidates: Map<string, LocalLinkTarget>,
 ): string[] {
   const sections: DependencySection[] = ["dependencies", "devDependencies", "peerDependencies"];
   const found = new Set<string>();
@@ -339,8 +364,9 @@ function findDependencyNamesAmong(
     const entries = packageJson[section] as Record<string, string> | undefined;
     if (!entries) continue;
     for (const [name, spec] of Object.entries(entries)) {
-      if (!candidateVersions.has(name)) continue;
-      if (specifierLinksToLocalWorkspace(spec, candidateVersions.get(name))) found.add(name);
+      const target = candidates.get(name);
+      if (!target) continue;
+      if (specifierLinksToLocalWorkspace(spec, consumerDir, target)) found.add(name);
     }
   }
   return [...found];
@@ -423,9 +449,12 @@ interface DeclaringWorkspace {
   name: string;
   // Monorepo-relative dir — usable directly in a suggested --app value.
   dir: string;
-  // package.json "version" — needed to check whether a dependency on this
-  // workspace (by name) actually resolves locally (specifierLinksToLocalWorkspace)
-  // rather than to a same-named registry/alias/git package.
+  // Absolute dir — needed (alongside version) to check whether a
+  // dependency on this workspace (by name) actually resolves locally
+  // (specifierLinksToLocalWorkspace) rather than to a same-named
+  // registry/alias/git/vendored-elsewhere package.
+  absoluteDir: string;
+  // package.json "version" — see above.
   version: string | undefined;
 }
 
@@ -450,7 +479,12 @@ async function findWorkspacesDeclaring(
       );
       if (!packageJson || !findDependencySection(packageJson, pkgName)) return null;
       const relDir = path.relative(monorepoRoot, dir);
-      return { name: packageJson.name ?? relDir, dir: relDir, version: packageJson.version };
+      return {
+        name: packageJson.name ?? relDir,
+        dir: relDir,
+        absoluteDir: path.resolve(dir),
+        version: packageJson.version,
+      };
     },
   );
   return entries
@@ -570,16 +604,21 @@ export async function resolveFanOutConsumers(
   );
 
   const tier0 = workspaces.filter((w) => findDependencySection(w.packageJson, pkgName));
-  const tier0Names = new Set(
-    tier0.map((w) => w.packageJson.name).filter((n): n is string => !!n),
-  );
-  // name -> declared version, so a tier-1 dependency on it can be checked
-  // for actual semver compatibility (specifierLinksToLocalWorkspace) rather
-  // than matched on name alone.
-  const tier0Versions = new Map<string, string | undefined>(
+  // Resolved directories, not names — a tier-0 workspace's package.json
+  // "name" field is optional, and excluding "already tier 0" by name would
+  // silently fail to exclude an unnamed one (tier0Names.has("") is always
+  // false), letting it ALSO qualify for tier 1 if it happens to depend on
+  // some other named tier-0 workspace: a duplicate, mis-tiered candidate
+  // for the exact same directory.
+  const tier0Dirs = new Set(tier0.map((w) => path.resolve(w.dir)));
+  // name -> { version, dir }, so a tier-1 dependency on it can be checked
+  // for actual local resolution (specifierLinksToLocalWorkspace — semver
+  // compatibility for a plain range, or the real target directory for a
+  // file:/link: path) rather than matched on name alone.
+  const tier0Info = new Map<string, LocalLinkTarget>(
     tier0
       .filter((w): w is typeof w & { packageJson: { name: string } } => !!w.packageJson.name)
-      .map((w) => [w.packageJson.name, w.packageJson.version]),
+      .map((w) => [w.packageJson.name, { version: w.packageJson.version, dir: path.resolve(w.dir) }]),
   );
 
   const tier0Candidates = await runWithConcurrencyLimit(
@@ -601,15 +640,15 @@ export async function resolveFanOutConsumers(
 
   const tier1Inputs = workspaces.filter((w) => {
     if (path.resolve(w.dir) === resolvedAppDir) return false;
-    if (tier0Names.has(w.packageJson.name ?? "")) return false; // already tier 0
-    return findDependencyNamesAmong(w.packageJson, tier0Versions).length > 0;
+    if (tier0Dirs.has(path.resolve(w.dir))) return false; // already tier 0, named or not
+    return findDependencyNamesAmong(w.packageJson, w.dir, tier0Info).length > 0;
   });
 
   const tier1Candidates = await runWithConcurrencyLimit(
     tier1Inputs,
     DISCOVERY_CONCURRENCY,
     async (w): Promise<FanOutCandidate> => {
-      const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Versions);
+      const wrapperNames = findDependencyNamesAmong(w.packageJson, w.dir, tier0Info);
       let symbolCount = 0;
       let hasObjectArg = false;
       for (const wrapperName of wrapperNames) {
@@ -1203,11 +1242,17 @@ async function resolveRunContext(
       // itself is what's missing — otherwise fall through to the generic
       // "declared in these workspaces" message, which is still correct
       // (it just names where the missing group member lives).
-      const declaringVersions =
+      const declaringTargets =
         missingName === pkgName
-          ? new Map(declaringWorkspaces.map((w) => [w.name, w.version]))
-          : new Map<string, string | undefined>();
-      const reachableWrapperNames = findDependencyNamesAmong(appPackageJson, declaringVersions);
+          ? new Map<string, LocalLinkTarget>(
+              declaringWorkspaces.map((w) => [w.name, { version: w.version, dir: w.absoluteDir }]),
+            )
+          : new Map<string, LocalLinkTarget>();
+      const reachableWrapperNames = findDependencyNamesAmong(
+        appPackageJson,
+        options.appDir,
+        declaringTargets,
+      );
       const wrapperName =
         reachableWrapperNames.length === 1 ? reachableWrapperNames[0] : undefined;
       const wrapper = wrapperName
