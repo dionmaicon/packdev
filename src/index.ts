@@ -715,9 +715,12 @@ program
   .option(
     "--fan-out",
     "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
-      "monorepo root (other than --app) that directly declares <package>, ranked by how many " +
-      "distinct symbols it imports from it and capped at --top. Testing only the owning " +
-      "workspace's own tests is a much weaker claim than testing what actually depends on it.",
+      "monorepo root (other than --app) that directly declares <package>, plus — one hop out — " +
+      "every workspace that depends via workspace: on one of those (the wrapper pattern: a lib " +
+      "wraps <package>, apps depend on the lib). Ranked by distinct symbols imported from " +
+      "whichever of those makes it eligible, then by whether it passes an object into that " +
+      "import, capped at --top. Testing only the owning workspace's own tests is a much weaker " +
+      "claim than testing what actually depends on it.",
     false,
   )
   .option(

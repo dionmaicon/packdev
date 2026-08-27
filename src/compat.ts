@@ -27,7 +27,7 @@ import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
 import { esmOnlyAdvisory } from "./apiDiff";
-import { scanImportedSymbols } from "./appScan";
+import { scanImportedSymbols, scanPassedOptionKeys } from "./appScan";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -178,13 +178,8 @@ export interface CompatOptions {
   // physically exist alongside appDir in the sandbox. Mutually exclusive
   // with fanOut.
   consumerApps?: string[] | undefined;
-  // Auto-discover consumers instead of listing them: every workspace under
-  // the monorepo root (other than appDir) that directly declares pkgName in
-  // dependencies/devDependencies/peerDependencies, ranked by how many
-  // distinct symbols it actually imports from pkgName (scanImportedSymbols)
-  // and capped at fanOutTop. A workspace that only gets pkgName through
-  // hoisting (imports it but doesn't declare it) is not eligible — pinning
-  // requires a section to pin it into.
+  // Auto-discover consumers instead of listing them — see
+  // resolveFanOutConsumers for the tiered discovery/ranking this drives.
   fanOut?: boolean | undefined;
   // Cap on auto-discovered consumers (fanOut only) — fan-out multiplies
   // wall clock per version, so this bounds it. Default 5.
@@ -303,6 +298,30 @@ export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
  * outside any discoverable workspaces config), which is the only situation
  * compat still has to report SKIPPED for.
  */
+// Dependency keys (in any of dependencies/devDependencies/peerDependencies)
+// that name a workspace in `candidateNames`, regardless of the specifier
+// used to declare it. Local-workspace linking isn't gated on the
+// `workspace:` protocol string — npm/yarn classic auto-link a same-named
+// local workspace off a plain "*" or matching semver range just as
+// yarn berry/pnpm do off `workspace:*` — so the specifier is incidental
+// package-manager idiom, not the signal that matters for "is this an
+// intra-monorepo dependency."
+function findDependencyNamesAmong(
+  packageJson: PackageJson,
+  candidateNames: Set<string>,
+): string[] {
+  const sections: DependencySection[] = ["dependencies", "devDependencies", "peerDependencies"];
+  const found = new Set<string>();
+  for (const section of sections) {
+    const entries = packageJson[section] as Record<string, string> | undefined;
+    if (!entries) continue;
+    for (const name of Object.keys(entries)) {
+      if (candidateNames.has(name)) found.add(name);
+    }
+  }
+  return [...found];
+}
+
 export async function findMonorepoRoot(appDir: string): Promise<string | null> {
   let dir = path.resolve(appDir);
   for (;;) {
@@ -344,25 +363,33 @@ export function resolvePinTargets(
 // not evidence the package name is wrong. Scans every workspace's own
 // package.json rather than just appDir's, so the error names candidates
 // instead of leaving the caller to `grep` the monorepo by hand.
+interface DeclaringWorkspace {
+  // package.json "name", falling back to the monorepo-relative dir when unnamed.
+  name: string;
+  // Monorepo-relative dir — usable directly in a suggested --app value.
+  dir: string;
+}
+
 async function findWorkspacesDeclaring(
   pkgName: string,
   appDir: string,
-): Promise<string[]> {
+): Promise<DeclaringWorkspace[]> {
   const monorepoRoot = await findMonorepoRoot(appDir);
   if (!monorepoRoot) return [];
 
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
-  const declaring: string[] = [];
+  const declaring: DeclaringWorkspace[] = [];
   for (const dir of workspaceDirs) {
     if (path.resolve(dir) === path.resolve(appDir)) continue;
     const packageJson = await readJsonFile<PackageJson & { name?: string }>(
       path.join(dir, "package.json"),
     );
     if (packageJson && findDependencySection(packageJson, pkgName)) {
-      declaring.push(packageJson.name ?? path.relative(monorepoRoot, dir));
+      const relDir = path.relative(monorepoRoot, dir);
+      declaring.push({ name: packageJson.name ?? relDir, dir: relDir });
     }
   }
-  return declaring.sort();
+  return declaring.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export interface ConsumerTarget {
@@ -374,13 +401,32 @@ export interface ConsumerTarget {
 }
 
 /**
- * Auto-discover fan-out consumers: every workspace under monorepoRoot
- * (other than appDir) that directly declares pkgName in
- * dependencies/devDependencies/peerDependencies — a workspace that only
- * gets pkgName through hoisting doesn't have a section to pin it into, so
- * it's not eligible here even if it imports it. Ranked by how many
- * distinct symbols it actually imports from pkgName (scanImportedSymbols),
- * descending, and capped at `top`.
+ * Auto-discover fan-out consumers, widened by exactly one hop past direct
+ * declarers so the wrapper pattern (a lib wraps pkgName, apps depend on the
+ * lib rather than pkgName directly) is actually reachable:
+ *
+ *   tier 0 — every workspace under monorepoRoot (other than appDir) that
+ *            directly declares pkgName in dependencies/devDependencies/
+ *            peerDependencies.
+ *   tier 1 — every workspace that depends (via a `workspace:` specifier) on
+ *            a tier-0 workspace, but does not itself declare pkgName. This
+ *            is the one hop that makes a wrapper's own consumers
+ *            discoverable — going deeper (consumer-of-a-consumer) would
+ *            risk pulling in the whole repo, so it stops here.
+ *
+ * A workspace that only gets pkgName through hoisting (imports it but
+ * doesn't declare it, and doesn't depend on a declarer via workspace:)
+ * isn't eligible in either tier — pinning requires either a section to pin
+ * pkgName into directly (tier 0) or a wrapper whose own pin already carries
+ * the version through (tier 1).
+ *
+ * Ranked: tier 0 before tier 1; within a tier, by distinct symbols imported
+ * from the thing that makes it eligible (pkgName for tier 0, the
+ * connecting wrapper(s) for tier 1), descending; then by whether it passes
+ * an object literal into a call on that import (scanPassedOptionKeys) —
+ * the signal that distinguishes a consumer handing the wrapper real
+ * options (and so most likely to break on a structural change) from one
+ * that only calls a bare decorator. Capped at `top`.
  */
 // Resolves symlinks on both sides before comparing, so a workspace dir that
 // only *looks* contained (e.g. a symlink pointing outside monorepoRoot)
@@ -406,6 +452,13 @@ async function assertConsumerWithinMonorepo(monorepoRoot: string, absoluteDir: s
   }
 }
 
+interface FanOutCandidate {
+  dir: string;
+  tier: 0 | 1;
+  symbolCount: number;
+  hasObjectArg: boolean;
+}
+
 export async function resolveFanOutConsumers(
   pkgName: string,
   monorepoRoot: string,
@@ -415,16 +468,57 @@ export async function resolveFanOutConsumers(
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
   const resolvedAppDir = path.resolve(appDir);
 
-  const candidates: { dir: string; symbolCount: number }[] = [];
+  // Read every workspace, INCLUDING appDir — appDir itself may be the
+  // direct declarer (the common case: --app points at the wrapper), and
+  // its name has to be in tier0Names for tier-1 detection to find anything
+  // that depends on it. appDir is excluded only when building the actual
+  // candidate list below, never from this name-resolution pass.
+  const workspaces: { dir: string; packageJson: PackageJson & { name?: string } }[] = [];
   for (const dir of workspaceDirs) {
-    if (path.resolve(dir) === resolvedAppDir) continue;
-    const packageJson = await readJsonFile<PackageJson>(path.join(dir, "package.json"));
-    if (!packageJson || !findDependencySection(packageJson, pkgName)) continue;
-    const { symbols } = await scanImportedSymbols(dir, pkgName);
-    candidates.push({ dir, symbolCount: symbols.size });
+    const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+      path.join(dir, "package.json"),
+    );
+    if (packageJson) workspaces.push({ dir, packageJson });
   }
 
-  candidates.sort((a, b) => b.symbolCount - a.symbolCount || a.dir.localeCompare(b.dir));
+  const tier0 = workspaces.filter((w) => findDependencySection(w.packageJson, pkgName));
+  const tier0Names = new Set(
+    tier0.map((w) => w.packageJson.name).filter((n): n is string => !!n),
+  );
+
+  const candidates: FanOutCandidate[] = [];
+  for (const w of tier0) {
+    if (path.resolve(w.dir) === resolvedAppDir) continue;
+    const { symbols } = await scanImportedSymbols(w.dir, pkgName);
+    candidates.push({ dir: w.dir, tier: 0, symbolCount: symbols.size, hasObjectArg: false });
+  }
+
+  for (const w of workspaces) {
+    if (path.resolve(w.dir) === resolvedAppDir) continue;
+    if (tier0Names.has(w.packageJson.name ?? "")) continue; // already tier 0
+    const wrapperNames = findDependencyNamesAmong(w.packageJson, tier0Names);
+    if (wrapperNames.length === 0) continue;
+
+    let symbolCount = 0;
+    let hasObjectArg = false;
+    for (const wrapperName of wrapperNames) {
+      const { symbols } = await scanImportedSymbols(w.dir, wrapperName);
+      symbolCount += symbols.size;
+      if (!hasObjectArg) {
+        const optionKeys = await scanPassedOptionKeys(w.dir, wrapperName);
+        if (optionKeys.size > 0) hasObjectArg = true;
+      }
+    }
+    candidates.push({ dir: w.dir, tier: 1, symbolCount, hasObjectArg });
+  }
+
+  candidates.sort(
+    (a, b) =>
+      a.tier - b.tier ||
+      b.symbolCount - a.symbolCount ||
+      Number(b.hasObjectArg) - Number(a.hasObjectArg) ||
+      a.dir.localeCompare(b.dir),
+  );
 
   return candidates.slice(0, top).map(({ dir }) => ({
     absoluteDir: path.resolve(dir),
@@ -963,9 +1057,35 @@ async function resolveRunContext(
     const missingName = /^"(.+)" is not declared/.exec(message)?.[1] ?? pkgName;
     const declaringWorkspaces = await findWorkspacesDeclaring(missingName, options.appDir);
     if (declaringWorkspaces.length > 0) {
+      // The primary must still declare the package directly — it anchors
+      // control resolution — but when it reaches the package transitively
+      // through a dependency on exactly one of these declarers, that
+      // declarer is a wrapper, and naming it beats a generic "declared in
+      // these workspaces" list that would otherwise point the user right
+      // back at the workspace whose build already passes.
+      const declaringNames = new Set(declaringWorkspaces.map((w) => w.name));
+      const wrapperName = findDependencyNamesAmong(appPackageJson, declaringNames)[0];
+      const wrapper = wrapperName
+        ? declaringWorkspaces.find((w) => w.name === wrapperName)
+        : undefined;
+      if (wrapper && wrapperName) {
+        const wrapperSpec =
+          (findDependencySection(appPackageJson, wrapperName) &&
+            (appPackageJson[findDependencySection(appPackageJson, wrapperName)!] as Record<
+              string,
+              string
+            >)[wrapperName]) ??
+          "*";
+        throw new Error(
+          `"${missingName}" is not declared in ${options.appDir}, but it reaches it through ` +
+            `${wrapper.name} (${wrapperSpec}). Use:\n` +
+            `  --app ${wrapper.dir},${options.appDir}\n` +
+            `  or --fan-out to test the wrapper's consumers automatically.`,
+        );
+      }
       throw new Error(
         `${message} — but it is declared in these workspaces: ` +
-          `${declaringWorkspaces.join(", ")}. Point --app at one of them instead.`,
+          `${declaringWorkspaces.map((w) => w.name).join(", ")}. Point --app at one of them instead.`,
       );
     }
     throw error;
@@ -1020,7 +1140,19 @@ async function resolveRunContext(
       if (!consumerPackageJson) {
         throw new Error(`No package.json found in consumer directory: ${consumer.absoluteDir}`);
       }
-      const consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
+      // Unlike the primary, a consumer doesn't have to declare pkgName (or
+      // every --group member) itself — the wrapper pattern this fan-out
+      // widening exists to reach is exactly the case where it doesn't. A
+      // non-declaring consumer just has nothing pinned in its own
+      // package.json; it still gets copied into the sandbox and tested,
+      // and sees whatever version the primary's pin resolves to through
+      // the workspace link.
+      let consumerPinTargets: PinTarget[];
+      try {
+        consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
+      } catch {
+        consumerPinTargets = [];
+      }
       consumerTargets.push({
         relativePath: consumer.relativeDir,
         pinTargets: consumerPinTargets,
