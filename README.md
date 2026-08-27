@@ -201,8 +201,6 @@ packdev finish                           # Back to npm version
 - **When to use Verdaccio**: team needs a full private npm registry with authentication
 - **When to use Yalc**: prefer a publish/push workflow, need package copying over `file:` links
 
-📖 **[Detailed Comparison →](docs/WORKFLOW.md#-detailed-comparison-with-alternatives)**
-
 ### Examples
 
 <details>
@@ -271,7 +269,7 @@ packdev init  # Resume local development
 
 **Benefits**: No package.json conflicts, clean git status, fast context switching
 
-📖 **[Git Workflows →](docs/WORKFLOW.md#git-branch-switching)**
+📖 **[Git Workflows →](docs/WORKFLOW.md#branch-switching-without-conflicts)**
 
 </details>
 
@@ -361,7 +359,7 @@ jobs:
 
 This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1, experimental+v2) to ensure compatibility across all combinations.
 
-📖 **[CI/CD Integration Guide →](docs/WORKFLOW.md#-advanced-workflows)**
+📖 **[More git-dependency patterns →](docs/WORKFLOW.md#git-repository-dependencies)**
 
 </details>
 
@@ -416,18 +414,20 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 - **Status checks**: Always know if you're in dev or production mode
 - **Per-developer config**: `.packdev.json` lives on your machine — add it to `.gitignore` since paths are local to each developer
 
-📖 **[Safety Best Practices →](docs/WORKFLOW.md#-safety-features)**
+📖 **[Safety Best Practices →](docs/GITHUB-HOOKS.md)**
 
 ---
 
 ## 📖 Documentation
 
+- **[Documentation Index](./docs/README.md)** - Full guide list with a "what do I need" table
 - **[Quick Start Guide](docs/QUICK-START.md)** - Get up and running in 5 minutes
 - **[Workflow & Best Practices](docs/WORKFLOW.md)** - Team collaboration, CI/CD, safety
 - **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes`/`behavior-diff` — decision table, flags, real output, agent notes
 - **[Git Hooks](docs/GITHUB-HOOKS.md)** - Auto-commit protection and safety checks
 - **[Packaging Guide](docs/PACKAGING.md)** - Building, testing, and distributing
 - **[Yarn Support](docs/YARN-SUPPORT.md)** - Using PackDev with Yarn
+- **[Contributing Guide](docs/CONTRIBUTING.md)** - Dev setup, testing, release process
 
 ## 🔧 Commands Reference
 

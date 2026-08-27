@@ -107,22 +107,12 @@ packdev setup-hooks
 
 ### Branch Switching Without Conflicts
 ```bash
-# Working with local dependencies
-packdev init  # Development mode active
-
-# Need to switch branches?
-packdev finish  # Clean package.json instantly
-
-# Switch freely without conflicts
-git checkout main  # ✅ No "uncommitted changes" warnings
-git checkout feature/other  # ✅ Clean switching
-
-# Resume work
+packdev finish            # clean package.json before switching
+git checkout other-branch # ✅ no conflicts, no "uncommitted changes" warning
 git checkout your-branch
-packdev init  # Back to local development
+packdev init               # resume exactly where you left off
 ```
-
-**Why this helps**: No package.json merge conflicts, clean git status, fast context switching between branches
+Full explanation and more scenarios: [Workflow Guide → Branch Switching](./WORKFLOW.md#branch-switching-without-conflicts)
 
 ### Testing Local and Git Changes
 ```bash
