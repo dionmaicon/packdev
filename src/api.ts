@@ -76,11 +76,23 @@ function findTypesCondition(node: unknown): string | null {
   if (typeof obj["types"] === "string") return obj["types"];
   if (typeof obj["typings"] === "string") return obj["typings"];
 
-  for (const key of ["import", "require", "node", "default"]) {
+  // "node"/"import"/"require"/"default" cover the common case. A package
+  // whose root has ONLY environment condition keys and no "node" among them
+  // (seen in the wild, e.g. @solana/kit 5.x: node/browser/workerd/edge-light/
+  // react-native, no bare "."/no "node") still needs a deterministic pick —
+  // fall back to the first condition key present, in manifest order, rather
+  // than reporting no types at all.
+  const preferredKeys = ["import", "require", "node", "default"];
+  for (const key of preferredKeys) {
     if (key in obj) {
       const found = findTypesCondition(obj[key]);
       if (found) return found;
     }
+  }
+  for (const key of Object.keys(obj)) {
+    if (preferredKeys.includes(key)) continue;
+    const found = findTypesCondition(obj[key]);
+    if (found) return found;
   }
   return null;
 }
@@ -113,6 +125,10 @@ export async function resolveEntryPoint(
   if (packageInfo.main) {
     candidates.push(packageInfo.main.replace(/\.jsx?$/, ".d.ts"));
   }
+  // No main/types/typings/exports at all in the manifest (seen in the wild,
+  // e.g. @nestjs/axios's published tarball) — fall back to the same
+  // ./index.d.ts default Node/TS use for an untyped ./index.js main.
+  candidates.push("index.d.ts");
 
   let typesPath: string | null = null;
   for (const candidate of candidates) {
@@ -256,6 +272,12 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
     module: ts.ModuleKind.ESNext,
     skipLibCheck: true,
     noResolve: false,
+    // Node10 (classic Node resolution: extension-less specifiers, directory
+    // specifiers falling back to <dir>/index.d.ts) is what actually follows
+    // a barrel's local re-exports (`export * from "./dist"`,
+    // `export { X } from "./client/client"`) — the module-kind-inferred
+    // default (Bundler/Classic depending on TS version) does not.
+    moduleResolution: ts.ModuleResolutionKind.Node10,
   });
 
   const sourceFile = program.getSourceFile(typesPath);
@@ -306,6 +328,81 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
   }
 
   return results;
+}
+
+export interface UnresolvedReexports {
+  // An `export * from "spec"` (or `export * as ns from "spec"`) whose target
+  // couldn't be resolved. Since the re-exported names are unknown, ANY used
+  // symbol not otherwise found might have come from it — a genuine "can't
+  // tell", not "absent".
+  wildcard: boolean;
+  // `export { A, B } from "spec"` whose target couldn't be resolved — here
+  // the affected names ARE known statically, so only those specific symbols
+  // are unresolved rather than every unmatched symbol in the file.
+  namedUnresolved: Set<string>;
+}
+
+async function specifierResolves(
+  specifier: string,
+  fromFileDir: string,
+  pkgDir: string,
+): Promise<boolean> {
+  if (specifier.startsWith(".") || specifier.startsWith("/")) {
+    const base = path.resolve(fromFileDir, specifier);
+    const candidates = [base, `${base}.d.ts`, `${base}.ts`, path.join(base, "index.d.ts")];
+    for (const candidate of candidates) {
+      if (await fileExists(candidate)) return true;
+    }
+    return false;
+  }
+  // Bare specifier — a sibling npm package. Resolved the same way Node
+  // itself would: walk up node_modules from the package's own directory.
+  return (await resolveInstalledPackage(specifier, pkgDir)) !== null;
+}
+
+/**
+ * Scan a .d.ts file's top-level `export ... from "spec"` statements for ones
+ * whose target module can't be resolved on disk — the shape behind both a
+ * barrel re-exporting from local files the checker's isolated single-file
+ * program still can't see for some reason, and (more commonly) a re-export
+ * from another npm package that simply isn't installed alongside this one
+ * (e.g. a tarball extracted into an isolated temp dir with no node_modules
+ * tree). Syntax-only, so it can't fail the way the checker-based walk can.
+ */
+export async function findUnresolvableReexports(
+  typesPath: string,
+  pkgDir: string,
+): Promise<UnresolvedReexports> {
+  const result: UnresolvedReexports = { wildcard: false, namedUnresolved: new Set() };
+
+  const sourceText = ts.sys.readFile(typesPath);
+  if (!sourceText) return result;
+
+  const sourceFile = ts.createSourceFile(typesPath, sourceText, ts.ScriptTarget.Latest, true);
+  const fromFileDir = path.dirname(typesPath);
+
+  for (const stmt of sourceFile.statements) {
+    if (!ts.isExportDeclaration(stmt)) continue;
+    const moduleSpecifier =
+      stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+        ? stmt.moduleSpecifier.text
+        : null;
+    if (!moduleSpecifier) continue;
+
+    if (await specifierResolves(moduleSpecifier, fromFileDir, pkgDir)) continue;
+
+    if (!stmt.exportClause || ts.isNamespaceExport(stmt.exportClause)) {
+      result.wildcard = true;
+      continue;
+    }
+    if (ts.isNamedExports(stmt.exportClause)) {
+      for (const element of stmt.exportClause.elements) {
+        result.namedUnresolved.add(element.name.text);
+      }
+    }
+  }
+
+  return result;
 }
 
 export interface RawExportHint {

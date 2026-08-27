@@ -589,9 +589,14 @@ program
             v.typesSource === "none"
               ? " [no type declarations found — bundled or via @types]"
               : v.typesSource === "types-package"
-                ? " [types via @types package]"
+                ? ` [types via ${v.typesPackage ?? "@types package"}@${v.typesPackageVersion ?? "?"}${
+                    v.typesPackageVersionMismatch ? ", does not track this version" : ""
+                  }]`
                 : "";
           console.log(`  ${mark} ${v.version}${detail}${typesNote}`);
+          if (v.esmOnlyAdvisory) {
+            console.log(`     ⚠️  ${v.esmOnlyAdvisory}`);
+          }
         }
 
         console.log("");
@@ -684,6 +689,19 @@ program
     "Prefer the local package manager cache over the registry when resolving versions",
     false,
   )
+  .option(
+    "--check-dupes",
+    "After each sandboxed install, check for duplicate resolved copies of the package and its direct dependencies; fail a version whose copy count increased relative to the control",
+    false,
+  )
+  .option(
+    "--mode <mode>",
+    "Force sandbox mode: hermetic (copy only --app) or workspace (copy the whole discovered monorepo root) — overrides automatic workspace:-protocol detection",
+  )
+  .option(
+    "--package-manager <spec>",
+    'Override the detected package manager for the sandboxed install, e.g. "yarn@1.22.22" or "pnpm" — otherwise resolved from the nearest package.json "packageManager" field (corepack), then the nearest lockfile',
+  )
   .action(async (packageName: string, options) => {
     try {
       if (!options.range && !options.versions) {
@@ -691,6 +709,9 @@ program
       }
       if (options.range && options.versions) {
         throw new Error("--range and --versions are mutually exclusive");
+      }
+      if (options.mode && options.mode !== "hermetic" && options.mode !== "workspace") {
+        throw new Error(`--mode must be "hermetic" or "workspace", got "${options.mode}"`);
       }
 
       const npmrc = await loadNpmrcConfig(options.app);
@@ -720,6 +741,9 @@ program
         snapshotDir: options.snapshotDir,
         concurrency: Number(options.concurrency) || 1,
         preferOffline: !!options.preferOffline,
+        checkDupes: !!options.checkDupes,
+        mode: options.mode as "hermetic" | "workspace" | undefined,
+        packageManager: options.packageManager,
       };
 
       const report: CompatReport | CompatBisectReport = options.bisect
@@ -733,10 +757,11 @@ program
       // are expected search mechanics (that's how it finds the boundary),
       // not a verdict — so a FAILED entry there must not flip the exit code.
       const hasFailure =
-        !isCompatBisectReport(report) &&
-        report.versions.some(
-          (v) => v.status === "FAILED" || v.status === "INSTALL_FAILED",
-        );
+        (!isCompatBisectReport(report) &&
+          report.versions.some(
+            (v) => v.status === "FAILED" || v.status === "INSTALL_FAILED",
+          )) ||
+        report.controlFailed;
 
       output({ command: "compat", ...report }, () => {
         console.log(`📦 ${report.package} — runtime compatibility`);
@@ -751,6 +776,7 @@ program
         if (report.concurrency > 1) {
           console.log(`⚡ Concurrency: ${report.concurrency}`);
         }
+        console.log(`🧪 Sandbox mode: ${report.sandboxMode}, package manager: ${report.packageManager}`);
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
         if (report.testCommandCaveat) {
           console.log(`⚠️  ${report.testCommandCaveat}`);
@@ -780,9 +806,27 @@ program
               .join("\n");
             console.log(indented);
           }
+          if (v.dupesRegression) {
+            for (const r of v.dupesRegression) {
+              console.log(
+                `      ⚠️  ${r.package} copies ${r.controlCopies} → ${r.candidateCopies} after install`,
+              );
+            }
+          }
         }
 
         console.log("");
+        if (report.controlFailed && report.control) {
+          const firstLine = (report.control.output ?? "").split("\n").find((l) => l.trim()) ?? "";
+          console.log(
+            `⚠️  control ${report.control.version} (installed) ${report.control.status} — the test harness is broken, not the package.`,
+          );
+          if (firstLine) console.log(`    First error: ${firstLine.trim()}`);
+          console.log(
+            "    Hint: a dependency may be satisfied by hoisting in-repo but undeclared in this app's package.json.",
+          );
+          console.log("    No recommendation emitted.");
+        }
         if (report.minimumCompatibleVersion) {
           console.log(
             `💡 Minimum compatible version: ${report.minimumCompatibleVersion}`,
@@ -791,7 +835,7 @@ program
         if (report.recommendedVersion) {
           console.log(`💡 Recommended version: ${report.recommendedVersion}`);
         }
-        if (!report.minimumCompatibleVersion) {
+        if (!report.minimumCompatibleVersion && !report.controlFailed) {
           if (nothingTested) {
             console.log(
               "⚠️  Every version was skipped — nothing was actually tested. This is NOT a confirmed incompatibility.",
@@ -861,7 +905,10 @@ program
           command: "dupes",
           package: packageName,
           duplicate,
-          resolutions,
+          // Named "copies" here (not "resolutions", the internal DupeReport
+          // field name) to avoid colliding with package.json's own
+          // "resolutions" field when this JSON is diffed/grepped alongside it.
+          copies: resolutions,
           workspacesDetected,
           scannedWorkspaces,
           resolvedViaParent,

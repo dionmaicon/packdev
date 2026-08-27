@@ -9,12 +9,16 @@
  */
 
 import * as path from "path";
+import * as ts from "typescript";
 import { readJsonFile, type PackageInfo } from "./utils";
 import {
   resolvePackageExportMap,
   resolveEntryPoint,
   extractRawExportHints,
+  findUnresolvableReexports,
+  resolveInstalledPackage,
   type ExportedSymbolWithSubpath,
+  type UnresolvedReexports,
 } from "./api";
 import { scanImportedSymbols } from "./appScan";
 import {
@@ -44,6 +48,20 @@ export interface ApiDiffVersionResult {
   unresolvedSymbols: string[];
   exportCount: number;
   typesSource: TypesSource;
+  // Set only when typesSource is "types-package" — the @types/<pkg> package
+  // and version actually used to resolve the surface, so a reader can judge
+  // for themselves whether it tracks this candidate.
+  typesPackage?: string;
+  typesPackageVersion?: string;
+  // True when typesSource is "types-package" and no @types version shares
+  // this candidate's major — the types were the best available guess, not a
+  // verified match, and apiCompatible is forced to null to say so honestly.
+  typesPackageVersionMismatch?: boolean;
+  // Set when this candidate looks ESM-only (adds "type":"module", or drops
+  // a CJS "require"/"default" condition) relative to the control (installed)
+  // version — a signal that a CommonJS test runner (e.g. Jest with default
+  // transformIgnorePatterns) may fail even though this static check passes.
+  esmOnlyAdvisory?: string;
 }
 
 export interface ApiDiffReport {
@@ -73,6 +91,17 @@ interface ResolvedExports {
   // scan of the root .d.ts still found export-shaped content (barrel
   // re-exports, generic wrappers, ...) — signals "unverifiable", not "empty".
   unresolved: boolean;
+  // Root-level `export ... from "spec"` statements whose target couldn't be
+  // resolved (local file genuinely missing, or — far more commonly — a
+  // sibling npm package not present in this isolated extraction). Distinct
+  // from `unresolved` above: this applies even when SOME exports resolved
+  // fine (a barrel mixing local and cross-package re-exports), so only the
+  // specifically-affected used symbols get downgraded to unresolved instead
+  // of every used symbol in the file.
+  reexports: UnresolvedReexports;
+  typesPackage?: string;
+  typesPackageVersion?: string;
+  typesPackageVersionMismatch?: boolean;
 }
 
 // Types resolved but produced zero exports — check whether that's a
@@ -89,6 +118,15 @@ async function hasUnresolvableBarrelContent(
   return extractRawExportHints(typesPath).length > 0;
 }
 
+async function reexportsForRoot(
+  pkgDir: string,
+  packageInfo: PackageInfo,
+): Promise<UnresolvedReexports> {
+  const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+  if (!typesPath) return { wildcard: false, namedUnresolved: new Set() };
+  return findUnresolvableReexports(typesPath, pkgDir);
+}
+
 // Bundled types (root export plus any subpath exports, e.g. pkg/testing) win
 // when present. Otherwise, since the tarball was extracted into an isolated
 // temp dir with no node_modules tree, the local @types sibling-lookup
@@ -103,12 +141,14 @@ async function resolveExportsForVersion(
   registryUrl: string,
   token: string | undefined,
 ): Promise<ResolvedExports> {
+  const noReexports: UnresolvedReexports = { wildcard: false, namedUnresolved: new Set() };
   const bundled = await resolvePackageExportMap(packageDir, packageInfo);
   if (bundled.hasTypes) {
     const unresolved =
       bundled.exports.length === 0 &&
       (await hasUnresolvableBarrelContent(packageDir, packageInfo));
-    return { exports: bundled.exports, typesSource: "bundled", unresolved };
+    const reexports = await reexportsForRoot(packageDir, packageInfo);
+    return { exports: bundled.exports, typesSource: "bundled", unresolved, reexports };
   }
 
   const typesMatch = await resolveTypesPackageTarball(
@@ -118,7 +158,7 @@ async function resolveExportsForVersion(
     token,
   );
   if (!typesMatch) {
-    return { exports: [], typesSource: "none", unresolved: false };
+    return { exports: [], typesSource: "none", unresolved: false, reexports: noReexports };
   }
 
   const typesBuffer = await downloadTarball(typesMatch.tarball, token);
@@ -130,25 +170,68 @@ async function resolveExportsForVersion(
   );
   if (!typesPkgInfo) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { exports: [], typesSource: "none", unresolved: false };
+    return { exports: [], typesSource: "none", unresolved: false, reexports: noReexports };
   }
 
   const resolved = await resolvePackageExportMap(typesPkgDir, typesPkgInfo);
   if (!resolved.hasTypes) {
     await cleanupExtractedTarball(typesCleanupDir);
-    return { exports: [], typesSource: "none", unresolved: false };
+    return { exports: [], typesSource: "none", unresolved: false, reexports: noReexports };
   }
 
   const unresolved =
     resolved.exports.length === 0 &&
     (await hasUnresolvableBarrelContent(typesPkgDir, typesPkgInfo));
+  const reexports = await reexportsForRoot(typesPkgDir, typesPkgInfo);
 
   return {
     exports: resolved.exports,
     typesSource: "types-package",
     extraCleanupDir: typesCleanupDir,
     unresolved,
+    reexports,
+    typesPackage: typesPkgInfo.name,
+    typesPackageVersion: typesMatch.version,
+    typesPackageVersionMismatch: !typesMatch.majorMatched,
   };
+}
+
+// With esModuleInterop/allowSyntheticDefaultImports on, `import x from "mod"`
+// against a module with no real default export is satisfied by TS/Node
+// synthesizing one from the whole CJS namespace — reporting "default"
+// missing there is flagging a rule the consumer has explicitly opted out of.
+function consumerAllowsSyntheticDefault(appDir: string): boolean {
+  const configPath = ts.findConfigFile(appDir, ts.sys.fileExists, "tsconfig.json");
+  if (!configPath) return false;
+  const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (configFile.error || !configFile.config) return false;
+  const parsed = ts.parseJsonConfigFileContent(
+    configFile.config,
+    ts.sys,
+    path.dirname(configPath),
+  );
+  return !!(parsed.options.esModuleInterop || parsed.options.allowSyntheticDefaultImports);
+}
+
+// Flags a candidate that looks ESM-only relative to the control (installed)
+// version — the one class of break `compat --test "tsc --noEmit"` (a type
+// checker with no runner) structurally cannot see, since Node's module
+// loader and Jest's CJS transform behave differently from tsc here.
+function esmOnlyAdvisory(
+  controlInfo: PackageInfo | null,
+  candidateInfo: PackageInfo,
+): string | undefined {
+  if (!controlInfo) return undefined;
+  const controlIsModule = controlInfo.type === "module";
+  const candidateIsModule = candidateInfo.type === "module";
+  if (!controlIsModule && candidateIsModule) {
+    return (
+      'candidate adds "type":"module" (ESM-only) relative to the installed version; ' +
+      "a CommonJS test runner (e.g. Jest with default transformIgnorePatterns) may fail " +
+      "even though this static check passes — make sure --test runs your test suite, not just a type check"
+    );
+  }
+  return undefined;
 }
 
 async function diffOneVersion(
@@ -158,11 +241,17 @@ async function diffOneVersion(
   usedSymbols: Set<string>,
   registryUrl: string,
   token: string | undefined,
+  allowSyntheticDefault: boolean,
+  controlInfo: PackageInfo | null,
 ): Promise<{
   missingSymbols: string[];
   unresolvedSymbols: string[];
   exportCount: number;
   typesSource: TypesSource;
+  typesPackage?: string;
+  typesPackageVersion?: string;
+  typesPackageVersionMismatch?: boolean;
+  esmOnlyAdvisory?: string;
 }> {
   const buffer = await downloadTarball(tarballUrl, token);
   const { packageDir, cleanupDir } = await extractTarball(buffer);
@@ -195,22 +284,52 @@ async function diffOneVersion(
     // false negative (worse than the pre-registry-auth 401 this replaced:
     // it now runs and looks authoritative). Report them as unresolved
     // instead, never as missing, when resolution itself couldn't verify.
+    let missingSymbols: string[];
+    let unresolvedSymbols: string[];
+    if (resolved.unresolved) {
+      missingSymbols = [];
+      unresolvedSymbols = [...usedSymbols].sort();
+    } else {
+      // A symbol not found among resolved exports is only genuinely
+      // "missing" when no unresolvable re-export statement could plausibly
+      // have supplied it — a named re-export (`export { A } from X`) names
+      // its affected symbols exactly; a wildcard/namespace re-export
+      // (`export * from X`) could have supplied ANY unmatched symbol.
+      const unresolvedSet = new Set<string>();
+      for (const symbol of usedSymbols) {
+        if (exportedNames.has(symbol)) continue;
+        if (resolved.reexports.namedUnresolved.has(symbol) || resolved.reexports.wildcard) {
+          unresolvedSet.add(symbol);
+        }
+      }
+      unresolvedSymbols = [...unresolvedSet].sort();
+      missingSymbols = [...usedSymbols]
+        .filter((symbol) => !exportedNames.has(symbol) && !unresolvedSet.has(symbol))
+        .sort();
+    }
+
     // Sorted alphabetically (not scan/insertion order) so the same symbol
     // lands in the same relative position across every version's list —
     // that's what makes two versions' missing/unresolved lists diffable at
     // a glance instead of needing to be re-read symbol-by-symbol each time.
-    const missingSymbols = resolved.unresolved
-      ? []
-      : [...usedSymbols].filter((symbol) => !exportedNames.has(symbol)).sort();
-    const unresolvedSymbols = resolved.unresolved
-      ? [...usedSymbols].sort()
-      : [];
+    if (allowSyntheticDefault) {
+      missingSymbols = missingSymbols.filter((symbol) => symbol !== "default");
+    }
 
+    const advisory = esmOnlyAdvisory(controlInfo, packageInfo);
     return {
       missingSymbols,
       unresolvedSymbols,
       exportCount: resolved.exports.length,
       typesSource: resolved.typesSource,
+      ...(resolved.typesPackage !== undefined ? { typesPackage: resolved.typesPackage } : {}),
+      ...(resolved.typesPackageVersion !== undefined
+        ? { typesPackageVersion: resolved.typesPackageVersion }
+        : {}),
+      ...(resolved.typesPackageVersionMismatch !== undefined
+        ? { typesPackageVersionMismatch: resolved.typesPackageVersionMismatch }
+        : {}),
+      ...(advisory !== undefined ? { esmOnlyAdvisory: advisory } : {}),
     };
   } finally {
     await cleanupExtractedTarball(cleanupDir);
@@ -237,20 +356,36 @@ export async function runApiDiff(
     includeDeprecated: options.includeDeprecated,
   });
 
+  const allowSyntheticDefault = consumerAllowsSyntheticDefault(options.appDir);
+  const installedDir = await resolveInstalledPackage(pkgName, options.appDir);
+  const controlInfo = installedDir
+    ? await readJsonFile<PackageInfo>(path.join(installedDir, "package.json"))
+    : null;
+
   const versions: ApiDiffVersionResult[] = [];
   for (const version of versionsInRange) {
     const dist = metadata.versions[version]?.dist;
     if (!dist) continue;
 
-    const { missingSymbols, unresolvedSymbols, exportCount, typesSource } =
-      await diffOneVersion(
-        pkgName,
-        version,
-        dist.tarball,
-        symbols,
-        options.registryUrl,
-        options.token,
-      );
+    const {
+      missingSymbols,
+      unresolvedSymbols,
+      exportCount,
+      typesSource,
+      typesPackage,
+      typesPackageVersion,
+      typesPackageVersionMismatch,
+      esmOnlyAdvisory: advisory,
+    } = await diffOneVersion(
+      pkgName,
+      version,
+      dist.tarball,
+      symbols,
+      options.registryUrl,
+      options.token,
+      allowSyntheticDefault,
+      controlInfo,
+    );
 
     // unresolvedSymbols is only non-empty when there was something to
     // verify and resolution couldn't — apiCompatible: null then means
@@ -258,8 +393,14 @@ export async function runApiDiff(
     // import anything (usedSymbols empty), unresolvedSymbols stays empty
     // even for an unresolved barrel, so apiCompatible correctly stays
     // `true` (nothing to miss) rather than downgrading to unknown.
-    const apiCompatible =
+    let apiCompatible: boolean | null =
       unresolvedSymbols.length > 0 ? null : missingSymbols.length === 0;
+    // Types resolved via a @types/<pkg> version that doesn't share this
+    // candidate's major aren't a verified match — don't let a resulting
+    // false negative assert incompatibility with confidence it doesn't have.
+    if (typesPackageVersionMismatch && apiCompatible === false) {
+      apiCompatible = null;
+    }
 
     versions.push({
       version,
@@ -268,6 +409,10 @@ export async function runApiDiff(
       unresolvedSymbols,
       exportCount,
       typesSource,
+      ...(typesPackage ? { typesPackage } : {}),
+      ...(typesPackageVersion ? { typesPackageVersion } : {}),
+      ...(typesPackageVersionMismatch ? { typesPackageVersionMismatch } : {}),
+      ...(advisory ? { esmOnlyAdvisory: advisory } : {}),
     });
   }
 

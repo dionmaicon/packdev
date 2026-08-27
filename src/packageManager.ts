@@ -107,6 +107,40 @@ interface PackageJsonBackup {
 export interface PackageManagerInfo {
   manager: "npm" | "yarn" | "pnpm";
   lockFile: string;
+  // Present when pinned via a package.json "packageManager" field (corepack)
+  // or a --package-manager override; absent when picked from a bare lockfile.
+  version?: string;
+  // Where this resolution came from — surfaced in `compat` output so a
+  // recommendation can be traced back to what actually ran it.
+  source: "packageManager-field" | "lockfile" | "default" | "cli-override";
+}
+
+export const LOCK_FILE_BY_MANAGER: Record<PackageManagerInfo["manager"], string> = {
+  pnpm: "pnpm-lock.yaml",
+  yarn: "yarn.lock",
+  npm: "package-lock.json",
+};
+
+// Reads the nearest-ancestor package.json's corepack "packageManager" field
+// (e.g. "yarn@1.22.22"), the same pin `corepack` itself honours, so compat's
+// sandbox install uses the manager the project actually declares rather than
+// guessing from whichever lockfile happens to be present.
+async function readPackageManagerField(
+  dir: string,
+): Promise<{ manager: PackageManagerInfo["manager"]; version: string } | null> {
+  const pkgJsonPath = path.join(dir, "package.json");
+  if (!(await fileExists(pkgJsonPath))) return null;
+  try {
+    const raw = JSON.parse(await fs.readFile(pkgJsonPath, "utf-8")) as {
+      packageManager?: string;
+    };
+    if (!raw.packageManager) return null;
+    const match = /^(npm|yarn|pnpm)@([^+]+)/.exec(raw.packageManager);
+    if (!match?.[1] || !match[2]) return null;
+    return { manager: match[1] as PackageManagerInfo["manager"], version: match[2] };
+  } catch {
+    return null;
+  }
 }
 
 interface GitReference {
@@ -133,14 +167,23 @@ export async function detectPackageManager(
   // root rather than next to the child's package.json.
   let dir = startDir;
   for (;;) {
+    const pinned = await readPackageManagerField(dir);
+    if (pinned) {
+      return {
+        manager: pinned.manager,
+        lockFile: LOCK_FILE_BY_MANAGER[pinned.manager],
+        version: pinned.version,
+        source: "packageManager-field",
+      };
+    }
     if (await fileExists(path.join(dir, "pnpm-lock.yaml"))) {
-      return { manager: "pnpm", lockFile: "pnpm-lock.yaml" };
+      return { manager: "pnpm", lockFile: "pnpm-lock.yaml", source: "lockfile" };
     }
     if (await fileExists(path.join(dir, "yarn.lock"))) {
-      return { manager: "yarn", lockFile: "yarn.lock" };
+      return { manager: "yarn", lockFile: "yarn.lock", source: "lockfile" };
     }
     if (await fileExists(path.join(dir, "package-lock.json"))) {
-      return { manager: "npm", lockFile: "package-lock.json" };
+      return { manager: "npm", lockFile: "package-lock.json", source: "lockfile" };
     }
 
     const parentDir = path.dirname(dir);
@@ -149,7 +192,7 @@ export async function detectPackageManager(
   }
 
   // Default to npm if no lockfile was found anywhere up the tree.
-  return { manager: "npm", lockFile: "package-lock.json" };
+  return { manager: "npm", lockFile: "package-lock.json", source: "default" };
 }
 
 async function executeInstall(

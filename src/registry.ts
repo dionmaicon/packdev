@@ -231,6 +231,11 @@ export function listVersionsInRange(
 export interface TypesPackageMatch {
   version: string;
   tarball: string;
+  // False when no @types version shares the source package's major, so the
+  // "latest" fallback was used instead — the resolved type surface is not
+  // actually versioned against this candidate and callers should not assert
+  // compatibility off it with full confidence.
+  majorMatched: boolean;
 }
 
 /**
@@ -270,7 +275,7 @@ export async function resolveTypesPackageTarball(
   const dist = metadata.versions[chosen]?.dist;
   if (!dist) return null;
 
-  return { version: chosen, tarball: dist.tarball };
+  return { version: chosen, tarball: dist.tarball, majorMatched: sameMajor.length > 0 };
 }
 
 export async function downloadTarball(

@@ -131,6 +131,11 @@ function startFakeRegistry(packages) {
             // packument manifest, not by inspecting the extracted tarball —
             // omitting `scripts` here silently skips postinstall etc.
             ...(info.scripts ? { scripts: info.scripts } : {}),
+            // Likewise, npm's arborist resolves the transitive dependency
+            // tree from this packument manifest, not from the tarball's own
+            // package.json — omitting `dependencies` here means npm never
+            // learns this version needs anything installed under it.
+            ...(info.dependencies ? { dependencies: info.dependencies } : {}),
           };
         }
         res.setHeader('content-type', 'application/json');
@@ -1187,6 +1192,352 @@ class FeatureTests {
     });
   }
 
+  // --- api-diff: no main/types/exports in manifest (issue #1) --------------
+
+  async testApiDiffInfersDefaultEntryWhenManifestHasNoEntryFields() {
+    await this.run('api-diff infers ./index.js + ./index.d.ts and follows export * into a directory, when the manifest declares no main/types/exports at all', async () => {
+      const v1 = await buildFakeTarball({
+        // Deliberately no main/types/typings/exports — the real-world
+        // @nestjs/axios tarball shape.
+        'package.json': JSON.stringify({ name: 'fx-no-entry', version: '1.0.0' }),
+        'index.js': "module.exports = require('./dist');",
+        'index.d.ts': "export * from './dist';\n",
+        'dist/index.d.ts':
+          'export declare class HttpService {}\nexport declare class HttpModule {}\n',
+      });
+      const registryUrl = await this.registry('fx-no-entry', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-no-entry');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { HttpModule, HttpService } from "fx-no-entry";\nHttpModule; HttpService;\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-no-entry', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true);
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.ok(json.versions[0].exportCount >= 2);
+    });
+  }
+
+  // --- api-diff: barrel of explicit named re-exports (issue #2) ------------
+
+  async testApiDiffFollowsBarrelNamedReexports() {
+    await this.run('api-diff follows a barrel .d.ts of explicit named re-exports across local files', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-barrel', version: '1.0.0', main: 'dist/index.js' }),
+        'dist/index.js': 'module.exports = {};',
+        'dist/index.d.ts':
+          'export { Client } from "./client/client";\nexport * from "./models/models";\n',
+        'dist/client/client.d.ts': 'export declare class Client {}\n',
+        'dist/models/models.d.ts':
+          'export declare enum FeeLevel { LOW, MEDIUM, HIGH }\nexport type TransactionRequest = { id: string };\n',
+      });
+      const registryUrl = await this.registry('fx-barrel', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-barrel-reexport');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { Client, FeeLevel, TransactionRequest } from "fx-barrel";\nClient; FeeLevel; TransactionRequest;\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-barrel', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, JSON.stringify(json.versions[0]));
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+    });
+  }
+
+  async testApiDiffBarrelPartialFailureOnlyFlagsGenuineMissing() {
+    await this.run('api-diff regression guard: a barrel resolving 3 of 4 symbols reports only the 4th as missing, not all 4', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-barrel', version: '1.0.0', main: 'dist/index.js' }),
+        'dist/index.js': 'module.exports = {};',
+        'dist/index.d.ts':
+          'export { Client } from "./client/client";\nexport * from "./models/models";\n',
+        'dist/client/client.d.ts': 'export declare class Client {}\n',
+        'dist/models/models.d.ts': 'export declare enum FeeLevel { LOW, MEDIUM, HIGH }\n',
+      });
+      const registryUrl = await this.registry('fx-barrel', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-barrel-partial');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { Client, FeeLevel, DoesNotExist } from "fx-barrel";\nClient; FeeLevel; DoesNotExist;\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-barrel', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, ['DoesNotExist']);
+      assert.strictEqual(json.versions[0].apiCompatible, false);
+    });
+  }
+
+  // --- api-diff: cross-package re-exports (issue #3) ------------------------
+
+  async testApiDiffCrossPackageReexportUnknownNotMissing() {
+    await this.run('api-diff marks symbols behind an unresolvable cross-package export * as unresolved, never as a false ❌', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-kit', version: '1.0.0', types: './dist/types/index.d.ts',
+          dependencies: { 'fx-sub': '^1.0.0' },
+        }),
+        'index.js': 'module.exports = {};',
+        // fx-sub is declared as a dependency but NOT bundled into this
+        // tarball's own node_modules — exactly the isolated-extraction gap
+        // issue #3 describes for @solana/kit's sibling @solana/* packages.
+        'dist/types/index.d.ts': 'export * from "fx-sub";\n',
+      });
+      const registryUrl = await this.registry('fx-kit', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-cross-pkg-unresolved');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address } from "fx-kit";\naddress("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-kit', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, null, 'must never be false — unverifiable, not incompatible');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, ['address']);
+    });
+  }
+
+  async testApiDiffCrossPackageReexportResolvesWhenSiblingBundled() {
+    await this.run('api-diff resolves a cross-package export * when the sibling package IS reachable on disk', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-kit', version: '1.0.0', types: './dist/types/index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'dist/types/index.d.ts': 'export * from "fx-sub";\n',
+        // Bundled inside this package's own node_modules, so the walk-up
+        // resolution used for bare specifiers finds it from pkgDir.
+        'node_modules/fx-sub/package.json': JSON.stringify({ name: 'fx-sub', version: '1.0.0', types: 'index.d.ts' }),
+        'node_modules/fx-sub/index.d.ts': 'export declare function address(s: string): string;\n',
+      });
+      const registryUrl = await this.registry('fx-kit', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-cross-pkg-resolved');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address } from "fx-kit";\naddress("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-kit', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, JSON.stringify(json.versions[0]));
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, []);
+    });
+  }
+
+  async testApiDiffExportsConditionMapWithNoDotKey() {
+    await this.run('api-diff resolves types from an exports map that has only environment condition keys, no "."', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-kit', version: '1.0.0',
+          exports: {
+            node: { types: './dist/node.d.ts', default: './dist/node.js' },
+            browser: { types: './dist/browser.d.ts', default: './dist/browser.js' },
+          },
+        }),
+        'dist/node.js': 'module.exports = {};',
+        'dist/node.d.ts': 'export declare function address(s: string): string;\n',
+        'dist/browser.js': 'module.exports = {};',
+        'dist/browser.d.ts': 'export declare function address(s: string): string;\n',
+      });
+      const registryUrl = await this.registry('fx-kit', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-exports-no-dot');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address } from "fx-kit";\naddress("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-kit', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, JSON.stringify(json.versions[0]));
+    });
+  }
+
+  // --- api-diff: default-import interop + @types package (issue #4) --------
+
+  async testApiDiffDefaultImportSatisfiedByInteropFlags() {
+    await this.run('api-diff does not flag "default" missing for a default import against a named-only @types module, when esModuleInterop is on', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-agent', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { startSegment(){} };',
+      });
+      const typesV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: '@types/fx-agent', version: '1.0.0', types: 'index.d.ts' }),
+        'index.d.ts': 'export declare function startSegment(name: string): void;\n',
+      });
+      const registryUrl = await this.registryMulti({
+        'fx-agent': { '1.0.0': { tarballBuffer: v1 } },
+        '@types/fx-agent': { '1.0.0': { tarballBuffer: typesV1 } },
+      });
+
+      const appDir = this.tmp('api-diff-interop-on');
+      fs.writeFileSync(
+        path.join(appDir, 'tsconfig.json'),
+        JSON.stringify({ compilerOptions: { esModuleInterop: true, allowSyntheticDefaultImports: true } }),
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import agent from "fx-agent";\nagent.startSegment("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-agent', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, JSON.stringify(json.versions[0]));
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+    });
+  }
+
+  async testApiDiffDefaultMissingSurvivesWithoutInteropFlags() {
+    await this.run('api-diff regression guard: with interop flags OFF, a genuinely-missing default import still reports missing', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-agent', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { startSegment(){} };',
+      });
+      const typesV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: '@types/fx-agent', version: '1.0.0', types: 'index.d.ts' }),
+        'index.d.ts': 'export declare function startSegment(name: string): void;\n',
+      });
+      const registryUrl = await this.registryMulti({
+        'fx-agent': { '1.0.0': { tarballBuffer: v1 } },
+        '@types/fx-agent': { '1.0.0': { tarballBuffer: typesV1 } },
+      });
+
+      const appDir = this.tmp('api-diff-interop-off');
+      fs.writeFileSync(
+        path.join(appDir, 'tsconfig.json'),
+        JSON.stringify({ compilerOptions: { esModuleInterop: false, allowSyntheticDefaultImports: false } }),
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import agent from "fx-agent";\nagent.startSegment("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-agent', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, false);
+      assert.deepStrictEqual(json.versions[0].missingSymbols, ['default']);
+    });
+  }
+
+  async testApiDiffTypesPackageMajorMismatchDowngradesFalseToUnknown() {
+    await this.run('api-diff downgrades a would-be false negative to unresolved when the @types package major does not track the candidate', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-agent2', version: '13.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { startSegment(){} };',
+      });
+      // @types package only ever published a 9.x — structurally can never
+      // share a major with a 13.x source, the newrelic/@types/newrelic shape.
+      const typesV1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: '@types/fx-agent2', version: '9.0.0', types: 'index.d.ts' }),
+        'index.d.ts': 'export declare function unrelatedExport(): void;\n',
+      });
+      const registryUrl = await this.registryMulti({
+        'fx-agent2': { '13.0.0': { tarballBuffer: v1 } },
+        '@types/fx-agent2': { '9.0.0': { tarballBuffer: typesV1 } },
+      });
+
+      const appDir = this.tmp('api-diff-types-mismatch');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { startSegment } from "fx-agent2";\nstartSegment();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-agent2', '--range', '>=13.0.0 <14.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, null, 'a mismatched @types major must not assert incompatibility');
+      assert.strictEqual(json.versions[0].typesPackageVersionMismatch, true);
+      assert.strictEqual(json.versions[0].typesPackage, '@types/fx-agent2');
+    });
+  }
+
+  // --- api-diff: ESM-only advisory (issue #8) -------------------------------
+
+  async testApiDiffEsmOnlyAdvisoryFiresWhenCandidateAddsTypeModule() {
+    await this.run('api-diff emits an ESM-only advisory when a candidate adds "type":"module" relative to the installed control version', async () => {
+      writeNodeModulesPackage(this.tmp('api-diff-esm-control-holder'), 'fx-resil', { name: 'fx-resil', version: '3.0.0' });
+      const appDir = this.tmp('api-diff-esm-advisory');
+      writeNodeModulesPackage(appDir, 'fx-resil', { name: 'fx-resil', version: '3.0.0', main: 'dist/index.js' }, {
+        'dist/index.js': 'exports.x = 1;',
+      });
+
+      const v4 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-resil', version: '4.0.0', main: 'dist/index.js', type: 'module' }),
+        'dist/index.js': 'export const x = 1;',
+        'dist/index.d.ts': 'export declare const x: number;\n',
+      });
+      const registryUrl = await this.registry('fx-resil', { '4.0.0': { tarballBuffer: v4 } });
+
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { x } from "fx-resil";\nx;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-resil', '--range', '>=4.0.0 <5.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, 'ESM-only is an advisory, not a static incompatibility');
+      assert.match(json.versions[0].esmOnlyAdvisory, /ESM-only/);
+    });
+  }
+
+  // --- api-diff: ESM-only dep + CJS interop is safe (issue #9 regression) --
+
+  async testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault() {
+    await this.run('api-diff regression guard: an ESM-only dependency with a real default export is NOT reported incompatible (the p-limit case)', async () => {
+      const v7 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-plimit', version: '7.0.0', types: './index.d.ts', type: 'module' }),
+        'index.js': 'export default function limit() {}',
+        'index.d.ts': 'export default function pLimit(concurrency: number): unknown;\n',
+      });
+      const registryUrl = await this.registry('fx-plimit', { '7.0.0': { tarballBuffer: v7 } });
+
+      const appDir = this.tmp('api-diff-esm-safe-default');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import limit from "fx-plimit";\nlimit(2);\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-plimit', '--range', '>=7.0.0 <8.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, true, 'a real ESM default export must resolve fine, no false alarm');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.strictEqual(json.versions[0].esmOnlyAdvisory, undefined, 'no control installed, so no advisory should fire either');
+    });
+  }
+
   // --- registry auth (--token / NPM_TOKEN / NODE_AUTH_TOKEN / .npmrc) ------
 
   async testApiDiffFailsWithHintOnPrivateRegistryWithoutToken() {
@@ -1340,6 +1691,311 @@ class FeatureTests {
     });
   }
 
+  async testCompatControlGateSuppressesRecommendationWhenInstalledVersionFails() {
+    await this.run('compat auto-tests the installed (control) version and suppresses any recommendation when it FAILS', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+        'helper.js': 'module.exports = "ok";',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('compat-control-gate');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      // The currently-installed version, so compat can resolve a control.
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'module.exports = {};',
+      });
+      // Fails against 1.0.0 (no helper.js) but passes against 2.0.0 — without
+      // the control gate this would look like a clean "upgrade to 2.0.0"
+      // recommendation even though the harness can't even confirm 1.0.0 (the
+      // version actually running today) works.
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'require("fake-lib/helper.js");\nprocess.exit(0);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib',
+        '--versions', '1.0.0,2.0.0',
+        '--app', appDir,
+        '--registry', registryUrl,
+        '--test', 'node check.js',
+        '--json',
+      ]);
+      assert.strictEqual(r.code, 7, `expected exit 7 (COMPAT_FAILED), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.control.version, '1.0.0');
+      assert.strictEqual(json.control.status, 'FAILED');
+      assert.strictEqual(json.controlFailed, true);
+      assert.strictEqual(json.minimumCompatibleVersion, null, 'recommendation must be suppressed when control fails');
+      assert.strictEqual(json.recommendedVersion, null);
+      // The 2.0.0 candidate itself still genuinely passed — the gate hides
+      // the recommendation, it doesn't lie about the per-version result.
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v2Result.status, 'PASSED');
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.match(human.stdout, /the test harness is broken, not the package/);
+      assert.match(human.stdout, /No recommendation emitted/);
+    });
+  }
+
+  async testCompatControlGateStaysQuietWhenInstalledVersionPasses() {
+    await this.run('compat regression guard: a passing control does not suppress a real recommendation', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-control-gate-ok');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'module.exports = {};',
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.control.version, '1.0.0');
+      assert.strictEqual(json.control.status, 'PASSED');
+      assert.strictEqual(json.controlFailed, false);
+      assert.strictEqual(json.recommendedVersion, '1.0.0');
+    });
+  }
+
+  async testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion() {
+    await this.run('compat --check-dupes fails a version whose bump nests a second copy of a dependency, even though the test command itself passes', async () => {
+      const inner1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-inner', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const inner2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-inner', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      // outer@1.0.0 needs inner ^1.0.0 (matches the app's own declared range
+      // — hoists to a single copy). outer@2.0.0 needs inner ^2.0.0, which the
+      // app's declared ^1.0.0 can't satisfy — npm nests a second inner copy
+      // under outer's own node_modules. Same shape as sqs-consumer 15
+      // requiring a newer @aws-sdk/client-sqs than the repo declared.
+      const outer1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-outer', version: '1.0.0', main: 'index.js',
+          dependencies: { 'fx-inner': '^1.0.0' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const outer2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-outer', version: '2.0.0', main: 'index.js',
+          dependencies: { 'fx-inner': '^2.0.0' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registryMulti({
+        'fx-inner': { '1.0.0': { tarballBuffer: inner1 }, '2.0.0': { tarballBuffer: inner2 } },
+        'fx-outer': {
+          '1.0.0': { tarballBuffer: outer1, dependencies: { 'fx-inner': '^1.0.0' } },
+          '2.0.0': { tarballBuffer: outer2, dependencies: { 'fx-inner': '^2.0.0' } },
+        },
+      });
+
+      const appDir = this.tmp('compat-check-dupes');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fx-outer': '^1.0.0', 'fx-inner': '^1.0.0' },
+      });
+      writeNodeModulesPackage(appDir, 'fx-outer', { name: 'fx-outer', version: '1.0.0', main: 'index.js' });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fx-outer',
+        '--versions', '1.0.0,2.0.0',
+        '--app', appDir,
+        '--registry', registryUrl,
+        '--test', 'node -e "process.exit(0)"',
+        '--check-dupes',
+        '--json',
+      ]);
+      assert.strictEqual(r.code, 7, `expected exit 7 (COMPAT_FAILED), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v1Result.dupeCounts['fx-inner'], 1);
+      assert.strictEqual(v1Result.status, 'PASSED');
+      assert.strictEqual(v2Result.dupeCounts['fx-inner'], 2, JSON.stringify(v2Result));
+      assert.strictEqual(v2Result.status, 'FAILED', 'a test command that passed must still be failed by the dupes regression');
+      assert.deepStrictEqual(v2Result.dupesRegression, [
+        { package: 'fx-inner', controlCopies: 1, candidateCopies: 2 },
+      ]);
+    });
+  }
+
+  async testCompatWithoutCheckDupesFlagDoesNotComputeDupeCounts() {
+    await this.run('compat regression guard: without --check-dupes, no dupeCounts/dupesRegression are computed', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-no-check-dupes');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].dupeCounts, undefined);
+      assert.strictEqual(json.versions[0].dupesRegression, undefined);
+    });
+  }
+
+  async testCompatReportsHermeticModeAndDetectedPackageManager() {
+    await this.run('compat reports hermetic sandbox mode + the detected package manager by default', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-mode-default');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      writeJson(path.join(appDir, 'package-lock.json'), { name: 'app', lockfileVersion: 3 });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.sandboxMode, 'hermetic');
+      assert.strictEqual(json.packageManager, 'npm');
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.match(human.stdout, /Sandbox mode: hermetic, package manager: npm/);
+    });
+  }
+
+  async testCompatHonoursPackageManagerFieldPin() {
+    await this.run('compat honours a nearest-ancestor package.json "packageManager" field (corepack pin)', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-pm-field');
+      // Pinned to the real npm on this machine so the sandbox install still
+      // actually succeeds — the point of this test is that the version comes
+      // from the "packageManager" field, not that a different manager runs.
+      const npmVersion = require('child_process')
+        .execFileSync('npm', ['--version'], { encoding: 'utf8' })
+        .trim();
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        packageManager: `npm@${npmVersion}`,
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.packageManager, `npm@${npmVersion}`);
+    });
+  }
+
+  async testCompatPackageManagerCliOverrideWins() {
+    await this.run('compat --package-manager overrides both the packageManager field and the lockfile', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-pm-override');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        packageManager: 'yarn@1.22.22',
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // The field says yarn, but --package-manager must win — and must still
+      // actually drive the sandboxed install, so pin it to the real npm on
+      // this machine rather than a manager that may not be installed here.
+      const npmVersion = require('child_process')
+        .execFileSync('npm', ['--version'], { encoding: 'utf8' })
+        .trim();
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js',
+        '--package-manager', `npm@${npmVersion}`, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.packageManager, `npm@${npmVersion}`);
+    });
+  }
+
+  async testCompatModeWorkspaceErrorsWithoutAMonorepoRoot() {
+    await this.run('compat --mode workspace fails clearly when no workspaces root can be found', async () => {
+      const appDir = this.tmp('compat-mode-workspace-no-root');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', 'http://127.0.0.1:1', '--test', 'node -e "process.exit(0)"',
+        '--mode', 'workspace', '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0, 'expected a non-zero exit');
+      assert.match(r.stderr + r.stdout, /--mode workspace requested, but no workspaces root/);
+    });
+  }
+
+  async testCompatModeRejectsInvalidValue() {
+    await this.run('compat --mode rejects a value that is not hermetic or workspace', async () => {
+      const appDir = this.tmp('compat-mode-invalid');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', 'http://127.0.0.1:1', '--test', 'node -e "process.exit(0)"',
+        '--mode', 'bogus', '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0, 'expected a non-zero exit');
+      assert.match(r.stderr + r.stdout, /--mode must be/);
+      assert.match(r.stderr + r.stdout, /hermetic/);
+      assert.match(r.stderr + r.stdout, /workspace/);
+    });
+  }
+
   async testCompatDistinguishesInstallFailure() {
     await this.run('compat reports INSTALL_FAILED distinctly from a test failure', async () => {
       const v1 = await buildFakeTarball({
@@ -1443,6 +2099,7 @@ class FeatureTests {
       assert.strictEqual(r.code, 7, `expected exit 7, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.notStrictEqual(json.versions[0].status, 'SKIPPED', 'a real install must have been attempted, not skipped, once a monorepo root is discoverable');
+      assert.strictEqual(json.sandboxMode, 'workspace');
     });
   }
 
@@ -1922,6 +2579,36 @@ class FeatureTests {
     });
   }
 
+  async testCompatUndeclaredPackageNamesSiblingWorkspacesThatDeclareIt() {
+    await this.run('compat names sibling workspaces that DO declare the package, when --app does not', async () => {
+      const monorepoRoot = this.tmp('compat-undeclared-workspace-hint');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: {},
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const apiDir = path.join(monorepoRoot, 'packages', 'api');
+      fs.mkdirSync(apiDir, { recursive: true });
+      writeJson(path.join(apiDir, 'package.json'), {
+        name: '@acme/api', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', 'http://127.0.0.1:1', '--test', 'node check.js',
+      ]);
+      assert.notStrictEqual(r.code, 0, 'expected a non-zero exit for an undeclared package');
+      assert.match(r.stderr, /not declared/i);
+      assert.match(r.stderr, /@acme\/api/, 'error should name the sibling workspace that declares fake-lib');
+    });
+  }
+
   async testCompatGroupComposesWithBisect() {
     await this.run('compat --group composes with --bisect across the whole family', async () => {
       const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0', '3.0.0']);
@@ -2124,10 +2811,10 @@ class FeatureTests {
       assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, true);
-      assert.strictEqual(json.resolutions.length, 2);
-      const versions = json.resolutions.map((res) => res.version).sort();
+      assert.strictEqual(json.copies.length, 2);
+      const versions = json.copies.map((res) => res.version).sort();
       assert.deepStrictEqual(versions, ['1.1.2', '1.3.0']);
-      assert.ok(json.resolutions.every((res) => typeof res.realpath === 'string'));
+      assert.ok(json.copies.every((res) => typeof res.realpath === 'string'));
     });
   }
 
@@ -2140,7 +2827,7 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, false);
-      assert.strictEqual(json.resolutions.length, 1);
+      assert.strictEqual(json.copies.length, 1);
     });
   }
 
@@ -2153,7 +2840,7 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, false);
-      assert.deepStrictEqual(json.resolutions, []);
+      assert.deepStrictEqual(json.copies, []);
     });
   }
 
@@ -2173,7 +2860,7 @@ class FeatureTests {
       // assertion here is that it terminated at all (no hang/crash on the cycle).
       assert.strictEqual(r.code, 5, `expected exit 5 (no hang/crash), got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
-      assert.strictEqual(json.resolutions.length, 2, 'should still find both real resolutions despite the cycle');
+      assert.strictEqual(json.copies.length, 2, 'should still find both real resolutions despite the cycle');
     });
   }
 
@@ -2198,9 +2885,9 @@ class FeatureTests {
       assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, true);
-      assert.strictEqual(json.resolutions.length, 2);
+      assert.strictEqual(json.copies.length, 2);
       assert.deepStrictEqual(json.scannedWorkspaces.length, 1);
-      const versions = json.resolutions.map((res) => res.version).sort();
+      const versions = json.copies.map((res) => res.version).sort();
       assert.deepStrictEqual(versions, ['1.0.0', '2.0.0']);
     });
   }
@@ -2221,7 +2908,7 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0 (workspace copy not scanned), got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, false);
-      assert.strictEqual(json.resolutions.length, 1);
+      assert.strictEqual(json.copies.length, 1);
       assert.strictEqual(json.workspacesDetected.length, 1);
       assert.strictEqual(json.scannedWorkspaces.length, 0);
     });
@@ -2237,7 +2924,7 @@ class FeatureTests {
       assert.strictEqual(r.code, 5, `expected exit 5, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'dupes');
       assert.strictEqual(json.duplicate, true, 'same version at two different realpaths is still a duplicate');
-      assert.strictEqual(json.resolutions.length, 2);
+      assert.strictEqual(json.copies.length, 2);
     });
   }
 
@@ -2347,7 +3034,7 @@ class FeatureTests {
       const r = await runPackdev(dir, ['dupes', 'left-pad', '--root', childDir, '--json']);
       assert.strictEqual(r.code, 0);
       const json = parseJson(r.stdout, 'dupes');
-      assert.strictEqual(json.resolutions.length, 0);
+      assert.strictEqual(json.copies.length, 0);
       assert.ok(json.resolvedViaParent, 'should report the parent resolution instead of a bare empty result');
       assert.strictEqual(json.resolvedViaParent.version, '1.3.0');
     });
@@ -2361,7 +3048,7 @@ class FeatureTests {
       const r = await runPackdev(dir, ['dupes', 'totally-nonexistent-pkg-xyz', '--json']);
       assert.strictEqual(r.code, 0);
       const json = parseJson(r.stdout, 'dupes');
-      assert.strictEqual(json.resolutions.length, 0);
+      assert.strictEqual(json.copies.length, 0);
       assert.strictEqual(json.resolvedViaParent, null);
     });
   }
@@ -2585,11 +3272,31 @@ class FeatureTests {
       await this.testApiDiffCountsSubpathExportsAsUsage();
       await this.testApiDiffReportsUnresolvedNotMissingOnBarrelExport();
       await this.testApiDiffStillReportsGenuineMissingSymbols();
+      await this.testApiDiffInfersDefaultEntryWhenManifestHasNoEntryFields();
+      await this.testApiDiffFollowsBarrelNamedReexports();
+      await this.testApiDiffBarrelPartialFailureOnlyFlagsGenuineMissing();
+      await this.testApiDiffCrossPackageReexportUnknownNotMissing();
+      await this.testApiDiffCrossPackageReexportResolvesWhenSiblingBundled();
+      await this.testApiDiffExportsConditionMapWithNoDotKey();
+      await this.testApiDiffDefaultImportSatisfiedByInteropFlags();
+      await this.testApiDiffDefaultMissingSurvivesWithoutInteropFlags();
+      await this.testApiDiffTypesPackageMajorMismatchDowngradesFalseToUnknown();
+      await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateAddsTypeModule();
+      await this.testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault();
       await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
       await this.testApiDiffAuthenticatesWithTokenFlag();
       await this.testApiDiffAuthenticatesWithNpmTokenEnv();
       await this.testApiDiffAutoDetectsRegistryAndTokenFromNpmrc();
       await this.testCompatPassFailPerVersion();
+      await this.testCompatControlGateSuppressesRecommendationWhenInstalledVersionFails();
+      await this.testCompatControlGateStaysQuietWhenInstalledVersionPasses();
+      await this.testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion();
+      await this.testCompatWithoutCheckDupesFlagDoesNotComputeDupeCounts();
+      await this.testCompatReportsHermeticModeAndDetectedPackageManager();
+      await this.testCompatHonoursPackageManagerFieldPin();
+      await this.testCompatPackageManagerCliOverrideWins();
+      await this.testCompatModeWorkspaceErrorsWithoutAMonorepoRoot();
+      await this.testCompatModeRejectsInvalidValue();
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
       await this.testCompatAttemptsRealInstallWhenMonorepoRootFound();
@@ -2606,6 +3313,7 @@ class FeatureTests {
       await this.testCompatGroupWithoutFlagSurfacesMismatch();
       await this.testCompatGroupMovesFamilyTogether();
       await this.testCompatGroupErrorsOnUndeclaredMember();
+      await this.testCompatUndeclaredPackageNamesSiblingWorkspacesThatDeclareIt();
       await this.testCompatGroupComposesWithBisect();
       await this.testCompatBisectFindsBoundaryInFewerRuns();
       await this.testCompatBisectEverythingPasses();
