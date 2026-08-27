@@ -1,83 +1,21 @@
 # Contributing to PackDev
 
-Thank you for your interest in contributing to PackDev! This guide will help you get started.
-
-## 📋 Table of Contents
-
-- [Code of Conduct](#code-of-conduct)
-- [Getting Started](#getting-started)
-- [Development Setup](#development-setup)
-- [Project Structure](#project-structure)
-- [Development Workflow](#development-workflow)
-- [Testing](#testing)
-- [Code Standards](#code-standards)
-- [Submitting Changes](#submitting-changes)
-- [Release Process](#release-process)
-
-## Code of Conduct
-
-### Our Standards
-
-- **Be respectful**: Treat everyone with respect and kindness
-- **Be collaborative**: Work together towards common goals
-- **Be constructive**: Provide helpful feedback and criticism
-- **Be inclusive**: Welcome contributors of all backgrounds and experience levels
+Thank you for your interest in contributing to PackDev!
 
 ## Getting Started
 
-### Prerequisites
-
-- Node.js >= 16.0.0
-- npm or Yarn
-- Git
-- TypeScript knowledge (helpful but not required)
-
-### Fork and Clone
-
-1. Fork the repository on GitHub
-2. Clone your fork locally:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/packdev.git
-   cd packdev/packdev-lib
-   ```
-
-3. Add upstream remote:
-   ```bash
-   git remote add upstream https://github.com/ORIGINAL_OWNER/packdev.git
-   ```
-
-## Development Setup
-
-### Install Dependencies
+**Prerequisites**: Node.js >= 18.0.0, npm/Yarn/pnpm, Git.
 
 ```bash
-# Install all dependencies
+git clone https://github.com/YOUR_USERNAME/packdev.git
+cd packdev
+git remote add upstream https://github.com/dionmaicon/packdev.git
 npm install
-
-# Or with Yarn
-yarn install
-```
-
-### Build the Project
-
-```bash
-# Build TypeScript to JavaScript
 npm run build
-
-# Watch mode for continuous development
-npm run watch
-
-# Clean build artifacts
-npm run clean
 ```
 
-### Development Mode
-
+**Development mode** (run the CLI from TypeScript source, no build step):
 ```bash
-# Run in development mode without building
-npm run dev -- <command>
-
-# Examples:
 npm run dev -- init
 npm run dev -- status
 npm run dev -- --help
@@ -86,354 +24,89 @@ npm run dev -- --help
 ## Project Structure
 
 ```
-packdev-lib/
+packdev/
 ├── src/
-│   ├── index.ts           # CLI entry point
-│   ├── packageManager.ts  # Core package management logic
-│   └── utils.ts          # Utility functions
-├── dist/                  # Compiled JavaScript (generated)
+│   ├── index.ts            # CLI entry point (Commander.js)
+│   ├── mcp.ts               # `packdev mcp` — MCP server exposing api_diff/compat/dupes/behavior_diff
+│   ├── packageManager.ts    # init/finish/add/link/watch — local & git dependency swapping
+│   ├── api.ts, apiDiff.ts   # `api`/`api-diff` — static export-surface checks
+│   ├── compat.ts            # `compat` — sandboxed real-install/real-test runtime checks
+│   ├── dupes.ts             # `dupes` — duplicate resolved-copy detection
+│   ├── behaviorDiff.ts       # `behavior-diff` (experimental) — reachability-filtered shipped-code diff
+│   ├── registry.ts          # npm registry fetch/auth/tarball download+extract
+│   ├── appScan.ts           # scans the app's own source for real package usage
+│   ├── runtimeIntrospect.ts # sandboxed runtime introspection fallback for `api --introspect`
+│   ├── watch.ts             # `watch` — rebuild linked local deps on change
+│   └── utils.ts             # shared helpers
+├── dist/                    # compiled output (generated, not committed)
 ├── test/
-│   ├── unit/             # Unit tests
-│   ├── integration/      # Integration tests
-│   ├── git-hooks/        # Git hooks tests
-│   └── run-all-tests.js  # Test runner
-├── scripts/              # Build and utility scripts
-├── docs/                 # Documentation
-├── .github/
-│   └── workflows/        # GitHub Actions
-├── package.json
-├── tsconfig.json
-└── README.md
+│   ├── unit/                # unit + feature tests (CI-safe)
+│   ├── integration/         # real package.json manipulation workflows
+│   ├── git-hooks/           # pre-commit hook tests (need a TTY, local-only)
+│   └── docker/              # yarn-workspaces integration, real package manager behavior
+├── scripts/                 # build/pack/demo scripts
+├── docs/                    # this documentation
+└── .github/workflows/       # CI (ci.yml) + npm publish on release (deploy.yml)
 ```
-
-### Key Files
-
-- **`src/index.ts`**: Main CLI application with Commander.js
-- **`src/packageManager.ts`**: Core logic for managing dependencies
-- **`src/utils.ts`**: Shared utilities and helpers
-- **`.packdev.json`**: Configuration file (created by users)
 
 ## Development Workflow
 
-### 1. Create a Branch
-
 ```bash
-# Update your fork
-git fetch upstream
-git checkout main
-git merge upstream/main
-
-# Create a feature branch
+git fetch upstream && git checkout main && git merge upstream/main
 git checkout -b feature/your-feature-name
+
+# ... make changes ...
+
+npm run build && npm run lint && npm run typecheck
+npm run test:unit-only        # fast, CI-safe
+npm test                      # everything, including git-hooks tests (local only)
+
+git commit -m "feat: add support for pnpm package manager"
 ```
 
-### 2. Make Changes
-
-- Write clear, concise code
-- Follow existing code style
-- Add comments for complex logic
-- Update documentation as needed
-
-### 3. Test Your Changes
-
-```bash
-# Run all tests
-npm test
-
-# Run only unit tests
-npm run test:unit-only
-
-# Run integration tests
-npm run test:integration
-
-# Type checking
-npm run typecheck
-```
-
-### 4. Commit Your Changes
-
-```bash
-# Stage changes
-git add .
-
-# Commit with descriptive message
-git commit -m "feat: add new feature description"
-```
-
-#### Commit Message Format
-
-We follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-- `feat:` - New feature
-- `fix:` - Bug fix
-- `docs:` - Documentation changes
-- `style:` - Code style changes (formatting, etc.)
-- `refactor:` - Code refactoring
-- `test:` - Adding or updating tests
-- `chore:` - Build process or auxiliary tool changes
-
-Examples:
-```
-feat: add support for pnpm package manager
-fix: resolve path validation on Windows
-docs: update quick start guide
-test: add unit tests for packageManager
-```
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`.
 
 ## Testing
 
-### Test Structure
+| Suite | Location | Run with | CI |
+|---|---|---|---|
+| Unit/feature | `test/unit/` | `npm run test:unit-only` | ✅ |
+| Integration | `test/integration/` | `npm run test:integration` | ✅ |
+| Git hooks | `test/git-hooks/` | `npm test` (included) | ❌ needs a TTY |
+| Docker (real package managers) | `test/docker/` | `npm run test:docker` | manual |
 
-PackDev has three types of tests:
-
-1. **Unit Tests** (`test/unit/`)
-   - Test individual functions and modules
-   - Fast and isolated
-   - Run in CI/CD
-
-2. **Integration Tests** (`test/integration/`)
-   - Test complete workflows
-   - Use real package.json manipulation
-   - Run locally and in CI/CD (where possible)
-
-3. **Git Hooks Tests** (`test/git-hooks/`)
-   - Test Git pre-commit hooks
-   - Require TTY access
-   - Run only locally (not in CI/CD)
-
-### Running Tests
-
-```bash
-# All tests (includes git hooks)
-npm test
-
-# Unit tests only (CI-safe)
-npm run test:unit-only
-
-# Integration tests
-npm run test:integration
-
-# Specific test file
-node test/unit/packageManager.test.js
-```
-
-### Writing Tests
-
-When adding new features, include tests:
-
-```javascript
-// test/unit/myFeature.test.js
-const assert = require('assert');
-const { myFunction } = require('../../dist/utils');
-
-console.log('🧪 Testing myFunction...');
-
-// Test case 1
-assert.strictEqual(myFunction('input'), 'expected output');
-console.log('✅ Test case 1 passed');
-
-// Test case 2
-assert.throws(() => myFunction(null), Error);
-console.log('✅ Test case 2 passed');
-
-console.log('✅ All myFunction tests passed!\n');
-```
-
-### Demo Scripts
-
-Test your changes with demo scripts:
-
-```bash
-# Complete workflow demo
-npm run demo-workflow
-
-# Git hooks demo
-npm run demo-hooks
-
-# Package info
-npm run package-info
-```
+Feature tests (`test/unit/features.test.js`) run the built CLI as a subprocess against a local fake npm registry — no network calls, no real installs beyond what the test itself sandboxes. When adding a `compat`/`api-diff`/`dupes`/`behavior-diff` feature, add a test there following the existing pattern (`this.run('description', async () => { ... })`), and register it in the `runAll()` call list at the bottom of the file.
 
 ## Code Standards
 
-### TypeScript Guidelines
-
-- Use TypeScript features (types, interfaces, enums)
-- Avoid `any` type when possible
-- Document complex types
-- Use meaningful variable names
-
-### Code Style
-
-- **Indentation**: 2 spaces (no tabs)
-- **Quotes**: Single quotes for strings
-- **Semicolons**: Required
-- **Line length**: ~100 characters max
-- **Naming**:
-  - `camelCase` for variables and functions
-  - `PascalCase` for classes and interfaces
-  - `UPPER_CASE` for constants
-
-### Example
-
-```typescript
-// Good
-interface PackageConfig {
-  package: string;
-  location: string;
-  version: string;
-  type: 'local' | 'git';
-}
-
-function validatePackagePath(path: string): boolean {
-  const normalizedPath = normalizePath(path);
-  return fs.existsSync(normalizedPath);
-}
-
-// Avoid
-function validate(p: any) {
-  return fs.existsSync(p)
-}
-```
-
-### Error Handling
-
-- Provide clear, actionable error messages
-- Include context in errors
-- Validate user input early
-
-```typescript
-// Good
-if (!fs.existsSync(packageJsonPath)) {
-  throw new Error(
-    `package.json not found at ${packageJsonPath}\n` +
-    `Make sure you're running packdev from your project root.`
-  );
-}
-
-// Avoid
-if (!fs.existsSync(packageJsonPath)) {
+- TypeScript strict types — avoid `any`. 2-space indent, single quotes, semicolons required.
+- Errors should be actionable: name the exact path/value, not just "not found."
+  ```typescript
+  // Good
+  throw new Error(`package.json not found at ${packageJsonPath} — run packdev from your project root.`);
+  // Avoid
   throw new Error('File not found');
-}
-```
-
-### Documentation
-
-- Update README.md for user-facing changes
-- Update relevant docs in `docs/` folder
-- Add inline comments for complex logic
-- Update examples if behavior changes
+  ```
+- Comments explain *why* (a non-obvious constraint or workaround), not *what* — the code and types should already say what.
+- Update `README.md`/`docs/` for user-facing changes in the same PR.
 
 ## Submitting Changes
 
-### Pull Request Process
-
-1. **Update your branch**:
-   ```bash
-   git fetch upstream
-   git rebase upstream/main
-   ```
-
-2. **Push to your fork**:
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-3. **Create Pull Request**:
-   - Go to GitHub and create a PR
-   - Use a clear, descriptive title
-   - Fill out the PR template
-   - Reference any related issues
-
-### PR Title Format
-
-Follow conventional commits format:
-
-```
-feat: add support for pnpm
-fix: resolve Windows path issues
-docs: improve quick start guide
-```
-
-### PR Description
-
-Include:
-- **What**: What does this PR do?
-- **Why**: Why is this change needed?
-- **How**: How does it work?
-- **Testing**: How was it tested?
-- **Screenshots**: If applicable
-
-Example:
-```markdown
-## What
-Adds support for pnpm package manager
-
-## Why
-Users requested pnpm support in issue #123
-
-## How
-- Detects pnpm.lock files
-- Uses pnpm commands when detected
-- Falls back to npm if pnpm not installed
-
-## Testing
-- Added unit tests for pnpm detection
-- Tested manually with pnpm projects
-- All existing tests still pass
-```
-
-### Review Process
-
-- Maintainers will review your PR
-- Address feedback and update your PR
-- Once approved, a maintainer will merge
+1. `git fetch upstream && git rebase upstream/main`
+2. Push your branch and open a PR with a Conventional Commits-style title (`feat: add pnpm support`)
+3. Describe what/why/how it was tested
+4. A maintainer reviews and merges
 
 ## Release Process
 
-### Version Numbering
+Maintainers only — see [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) for the exact automation:
 
-We follow [Semantic Versioning](https://semver.org/):
-
-- **MAJOR**: Breaking changes
-- **MINOR**: New features (backward compatible)
-- **PATCH**: Bug fixes (backward compatible)
-
-### Creating a Release
-
-Maintainers only:
-
-1. **Update version**:
-   ```bash
-   npm version patch  # or minor, or major
-   ```
-
-2. **Update CHANGELOG**:
-   - Document all changes
-   - Group by type (features, fixes, breaking)
-
-3. **Create Git tag**:
-   ```bash
-   git push origin main --tags
-   ```
-
-4. **Create GitHub Release**:
-   - Go to GitHub Releases
-   - Create new release with tag
-   - Include changelog
-   - Publish release (triggers NPM publish via GitHub Actions)
+1. Bump `version` in `package.json` (semver — patch/minor/major)
+2. `npm install --package-lock-only` to sync the lockfile, commit both
+3. `gh release create v<version> --title v<version> --notes "..."` — creating the **GitHub Release** (not just a git tag) triggers `deploy.yml`, which runs the full test suite and publishes to npm automatically
+4. A bare `git tag && git push --tags` does **not** trigger publish — it must go through a GitHub Release
 
 ## Questions?
 
-- **Bug reports**: [Open an issue](https://github.com/OWNER/packdev/issues)
-- **Feature requests**: [Open an issue](https://github.com/OWNER/packdev/issues)
-- **Questions**: [Start a discussion](https://github.com/OWNER/packdev/discussions)
-
-## Recognition
-
-Contributors will be:
-- Listed in CHANGELOG.md
-- Mentioned in release notes
-- Credited in the repository
-
-Thank you for contributing to PackDev! 🎉
+- Bug reports / feature requests: [open an issue](https://github.com/dionmaicon/packdev/issues)
+- Questions: [start a discussion](https://github.com/dionmaicon/packdev/discussions)

@@ -18,6 +18,7 @@ import { version } from "../package.json";
 import { runApiDiff } from "./apiDiff";
 import { runCompat, runCompatBisect, type CompatOptions } from "./compat";
 import { findDuplicateResolutions } from "./dupes";
+import { runBehaviorDiff } from "./behaviorDiff";
 import { loadNpmrcConfig, resolveRegistryForPackage, resolveAuthToken } from "./registry";
 
 // The discipline from the README's "add this to your agent instructions"
@@ -167,13 +168,48 @@ export function createPackdevMcpServer(): McpServer {
           .describe(
             'Version range to resolve candidates from instead of listing them explicitly, e.g. ">=1.0.0 <3.0.0" — mutually exclusive with `versions`',
           ),
-        app: z.string().default(".").describe("App directory to test"),
+        app: z.string().default(".").describe("Primary app directory to test — used for `range`/control resolution"),
+        consumerApps: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Extra workspace directories to test as fan-out consumers alongside `app`, in the " +
+              "same sandbox. Testing only the owning package's own tests is a much weaker claim " +
+              "than testing what actually depends on it. Requires a discoverable monorepo root " +
+              "above `app` (consumers are sibling packages). Mutually exclusive with `fanOut`.",
+          ),
+        fanOut: z
+          .boolean()
+          .optional()
+          .describe(
+            "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
+              "monorepo root (other than `app`) that directly declares `package`, ranked by how " +
+              "many distinct symbols it imports from it and capped at `fanOutTop`.",
+          ),
+        fanOutTop: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Cap on auto-discovered fan-out consumers (`fanOut` only). Default 5."),
+        testScript: z
+          .string()
+          .optional()
+          .describe(
+            'Run "<detected package manager> run <testScript>" in each target\'s own directory ' +
+              "instead of `test` for all of them — consumers rarely share one test command.",
+          ),
         test: z
           .string()
+          .optional()
           .describe(
-            'Command to run in each sandboxed version, e.g. "npm run build && npm test" — ' +
-              "should include your real test suite, not just a type check, which cannot see " +
-              "runtime-only failures",
+            'Command to run in each sandboxed version/target, e.g. "npm run build && npm test" — ' +
+              "should include your real test suite, not just a type check: a bare `tsc --noEmit` " +
+              "can see a broken type surface but nothing runtime-only (an ESM-only bump, a " +
+              "duplicate-copy regression, an actual behavior change), while a transpile-only " +
+              "jest setup (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the " +
+              "dependency's types at all. The response's testCommandCaveats[] reports which of " +
+              "these it detected for this exact command. Required unless testScript is given.",
           ),
         registry: z.string().optional().describe("npm registry URL, used for the sandboxed install"),
         token: z
@@ -207,7 +243,18 @@ export function createPackdevMcpServer(): McpServer {
           .optional()
           .describe(
             "After each install, fail a version whose duplicate-copy count for the package " +
-              "or its direct dependencies increased relative to the control",
+              "or its direct dependencies increased relative to the control — pair with " +
+              "seedLockfile, otherwise a fresh solve can re-flatten away exactly the nested-" +
+              "fork duplicate this is meant to catch",
+          ),
+        seedLockfile: z
+          .boolean()
+          .optional()
+          .describe(
+            "Copy the app's own lockfile into every sandbox before install, reproducing real " +
+              "resolution stickiness instead of a fresh solve. Less hermetic (a stale lockfile " +
+              "can mask a resolution a clean install would surface), but the condition " +
+              "checkDupes needs to see a nested-fork regression.",
           ),
         mode: z
           .enum(["hermetic", "workspace"])
@@ -230,6 +277,9 @@ export function createPackdevMcpServer(): McpServer {
         }
         if (args.range && args.versions && args.versions.length > 0) {
           throw new Error("`range` and `versions` are mutually exclusive");
+        }
+        if (!args.test && !args.testScript) {
+          throw new Error("Either `test` or `testScript` must be provided");
         }
         const appDir = args.app ?? ".";
         const { registryUrl, token } = await resolveRegistryAndToken(
@@ -256,6 +306,11 @@ export function createPackdevMcpServer(): McpServer {
           ...(args.concurrency !== undefined ? { concurrency: args.concurrency } : {}),
           ...(args.preferOffline !== undefined ? { preferOffline: args.preferOffline } : {}),
           ...(args.checkDupes !== undefined ? { checkDupes: args.checkDupes } : {}),
+          ...(args.seedLockfile !== undefined ? { seedLockfile: args.seedLockfile } : {}),
+          ...(args.consumerApps !== undefined ? { consumerApps: args.consumerApps } : {}),
+          ...(args.fanOut !== undefined ? { fanOut: args.fanOut } : {}),
+          ...(args.fanOutTop !== undefined ? { fanOutTop: args.fanOutTop } : {}),
+          ...(args.testScript !== undefined ? { testScript: args.testScript } : {}),
           ...(args.mode !== undefined ? { mode: args.mode } : {}),
           ...(args.packageManager !== undefined ? { packageManager: args.packageManager } : {}),
         };
@@ -303,6 +358,71 @@ export function createPackdevMcpServer(): McpServer {
           copies: resolutions,
           ...rest,
         });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "behavior_diff",
+    {
+      title: "PackDev behavior-diff (EXPERIMENTAL)",
+      description:
+        "EXPERIMENTAL. Diffs a package's shipped code between the installed version and `to`, " +
+        "filtered to functions reachable from what `app` actually imports/passes as option-bag " +
+        "keys — the one class of break neither api_diff (types only) nor compat (pass/fail, no " +
+        "attribution) can point at directly: a semantic change with a near-identical type surface " +
+        "(e.g. a callback's return value changing from 'acknowledge' to 'requeue' semantics). " +
+        "Reports evidence only — which lines changed and which import/option-key pulled them in " +
+        "— never a verdict; do not report a change here as a confirmed behavior break without " +
+        "reading the diff yourself. Function-matching (by name) and reachability (textual " +
+        "mention, not a real call graph) are both best-effort heuristics: expect false negatives. " +
+        "`degraded` (non-null) means no diff could be produced (native/wasm, minified/bundled " +
+        "output, or no compiled JS found) — `changes` is always [] in that case.",
+      inputSchema: {
+        package: z.string().describe("Package name to check"),
+        to: z.string().describe("Version to diff against the installed (control) version"),
+        app: z
+          .string()
+          .default(".")
+          .describe("App directory to scan for usage, and to resolve the installed (from) version from"),
+        registry: z
+          .string()
+          .optional()
+          .describe("npm registry URL (defaults to .npmrc resolution, then the public registry)"),
+        token: z.string().optional().describe("Bearer token for a private registry"),
+        maxDepth: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Local-require hops to walk out from the entry file, per version. Default 3."),
+        maxResults: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Cap on distinct changed/added/removed functions returned. Default 20."),
+      },
+    },
+    async (args) => {
+      try {
+        const appDir = args.app ?? ".";
+        const { registryUrl, token } = await resolveRegistryAndToken(
+          args.package,
+          appDir,
+          args.registry,
+          args.token,
+        );
+        const report = await runBehaviorDiff(args.package, args.to, {
+          appDir,
+          registryUrl,
+          token,
+          ...(args.maxDepth !== undefined ? { maxDepth: args.maxDepth } : {}),
+          ...(args.maxResults !== undefined ? { maxResults: args.maxResults } : {}),
+        });
+        return jsonResult({ command: "behavior-diff", ...report });
       } catch (error) {
         return errorResult(error);
       }

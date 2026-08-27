@@ -1,601 +1,130 @@
 # PackDev Workflow Guide
 
-This guide explains the complete workflow for using `packdev` to manage package dependencies during development using local paths or git repositories.
+The complete `init`/`finish` cycle for local and git-repository dependency development.
 
-## 🔄 Core Workflow Cycle
-
-The PackDev workflow is based on a simple **init/finish cycle** that allows you to switch between local development and production-ready states:
+## Core Cycle
 
 ```
 Production State → init → Development State → finish → Production State
 ```
 
-### Key Principle: Configuration Persistence
+**Key principle**: `.packdev.json` is never deleted by `finish` — it's your persistent config, safe to restart the cycle from any time.
 
-**Important**: The `.packdev.json` configuration file is **never deleted** by the `finish` command. This allows you to easily restart the development cycle with the same local dependencies.
-
-## 📋 Complete Workflow Example
-
-### 1. Initial Setup
+## Walkthrough
 
 ```bash
-# Create configuration file
-packdev create-config
-
-# Add local dependencies to track
+# 1. Track dependencies (creates .packdev.json automatically)
 packdev add lodash ../my-local-lodash
 packdev add @myorg/utils ../shared/utils
+
+# 2. Switch to local development (auto-installs)
+packdev init
 ```
-
-**Result**: Creates `.packdev.json` with your local dependency mappings.
-
-### 2. Start Local Development
-
-```bash
-# Switch to local development mode
-packdev init  # Automatically runs npm/yarn/pnpm install
-```
-
-**What happens**:
-- ✅ Reads `.packdev.json` configuration
-- ✅ Updates `package.json` dependencies from `"lodash": "^4.17.21"` to `"lodash": "file:../my-local-lodash"`
-- ✅ Preserves original versions in `.packdev.json`
-- ✅ Validates that local paths exist
-- ✅ Automatically runs package manager install (use `--no-install` to skip)
-
-**package.json changes**:
+`init` rewrites `package.json`, preserving the original version in `.packdev.json`:
 ```diff
-{
   "dependencies": {
 -   "lodash": "^4.17.21",
 +   "lodash": "file:/absolute/path/to/my-local-lodash",
--   "@myorg/utils": "^2.1.0"
-+   "@myorg/utils": "file:/absolute/path/to/shared/utils"
   }
-}
 ```
-
-### 3. Development Work
-
 ```bash
-# Your project now uses local versions (already installed by packdev init)
-# Make changes to both your project and local packages
-# Test, debug, iterate...
+# 3. Develop, test, iterate against both projects
 
-# Commit work-in-progress (if hooks are set up)
-git commit -m "WIP: testing new features with local packages"
+# 4. Restore production versions (auto-installs)
+packdev finish
 ```
+`finish` reverses the diff exactly, keeps `.packdev.json` intact, and updates its `lastModified` timestamp. Repeat the cycle as needed — nothing about step 1 needs to happen again.
 
-### 4. Finish Development
-
-```bash
-# Restore original versions
-packdev finish  # Automatically runs npm/yarn/pnpm install
-```
-
-**What happens**:
-- ✅ Reads `.packdev.json` configuration
-- ✅ Restores `package.json` dependencies from `"lodash": "file:../my-local-lodash"` back to `"lodash": "^4.17.21"`
-- ✅ **Keeps `.packdev.json` intact** for future use
-- ✅ Updates `lastModified` timestamp
-- ✅ Automatically runs package manager install (use `--no-install` to skip)
-
-**package.json changes**:
-```diff
-{
-  "dependencies": {
--   "lodash": "file:/absolute/path/to/my-local-lodash",
-+   "lodash": "^4.17.21",
--   "@myorg/utils": "file:/absolute/path/to/shared/utils"
-+   "@myorg/utils": "^2.1.0"
-  }
-}
-```
-
-### 5. Repeat Cycle
-
-```bash
-# You can immediately start development again
-packdev init
-
-# The same local dependencies are restored
-# Continue with your development workflow
-```
-
-## 🔧 Workflow Commands
+## Commands
 
 | Command | Purpose | Modifies package.json | Modifies .packdev.json |
-|---------|---------|---------------------|---------------------|
-| `create-config` | Create new configuration | ❌ No | ✅ Creates |
-| `add <pkg> <path>` | Add local dependency | ❌ No | ✅ Updates |
-| `remove <pkg>` | Remove local dependency | ❌ No | ✅ Updates |
-| `list` | Show configured dependencies | ❌ No | ❌ Read-only |
-| `init` | Switch to local development | ✅ Local paths | ✅ Timestamps |
-| `finish` | Restore original versions | ✅ Restore | ✅ Timestamps |
-| `status` | Show current state | ❌ No | ❌ Read-only |
+|---|---|---|---|
+| `create-config` | Create config (rarely needed — `add` does this) | ❌ | ✅ creates |
+| `add <pkg> <path\|url\|semver>` | Track a local/git/version override | ❌ | ✅ updates |
+| `remove <pkg>` | Untrack a dependency | ❌ | ✅ updates |
+| `list` | Show tracked dependencies | ❌ | read-only |
+| `init` | Switch to local development | ✅ local/git paths | ✅ timestamp |
+| `finish` | Restore production versions | ✅ restore | ✅ timestamp |
+| `status` | Show current state | ❌ | read-only |
 
-## 🎯 Common Workflow Patterns
+## Branch Switching Without Conflicts
 
-### Daily Development Cycle
+The workflow's most practical daily benefit: `packdev finish` before switching branches means no `file:`-dependency merge conflicts and no "uncommitted changes" warnings blocking `git checkout`.
 
 ```bash
-# Morning: Start working on feature
-packdev init  # Automatically installs dependencies
-
-# ... development work ...
-
-# Evening: Commit progress
-packdev finish  # Automatically restores and reinstalls
-git add .
-git commit -m "implement new authentication feature"
-
-# Next morning: Continue work
-packdev init  # Automatically reinstalls with local deps
-# Continue where you left off
+packdev init                        # local dev active
+packdev finish                      # clean package.json instantly
+git checkout hotfix/urgent-fix      # ✅ no conflicts, anywhere
+# ... fix, review a PR, whatever ...
+git checkout your-feature-branch
+packdev init                        # resume exactly where you left off
 ```
 
-### Feature Branch Development
+This composes with anything that needs a clean tree: stashing, reviewing a colleague's PR, testing a different feature branch — `finish` first, `init` again when you're back.
+
+## Safety Hooks
+
+`packdev setup-hooks` blocks a commit that would ship `file:`/relative-path dependencies unless the message contains `WIP` (or the commit is preceded by `packdev finish`). Full setup and the auto-commit flow: **[GitHub Hooks Guide](./GITHUB-HOOKS.md)**.
 
 ```bash
-# Create feature branch
-git checkout -b feature/new-ui
-
-# Start local development
-packdev init  # Automatically installs dependencies
-
-# Work with local packages
-# ... development work ...
-
-# Commit WIP to share with team
-git commit -m "WIP: new UI components with local design-system"
-git push origin feature/new-ui
-
-# When ready to merge
-packdev finish  # Automatically restores and reinstalls
-git add .
-git commit -m "finalize new UI components"
-git push origin feature/new-ui
-```
-
-### Git Branch Switching
-
-A powerful workflow benefit - clean branch switching without conflicts:
-
-```bash
-# Working on feature with local dependencies
-packdev init  # Development mode active
-
-# Need to switch branches urgently
-packdev finish  # Clean package.json automatically
-
-# Now you can switch branches freely
-git checkout main  # ✅ No "uncommitted changes" blocking you
-git checkout hotfix/security-fix  # ✅ Switch anywhere without conflicts
-
-# Back to your feature branch
-git checkout feature/new-ui
-packdev init  # Resume local development instantly
-```
-
-**Benefits:**
-- 🚫 **No merge conflicts** on package.json when switching branches
-- 🚫 **No "uncommitted changes"** warnings from git
-- ⚡ **Fast context switching** between branches
-- 🔄 **Easy experimentation** with different branches
-- 🧹 **Clean git status** before switching
-
-**Common scenarios:**
-```bash
-# Urgent hotfix needed while developing
-packdev finish  # Clean up instantly
-git stash  # Stash your work
-git checkout -b hotfix/urgent-fix
-# Fix the issue...
-git checkout feature/your-feature
-git stash pop
-packdev init  # Resume development
-
-# Review a colleague's PR
-packdev finish  # Clean package.json
-git fetch origin
-git checkout pr-branch  # No conflicts!
-# Review code...
-git checkout your-branch
-packdev init  # Back to work
-
-# Test different feature branches
-packdev finish  # Clean state
-git checkout feature-a && packdev init  # Test feature A
-packdev finish
-git checkout feature-b && packdev init  # Test feature B
-```
-
-### Multiple Project Development
-
-```bash
-# Project A - working on shared utilities
-cd project-a
-packdev add @shared/utils ../shared-utils
-packdev init  # Automatically installs
-
-# Project B - using the same shared utilities
-cd ../project-b
-packdev add @shared/utils ../shared-utils
-packdev init  # Automatically installs
-
-# Both projects now use your local @shared/utils
-# Changes in shared-utils affect both projects immediately
-```
-
-### Release Preparation
-
-```bash
-# Ensure clean state
 packdev status
-# Should show: "Development mode: 📦 Inactive"
-
-# If in dev mode, finish first
-packdev finish
-
-# Verify package.json is clean
-cat package.json | grep -E "(file:|\.\.\/)"
-# Should return nothing
-
-# Safe to build and release
-npm run build
-npm publish
-```
-
-## 🛡️ Safety Features
-
-### GitHub Hooks Integration
-
-When combined with GitHub hooks (`packdev setup-hooks`):
-
-```bash
-# This workflow is protected
-packdev init
-# ... development work ...
-git commit -m "add new features"  # ❌ BLOCKED by hook
-
-# Use WIP for development commits
-git commit -m "WIP: add new features"  # ✅ ALLOWED
-
-# Or finish development first
-packdev finish
-git commit -m "add new features"  # ✅ ALLOWED
-```
-
-### State Validation
-
-```bash
-# Check current state anytime
-packdev status
-
-# Example output:
-# 📊 Project Status:
-# Config file: ✅ Found
-# Package.json: ✅ Found
-# Development mode: 🔧 Active
-#
-# 📦 Configured dependencies:
+# 📊 Development mode: 🔧 Active
 #   🔧 Active 📁 Local lodash: ^4.17.21 → ../my-local-lodash
-#   🔧 Active 🔗 Git ui-components: ^2.0.0 → https://github.com/myorg/ui.git#feature
 ```
 
-## 📁 File Management
+## File Management
 
-### What Gets Modified
+| File | Role | Committed? |
+|---|---|---|
+| `.packdev.json` | Dependency mappings, original versions, timestamps | ⚠️ conditional — see [Team Collaboration](#team-collaboration) below |
+| `package.json` | Rewritten by `init`, restored by `finish` | Only ever commit it in its **restored** (`finish`'d) state |
 
-**`.packdev.json`** (Configuration - Persistent):
-- ✅ Created by `create-config`, `add`
-- ✅ Modified by `add`, `remove`, `init`, `finish`
-- ❌ **Never deleted** by any command
-- 📋 Contains: dependency mappings, original versions, timestamps
+**Backup strategy**: original versions are stored in `.packdev.json` *before* any `package.json` change, local paths are validated before switching, and `finish` always succeeds if the matching `init` succeeded — `packdev restore` recovers from a crash mid-operation.
 
-**`package.json`** (Dependencies - Temporary):
-- ✅ Modified by `init` (adds local paths)
-- ✅ Modified by `finish` (restores original versions)
-- ❌ Never modified by `add`, `remove`, `list`, `status`
+## What NOT to Do
 
-### Backup Strategy
+- **Don't delete `.packdev.json`** — it's meant to persist; `finish` needs it to know what to restore.
+- **Don't hand-edit `package.json` dependencies during development** — use `packdev add`/`remove`, then `init`/`finish`.
+- **Don't commit `package.json` with `file:`/git-path dependencies still active** — always `packdev finish` first, or use a `WIP:` commit message if hooks are set up.
 
-The workflow is designed to be safe:
-
-1. **Original versions** are stored in `.packdev.json` before any changes
-2. **Atomic operations** - either all dependencies switch or none do
-3. **Validation** - local paths are verified before switching
-4. **Rollback capability** - `finish` always works if `init` succeeded
-
-## 🚫 What NOT to Do
-
-### Don't Delete Configuration
-
-```bash
-# ❌ Don't do this
-rm .packdev.json
-packdev finish  # Will fail - config not found
-
-# ✅ Configuration is meant to be persistent
-# Keep .packdev.json in your project
-```
-
-### Don't Manually Edit package.json
-
-```bash
-# ❌ Don't manually edit dependencies during development
-# Let packdev manage the init/finish cycle
-
-# ✅ Use packdev commands to modify the configuration
-packdev add new-package ../path/to/package
-packdev remove old-package
-```
-
-### Don't Commit Local Dependencies
-
-```bash
-# ❌ Never commit package.json with file: dependencies
-git add package.json  # Contains "lodash": "file:../local"
-git commit -m "new feature"  # Bad!
-
-# ✅ Always finish development first
-packdev finish
-git add package.json  # Contains "lodash": "^4.17.21"
-git commit -m "new feature"  # Good!
-
-# ✅ Or use WIP commits during development
-git commit -m "WIP: new feature"  # Allowed by hooks
-```
-
-## 🔄 Advanced Workflows
+## Advanced
 
 ### Git Repository Dependencies
 
-Working with git repositories allows you to test unreleased features or specific branches without publishing to npm:
+Test unreleased branches/commits without publishing:
 
 ```bash
-# Add git repositories with specific branches/tags
 packdev add ui-components https://github.com/myorg/ui-components.git#feature-branch
 packdev add design-system git@github.com:myorg/design-system.git#develop
 packdev add beta-lib github:myorg/beta-lib#v2.0-beta
-
-# Mix local and git dependencies
-packdev add local-utils ../utils-lib
-packdev add remote-components https://github.com/external/components.git
-
-# Initialize - automatically downloads git repos and links local packages
-packdev init  # Handles both local and git dependencies
+packdev init   # downloads git deps, links local ones, in one pass
 ```
 
-**Git URL Patterns Supported:**
-- `https://github.com/user/repo.git` - HTTPS URLs
-- `git@github.com:user/repo.git` - SSH URLs  
-- `git+https://github.com/user/repo.git` - Git+HTTPS protocol
-- `github:user/repo` - GitHub shorthand
-- `gitlab:user/repo` - GitLab shorthand
-- All patterns support `#branch`, `#tag`, or `#commit` references
+Supported URL forms — all take `#branch`, `#tag`, or `#commit`: `https://github.com/user/repo.git`, `git@github.com:user/repo.git`, `git+https://...`, `github:user/repo`, `gitlab:user/repo`.
 
-### Mixed Local/Remote Development
+### Monorepo / Dependency Chains
 
 ```bash
-# Perfect for working on feature across multiple repos
-packdev add shared-types ../shared-types          # Local development
-packdev add ui-library https://github.com/myorg/ui.git#experiment
-packdev add third-party github:vendor/tools#beta
-
-packdev init  # Automatically installs all dependencies
-# Now testing: local changes + experimental UI + beta tools
-```
-
-### Monorepo Development
-
-```bash
-# Root package depends on workspace packages
 packdev add @myorg/package-a ./packages/package-a
 packdev add @myorg/package-b ./packages/package-b
-packdev init  # Automatically installs
-
-# All workspace packages are now linked locally
+packdev init
 ```
-
-### Dependency Chain Testing
-
-```bash
-# Package A depends on Package B depends on Package C
-# Test the entire chain locally
-
-# In Package A
-packdev add package-b ../package-b
-packdev add package-c ../package-c
-packdev init  # Automatically installs all in chain
-
-# Changes in Package C immediately affect Package A through B
-```
+Works transitively too — if A depends on B depends on C, adding both B and C as local overrides in A means a change in C is immediately visible through B, in A.
 
 ### Team Collaboration
 
-```bash
-# Share configuration across team
-git add .packdev.json
-git commit -m "add packdev configuration for shared development"
+`.packdev.json` is safe to commit if paths are relative and consistent across machines (a monorepo). If developers use different absolute local paths, add it to `.gitignore` instead — see the per-developer note in the [Quick Start Guide](./QUICK-START.md#team-collaboration).
 
-# Team members can use the same setup
-git pull
-packdev init  # Everyone gets the same setup, auto-installs
-```
+## Comparison with Alternatives (npm link / Verdaccio / Yalc)
 
-## 📊 Detailed Comparison with Alternatives
+Covered once, in the main README to avoid drift: **[README → vs alternatives](../README.md#vs-alternatives)**.
 
-PackDev is one of several tools for package development. Here's a detailed comparison to help you choose the right tool.
-
-### PackDev vs npm link
-
-| Aspect | PackDev | npm link |
-|--------|---------|----------|
-| **How it works** | Modifies package.json temporarily | Creates global symlinks |
-| **Setup complexity** | Simple (add + init) | Simple (link in both dirs) |
-| **Global state** | None | Global link directory |
-| **Multi-project** | Isolated per project | Conflicts between projects |
-| **Cleanup** | `packdev finish` | Manual unlink required |
-| **Safety** | Built-in hooks prevent commits | Easy to forget and commit |
-| **Git URLs** | ✅ Supported | ❌ Not supported |
-
-**Use npm link when**: You need quick one-off testing with symlinks
-
-**Use PackDev when**: You want project isolation and built-in safety
-
-### PackDev vs Verdaccio
-
-| Aspect | PackDev | Verdaccio |
-|--------|---------|-----------|
-| **How it works** | package.json swap | Private npm registry server |
-| **Setup** | Zero config | Install + run server |
-| **Infrastructure** | None needed | Requires running server |
-| **Use case** | Local development | Team private registry |
-| **Authentication** | Not needed | Full user/auth system |
-| **Publishing** | No publishing needed | Must publish packages |
-| **CI/CD** | Git URLs + file paths | Full registry features |
-
-**Use Verdaccio when**: You need a full private npm registry with authentication for your team
-
-**Use PackDev when**: You just want to test local changes without running infrastructure
-
-### PackDev vs Yalc
-
-| Aspect | PackDev | Yalc |
-|--------|---------|------|
-| **How it works** | package.json swap | Publish to local store + copy |
-| **Workflow** | init/finish | publish/push/update |
-| **Storage** | No storage needed | Global store (~/.yalc) |
-| **File handling** | Direct file: links | Copies files to .yalc/ |
-| **Git URLs** | ✅ Supported | ❌ Not supported |
-| **Safety hooks** | ✅ Built-in | ⚠️ Manual `yalc check` |
-| **State** | Project-isolated | Global store state |
-
-**Use Yalc when**: You prefer publish/push workflow and package copying
-
-**Use PackDev when**: You want simpler init/finish cycle and git URL support
-
-### Key Differentiators
-
-**PackDev's Unique Features:**
-
-1. **Git URL Support**: Test unreleased branches/commits from git repositories
-   ```bash
-   packdev add ui https://github.com/org/ui.git#experimental
-   ```
-
-2. **Built-in Safety Hooks**: Automatic git hooks prevent accidental commits
-   ```bash
-   packdev setup-hooks --auto-commit
-   ```
-
-3. **Mixed Dependencies**: Combine local paths and git URLs
-   ```bash
-   packdev add local-lib ../lib
-   packdev add remote-ui https://github.com/org/ui.git#dev
-   ```
-
-4. **No Global State**: Each project is completely isolated
-   - No global link directory (unlike npm link)
-   - No global store (unlike Yalc)
-   - No running server (unlike Verdaccio)
-
-5. **Simple Approach**: Direct package.json manipulation
-   - Easy to understand what's happening
-   - No intermediate storage or copying
-   - Transparent to package managers
-
-### When to Use What
-
-**Choose PackDev if:**
-- ✅ You want simple init/finish workflow
-- ✅ You need to test git repository branches
-- ✅ You want automatic safety against accidental commits
-- ✅ You prefer project-isolated configuration
-- ✅ You need CI/CD testing with git URLs
-
-**Choose npm link if:**
-- ✅ You need quick one-off symlink testing
-- ✅ You're comfortable with global state
-- ✅ You don't need safety features
-
-**Choose Verdaccio if:**
-- ✅ You need a full private npm registry
-- ✅ You want team authentication/authorization
-- ✅ You need to cache/proxy npmjs.org
-- ✅ You're okay running server infrastructure
-
-**Choose Yalc if:**
-- ✅ You prefer publish/push workflow
-- ✅ You want package copying instead of file: links
-- ✅ You don't need git URL support
-- ✅ You're okay with global store state
-
-## 💡 Best Practices
-
-### 1. Commit Configuration
+## Release Preparation
 
 ```bash
-# ✅ Commit the configuration to share with team
-git add .packdev.json
-git commit -m "add packdev config for local development"
+packdev status                       # confirm: Development mode: 📦 Inactive
+# if active:
+packdev finish
+grep -E "(file:|\.\.\/)" package.json  # should return nothing
+npm run build && npm publish           # or, for this repo: gh release create (see CONTRIBUTING.md)
 ```
-
-### 2. Document Dependencies
-
-```bash
-# ✅ Document in README.md
-echo "## Local Development" >> README.md
-echo "Use \`packdev init\` to switch to local/git dependencies" >> README.md
-echo "Use \`packdev finish\` to restore for production" >> README.md
-echo "See .packdev.json for configured local paths and git repositories" >> README.md
-```
-
-### 3. Use Status Checks
-
-```bash
-# ✅ Check status before important operations
-packdev status
-npm run build  # Only if development mode is inactive
-```
-
-### 4. Automate with Scripts
-
-```bash
-# ✅ Add npm scripts for common workflows
-# In package.json:
-{
-  "scripts": {
-    "dev:start": "packdev init",
-    "dev:end": "packdev finish",
-    "dev:status": "packdev status"
-  }
-}
-```
-
-### 5. Clean Branch Switching
-
-```bash
-# ✅ Always finish before switching branches
-packdev finish  # Clean package.json
-git checkout other-branch  # No conflicts!
-
-# ✅ This prevents:
-# - "uncommitted changes" warnings
-# - package.json merge conflicts
-# - Accidentally committing local dependencies to wrong branch
-```
-
-## 🎉 Summary
-
-The PackDev workflow is designed around **configuration persistence** and **safe state transitions**:
-
-- 🔧 **init** = Switch to local development (temporary state) + auto-install
-- 📦 **finish** = Restore production versions (permanent state) + auto-install
-- 📋 **Configuration** = Always preserved for easy restart
-- 🛡️ **Safety** = Hooks prevent accidental commits
-- 🔄 **Repeatable** = Use the same setup over and over
-- ⚡ **Automatic** = Package manager install runs automatically (use `--no-install` to skip)
-
-This allows you to seamlessly switch between local development and production-ready code while maintaining a clean, repeatable workflow.

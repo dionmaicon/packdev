@@ -1,6 +1,6 @@
 # API Compatibility Guide
 
-Four commands that answer "what's actually there" at increasing levels of confidence and cost — `api`, `api-diff`, `compat`, and `dupes`. They exist because LLMs and humans alike hallucinate methods that don't exist in the version actually resolved in a project (classic multi-package monorepo situation, e.g. NestJS's `@nestjs/*` family pinned to different versions across apps), and that isn't caught until CI or runtime.
+Five commands that answer "what's actually there" at increasing levels of confidence and cost — `api`, `api-diff`, `compat`, `dupes`, and the experimental `behavior-diff`. They exist because LLMs and humans alike hallucinate methods that don't exist in the version actually resolved in a project (classic multi-package monorepo situation, e.g. NestJS's `@nestjs/*` family pinned to different versions across apps), and that isn't caught until CI or runtime.
 
 ## 🧭 Which command do I need?
 
@@ -10,6 +10,7 @@ Four commands that answer "what's actually there" at increasing levels of confid
 | Which published versions have every symbol my app actually imports? (fast, no install) | `packdev api-diff <pkg> --range <semver>` |
 | Does my real test suite actually pass against a candidate version? (slower, real install) | `packdev compat <pkg> --test <cmd>` |
 | Is a weird `instanceof`/DI bug caused by two copies of the same package in the tree? | `packdev dupes <pkg>` |
+| `compat` failed (or I'm suspicious) and I want to know *what actually changed*, not just pass/fail? | `packdev behavior-diff <pkg> --to <version> --experimental` |
 
 **Start with `api-diff` before reaching for `compat`.** `api-diff` never installs anything — it downloads a tarball, reads its `.d.ts`, and diffs it against what your app actually imports — so checking a 10-version range costs about the same as checking one. `compat` does a real install + real test run per version, which is correct but slow. Use `api-diff` to narrow a range down first, then `compat` to actually confirm the survivors.
 
@@ -149,20 +150,26 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
     { "version": "3.0.1", "status": "PASSED", "exitCode": 0, "durationMs": 630,
       "lockfileHash": "394e9906…", "lockfileSnapshotPath": "/tmp/packdev-compat-snapshots-.../is-odd-3.0.1-npm-package-lock.json" }
   ],
-  "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1, "testCommandCaveat": null
+  "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1, "testCommandCaveat": null, "testCommandCaveats": [],
+  "seededLockfile": false, "lockfileSeedNote": null, "fanOutConsumers": []
 }
 ```
 
 | Flag | Purpose |
 |---|---|
-| `--test <cmd>` | **Required.** Command to run in each sandbox, e.g. `"npm test"`. |
+| `--test <cmd>` | Command to run in each sandbox, e.g. `"npm test"`. Required unless `--test-script` is given. |
+| `--test-script <name>` | Run `"<detected package manager> run <name>"` in each target's own directory instead of `--test` for all of them — consumers rarely share one test command, so with `--fan-out`/multi-target `--app` this is usually what you want. |
 | `--range <semver>` / `--versions <list>` | Mutually exclusive — a registry range, or an explicit comma-separated list. |
-| `--app <dir>`, `--registry <url>`, `--token <token>`, `--include-prerelease`, `--include-deprecated` | Same meaning and `.npmrc` auto-detection as `api-diff`. `--registry`/`--token` here only resolve `--range` — the sandbox's own real install always uses its package manager's normal `.npmrc` auth, unaffected by `--token`. |
+| `--app <dir>`, `--registry <url>`, `--token <token>`, `--include-prerelease`, `--include-deprecated` | Same meaning and `.npmrc` auto-detection as `api-diff`. `--registry`/`--token` here only resolve `--range` — the sandbox's own real install always uses its package manager's normal `.npmrc` auth, unaffected by `--token`. `--app` also accepts a comma-separated list (`libs/a,libs/b`) or a glob (`apps/*`, expanded from the current directory) — the first match is the primary app, the rest become fan-out consumers (see below). |
+| `--fan-out` | Auto-discover fan-out consumers instead of listing them in `--app`: every workspace under the monorepo root (other than `--app`) that directly declares `<pkg>`, ranked by how many distinct symbols it imports from it, capped at `--top`. |
+| `--top <n>` | Cap on auto-discovered fan-out consumers (`--fan-out` only, default 5) — fan-out multiplies wall clock per version. |
 | `--bisect` | Binary-search the pass/fail boundary instead of testing every version (fewer runs). Re-confirms the boundary once to catch flakiness/non-monotonicity, falling back to a full linear scan if the confirmation disagrees — never trusts a fast-but-wrong answer. |
 | `--group <pkgs>` | Comma-separated peer packages to pin to the **same** version as `<pkg>` in every run (NestJS's `@nestjs/*` family, or any set that must move in lockstep). Without this, only `<pkg>` moves — its declared peers stay wherever your `package.json` already has them, which usually isn't a combination anyone actually ships. |
 | `--snapshot-dir <dir>` | Save a hashed copy of each version's resolved lockfile — the target version pins exactly, but its *own* dependencies still resolve by range, so the same target version can mean a different dependency tree across two runs. Point repeated runs at the same directory to build a diffable history. |
 | `--concurrency <n>` | Test up to `n` versions in parallel (linear scan only — `--bisect`'s binary search is inherently sequential, this is a documented no-op there). |
 | `--prefer-offline` | Pass `--prefer-offline` through to the sandbox's package manager install. |
+| `--check-dupes` | After each sandboxed install, check for duplicate resolved copies of `<pkg>` and its direct dependencies; fail a version whose copy count increased relative to the control (`dupesRegression` on that version). |
+| `--seed-lockfile` | Copy the app's own lockfile into every sandbox before install, so the pin forces a minimal update against real resolution stickiness instead of a fresh solve. Recommended with `--check-dupes` — off by default because it's less hermetic: a stale lockfile can mask a resolution a clean install would surface. |
 
 - `status`: `"PASSED"` / `"FAILED"` (install succeeded, test command didn't) / `"INSTALL_FAILED"` (the install itself failed — native build breakage, missing peer, etc. — distinct from a real test failure, so it doesn't masquerade as an API problem) / `"SKIPPED"` (couldn't even be sandboxed — see below).
 - **`workspace:`-protocol dependencies are handled, not just diagnosed**: if the app's `package.json` declares a `workspace:`-protocol dependency (`"workspace:*"`, `"workspace:^"`, the yarn/pnpm workspaces convention), `compat` finds the monorepo root (walking up for a `package.json` with `workspaces` or a `pnpm-workspace.yaml`) and sandboxes the **whole monorepo**, not just the app — so sibling workspace packages physically exist in the sandbox and those specifiers resolve normally. The install runs at the sandboxed monorepo root; the test command runs at the sandboxed app's own directory within it. This needs a package manager that actually understands `workspace:` (Yarn Berry / pnpm — npm and Yarn Classic don't); if the app's own detected manager doesn't, expect `INSTALL_FAILED` with that manager's real error, not a silent skip.
@@ -171,7 +178,15 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 - **`INSTALL_FAILED`/`SKIPPED` diagnostics**: human output prints the real reason under each such line (the package manager's actual stderr for `INSTALL_FAILED`, the blocking dependency names for `SKIPPED`) — `--json`'s `output` field has the same text if you're scripting against it instead.
 - `nonMonotonic: true` (linear scan only) means a fail sits between two passes in version order — the assumption `--bisect` relies on doesn't hold for this package; test individually or accept the slower full scan.
 - Exact reproduction: `snapshotDir` + `lockfileSnapshotPath` per version are always present (auto-generated if `--snapshot-dir` wasn't passed) — diff two runs' snapshot files for the same version to see exactly what changed.
-- **A `PASSED` is only as trustworthy as `--test`.** `compat` runs your real command against real code — but if that command never actually exercises the dependency's types (a `ts-jest` config with `isolatedModules: true`, `babel-jest`, or `@swc/jest` all transpile TypeScript *without* type-checking it), a version with a genuinely broken/changed type surface can still report `PASSED`, because nothing ever reads the types. Prefer a `--test` command that includes a real build or type-check step (`tsc --noEmit`, `npm run build`) over a transpile-only test runner. When `--test` contains the word `jest` and the app's jest config looks transpile-only, `compat` sets `testCommandCaveat` (a human-readable warning string, `null` otherwise) and prints it — this is a best-effort heuristic over the config file, not a guarantee it catches every transpile-only setup.
+- **A `PASSED` is only as trustworthy as `--test`.** `compat` warns on the ways this can be true without meaning anything, all best-effort heuristics over your test command/config — false negatives are expected, they only need to catch the common cases:
+  - **`TRANSPILE_ONLY`**: `--test` contains `jest` and the app's config looks transpile-only (`ts-jest` with `isolatedModules: true`, `babel-jest`, `@swc/jest`) — these transpile TypeScript *without* type-checking it, so a version with a genuinely broken type surface can still report `PASSED`.
+  - **`TYPE_CHECK_ONLY`**: `--test` is bare `tsc`/`tsc --noEmit` and nothing else — the mirror case. A type check can't see anything runtime-only: an ESM-only bump, a duplicate-copy regression, an actual behavior change. Prefer a `--test` that includes your real test suite, not just one or the other.
+  - **`PASS_WITH_NO_TESTS`**: `--test` or the jest config sets `--passWithNoTests` — a run that matches zero test files still exits `0`, so `PASSED` may mean the suite never actually ran.
+  - **Per-version `esmMismatch`** (on each `CompatVersionResult`, not a report-level caveat — a package can go ESM-only in exactly one candidate, not the whole range): fires only when the app's own `--test` is a jest run that's CJS-blind to that candidate specifically (no evidence jest's default `transformIgnorePatterns` was customized) **and** the candidate looks ESM-only relative to the control (adds `"type":"module"`, or drops the CJS `require`/`default` export condition from its `exports` map). This is the one class of break a type-check-only `--test` structurally cannot see even with a real test suite configured, because Node's module loader and jest's CJS transform behave differently from `tsc` here.
+
+  `testCommandCaveat` (the first caveat's message, `null` if none) is kept for back-compat; `testCommandCaveats` is the full list of `{ code, severity, message }`. Both print in human output.
+- **`seededLockfile`/`lockfileSeedNote`**: `seededLockfile` is `true` only when `--seed-lockfile` was on **and** a matching lockfile for the detected/overridden package manager actually existed at the sandbox source root to copy — it confirms a real copy happened, not merely that the flag was passed. If nothing was found to seed, it's `false` even with `--seed-lockfile` set, and `lockfileSeedNote` says so explicitly. `lockfileSeedNote` is otherwise non-null whenever there's something worth saying about the choice — a reduced-hermeticity warning when seeding genuinely happened, or a recommendation to turn it on when `--check-dupes` is set without it (a fresh solve re-flattens the tree, which can hide exactly the nested-fork duplicate class `--check-dupes` was built to catch).
+- **Fan-out: test the dependents, not just the owner.** Testing only the package that declares `<pkg>` is a weak claim in a monorepo — its own tests can pass while a sibling workspace that actually exercises the changed behavior breaks. With `--fan-out` or a multi-target `--app`, every target is pinned and tested in **one shared sandbox** (this forces workspace sandbox mode — consumers are sibling packages, so a discoverable monorepo root is required above the primary `--app`). Each `CompatVersionResult.consumers[]` entry — `{ dir, name, status, exitCode, output }`, `dir: "."` for the primary app — is one target's own test run against that already-installed version; `status` at the top level becomes the **rollup**, `"PASSED"` only if every consumer passed. Report-level `fanOutConsumers` lists which dirs were actually tested (auto-discovered ones too), so you don't have to dig into a version to see who was covered. A workspace only reachable via hoisting (imports `<pkg>` but doesn't declare it) isn't eligible for auto-discovery — there's no section of its own `package.json` to pin the candidate version into.
 - **Non-zero exit on a real failure** (linear scan only): if any version comes back `FAILED` or `INSTALL_FAILED`, `compat` exits **`7`**, so it can gate a CI job the same way `dupes` gates on `5`. This does **not** apply to `--bisect` — its per-step `FAILED` results while narrowing the boundary are expected search mechanics, not a verdict, so they never flip the exit code; check `minimumCompatibleVersion`/`recommendedVersion` instead for a bisected run.
 
 **Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.), `6` every version was `SKIPPED` (nothing was actually tested), `7` at least one version genuinely `FAILED`/`INSTALL_FAILED` (linear scan only, not `--bisect`).
@@ -226,16 +241,54 @@ Exit code **`5`** on `duplicate: true` makes `dupes` usable directly as a CI gua
 
 Each resolution includes `realpath` (fully resolved, symlinks followed) alongside `path`, since realpath is what actually determines Node's module-identity — two `path`s that look different can still be the same realpath (a symlink), and vice versa.
 
-## Exit codes (all four commands)
+## 🔬 `packdev behavior-diff <pkg> --to <version>` (EXPERIMENTAL)
+
+The gap the other three commands can't close: a *semantic* change with a near-identical type surface, invisible to `api-diff` (types didn't move) and unattributed by `compat` (a test either passes or it doesn't — it doesn't say *why*). Example: a callback returning `undefined` changing meaning from "acknowledge" to "leave on the queue." `behavior-diff` diffs the package's actual shipped JS between the installed version and `--to`, filtered down to functions reachable from what your app imports and what option-bag keys it passes into calls on those imports (`Consumer.create({ handleMessage })` seeds `"handleMessage"` even though it's never imported — that key is how the reachable function gets found).
+
+**It reports evidence, never a verdict** — the same discipline `api-diff`'s `apiCompatible: null` uses. Output is "these lines changed and your code reaches them," not "this broke your app." Requires `--experimental`: function-matching (by name, across two versions' shipped code) and reachability (a textual-mention heuristic, not a real call graph) are both best-effort — expect false negatives, and always read the diff yourself before reporting a change as confirmed.
+
+```bash
+packdev behavior-diff sqs-consumer --to 15.0.3 --app . --experimental --json
+```
+```json
+{
+  "command": "behavior-diff", "package": "sqs-consumer", "from": "12.0.0", "to": "15.0.3",
+  "seedSymbols": ["Consumer"], "seedOptionKeys": ["handleMessage"], "degraded": null,
+  "changes": [
+    { "name": "executeHandler", "file": "dist/cjs/consumer.js", "reachableVia": ["handleMessage"],
+      "kind": "changed", "score": 6,
+      "diff": ["  if (result === undefined) {", "-   return message;", "+   return null;", "  }"] }
+  ],
+  "totalChanges": 1, "truncated": false
+}
+```
+
+| Flag | Purpose |
+|---|---|
+| `--to <version>` | **Required.** Version to diff against the installed (control) version, resolved from `--app`'s `node_modules`. |
+| `--app <dir>` | App directory to scan for usage and resolve the installed version from (default `.`). |
+| `--registry <url>`, `--token <token>` | Same meaning as the other commands. |
+| `--max-depth <n>` | Local-`require()` hops walked out from the entry file, per version (default `3`). |
+| `--max-results <n>` | Cap on distinct changed/added/removed functions returned (default `20`) — `totalChanges`/`truncated` report the real count either way. |
+| `--experimental` | **Required.** Explicit acknowledgment of the heuristic nature above. |
+
+- **Reachability seed** = every imported symbol (`api-diff`'s own `usedSymbols` scan) **plus** every object-literal key passed as an argument to a call whose callee traces back to one of those symbols — the option-bag pattern (`Consumer.create({ handleMessage })`) that a plain import scan can't see, since the key itself is never imported.
+- A function is reachable if its name or body textually mentions a seed identifier, or (up to 2 more rounds) mentions the name of an already-reachable function — a cheap stand-in for a real call graph, not one. False negatives (missing a real path) are expected and fine.
+- **`degraded`** (non-null) means no meaningful diff could be produced — `changes` is always `[]` in that case, never silently empty: a native (`.node`) or WebAssembly binary, a minified/bundled entry file, or a package shipping no resolvable compiled JS at all (TypeScript source only). The reason is always named, never a guess.
+- `changes[]` is ranked by a heuristic score (returns/throws/conditionals/`typeof`/equality/defaults count double) so the lines most likely to matter sort first — added/removed reachable functions always rank at the top, since a whole function appearing or disappearing is inherently significant.
+
+## Exit codes (all commands)
 
 | Code | Meaning |
 |---|---|
-| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` copies). |
-| `1` | Generic error — see the `error` field in `--json` output for the actual message. |
+| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` copies, `behavior-diff`'s `degraded`/empty `changes`). |
+| `1` | Generic error — see the `error` field in `--json` output for the actual message. `behavior-diff` without `--experimental` is this code. |
 | `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
 | `5` | `dupes` found `duplicate: true` — usable directly as a CI guard. |
 | `6` | `compat` — every version was `SKIPPED`; nothing was actually tested. |
 | `7` | `compat` — at least one version `FAILED`/`INSTALL_FAILED` (linear scan only; `--bisect` never sets this). |
+
+`behavior-diff` has no dedicated non-zero exit for "changes found" — it's evidence to read, not a pass/fail gate; don't wire it into CI as one.
 
 ## 🤖 Agent/scripting notes
 

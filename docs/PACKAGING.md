@@ -1,340 +1,65 @@
-# PackDev Packaging and Installation Guide
+# Packaging & Local Installation
 
-This guide explains how to package the PackDev library and install it locally for development and testing purposes using either npm or Yarn package managers.
+How to build a tarball and install it in another project for testing — before publishing.
 
-## Prerequisites
+## Build & Pack
 
-- Node.js >= 16.0.0
-- npm (comes with Node.js) OR Yarn package manager
-
-## Building and Packaging
-
-### Package Manager Detection
-
-The scripts automatically detect your preferred package manager:
-- If `yarn.lock` exists → uses Yarn
-- If `package-lock.json` exists → uses npm
-- Fallback: checks which command is available
-
-### Quick Start
-
-To build and package the library in one command:
-
-**With npm:**
 ```bash
-npm run pack
+npm run pack        # or: yarn pack
+```
+This builds TypeScript → `dist/`, creates `packdev-<version>.tgz`, and prints install instructions for both npm and Yarn. A cross-platform bash equivalent exists too: `npm run pack:bash`.
+
+Manual steps, if you want them separately:
+```bash
+npm run build   # tsc: src/ -> dist/
+npm pack        # dist/ + package.json + README.md + LICENSE.md -> .tgz
 ```
 
-**With Yarn:**
+The tarball's contents are controlled by `package.json`'s `"files"` field — currently `dist/**/*.js`, `dist/**/*.d.ts`, `README.md`, `LICENSE.md`. `src/`, `test/`, and dev config never ship.
+
+## Installing It Somewhere Else
+
 ```bash
-yarn pack
-```
+# From a tarball
+npm install ./packdev-0.4.0.tgz              # or: yarn add file:./packdev-0.4.0.tgz
 
-This will:
-1. Build the TypeScript source code to JavaScript
-2. Create a tarball (`.tgz` file)
-3. Display installation instructions for both package managers
+# Directly from the built directory (auto-updates when you rebuild)
+npm install /path/to/packdev                  # or: yarn add file:/path/to/packdev
 
-### Manual Steps
-
-If you prefer to run the steps manually:
-
-**With npm:**
-```bash
-# Build the library
-npm run build
-
-# Create the package tarball
-npm pack
-```
-
-**With Yarn:**
-```bash
-# Build the library
-yarn build
-
-# Create the package tarball
-yarn pack
-```
-
-### Alternative Pack Scripts
-
-We provide two pack scripts:
-
-- **Node.js script (recommended)**: `npm run pack` / `yarn pack`
-- **Bash script (Unix/Linux/macOS)**: `npm run pack:bash` / `yarn pack:bash`
-
-The Node.js script is cross-platform, automatically detects your package manager, and provides colored output with detailed instructions for both npm and Yarn.
-
-## Package Contents
-
-The generated tarball includes:
-
-- `dist/` - Compiled JavaScript and TypeScript declaration files
-- `package.json` - Package metadata
-- `README.md` - Project documentation
-- `LICENSE` - License file (if present)
-
-Files excluded from the package (as defined in `.npmignore` or `package.json` files field):
-- `src/` - TypeScript source files
-- `node_modules/` - Dependencies
-- `test/` - Test files
-- Development configuration files
-
-## Local Installation Methods
-
-### Method 1: Install from Tarball
-
-After running `npm run pack` or `yarn pack`, you'll get a file like `packdev-1.0.0.tgz`.
-
-**In another project with npm:**
-```bash
-# Copy the tarball to your project directory first
-npm install ./packdev-1.0.0.tgz
-
-# Using absolute path
-npm install /path/to/packdev/packdev-1.0.0.tgz
-```
-
-**In another project with Yarn:**
-```bash
-# Copy the tarball to your project directory first
-yarn add file:./packdev-1.0.0.tgz
-
-# Using absolute path
-yarn add file:/path/to/packdev/packdev-1.0.0.tgz
-```
-
-### Method 2: Install Directly from Directory
-
-You can install directly from the project directory without creating a tarball:
-
-**With npm:**
-```bash
-npm install /path/to/packdev
-```
-
-**With Yarn:**
-```bash
-yarn add file:/path/to/packdev
-```
-
-### Method 3: Global Installation
-
-To install the CLI tool globally:
-
-**With npm:**
-```bash
-# From tarball
-npm install -g ./packdev-1.0.0.tgz
-
-# From directory
-npm install -g /path/to/packdev
-```
-
-**With Yarn:**
-```bash
-# From tarball
-yarn global add file:./packdev-1.0.0.tgz
-
-# From directory
-yarn global add file:/path/to/packdev
-```
-
-After global installation, you can use the CLI from anywhere:
-```bash
+# Globally, to get the `packdev` binary on PATH
+npm install -g /path/to/packdev                # or: yarn global add file:/path/to/packdev
 packdev --help
 ```
 
-## Testing the Installation
+Yarn requires the `file:` protocol for local paths; npm accepts either form. See [Yarn Support](./YARN-SUPPORT.md) if anything here behaves differently under Yarn.
 
-### Local Installation Test
+## Verifying an Install
 
-In a project where you've installed packdev locally:
-
-**With npm:**
 ```bash
-# Test the CLI
-npx packdev --help
+packdev --help                                       # CLI works
+node -e "console.log(require('packdev'))"             # module resolves
 
-# Or if installed globally
-packdev --help
+# Inspect a tarball's contents before installing it, if you're suspicious
+tar -tzf packdev-0.4.0.tgz
 ```
 
-**With Yarn:**
+## Continuous Local Testing
+
+Point a real test project at the built directory instead of re-packing every time:
 ```bash
-# Test the CLI
-yarn packdev --help
-
-# Or if installed globally
-packdev --help
-```
-
-### Import Test
-
-Create a test file to verify the library can be imported:
-
-```javascript
-// test-import.js
-const packdev = require('packdev');
-console.log('Successfully imported packdev');
-```
-
-**Run the test:**
-```bash
-node test-import.js
-```
-
-## Uninstalling
-
-### Local Uninstall
-
-**With npm:**
-```bash
-npm uninstall packdev
-```
-
-**With Yarn:**
-```bash
-yarn remove packdev
-```
-
-### Global Uninstall
-
-**With npm:**
-```bash
-npm uninstall -g packdev
-```
-
-**With Yarn:**
-```bash
-yarn global remove packdev
+# In the test project
+npm install file:../path/to/packdev
+# Rebuilding packdev's dist/ is picked up automatically on next install/require
 ```
 
 ## Troubleshooting
 
-### Common Issues
+| Problem | Fix |
+|---|---|
+| `EACCES` on global install | `npm config set prefix ~/.npm-global` and add it to `PATH`, instead of `sudo` |
+| Build errors | `npm run clean && npm run build` |
+| "package not found" after install | Confirm the tarball built (`npm run pack` output), and that `dist/` actually contains compiled `.js`/`.d.ts` — a failed `tsc` run silently leaves a stale/partial `dist/` |
 
-1. **Permission Errors on Global Install**
-   
-   **With npm:**
-   ```bash
-   # Use sudo on Unix/Linux/macOS (not recommended)
-   sudo npm install -g ./packdev-1.0.0.tgz
-   
-   # Better: Configure npm to use a different directory
-   npm config set prefix ~/.npm-global
-   # Add ~/.npm-global/bin to your PATH
-   ```
-   
-   **With Yarn:**
-   ```bash
-   # Yarn typically handles global installs better
-   yarn global add file:./packdev-1.0.0.tgz
-   
-   # Check global directory
-   yarn global dir
-   ```
+## Publishing (maintainers)
 
-2. **Build Errors**
-   
-   **With npm:**
-   ```bash
-   # Clean and rebuild
-   npm run clean
-   npm run build
-   ```
-   
-   **With Yarn:**
-   ```bash
-   # Clean and rebuild
-   yarn clean
-   yarn build
-   ```
-
-3. **Package Not Found After Installation**
-   - Verify the tarball was created successfully
-   - Check that the `main` field in `package.json` points to the correct file
-   - Ensure the `dist/` directory contains the compiled files
-
-### Verifying Package Contents
-
-Before installation, you can inspect the tarball contents:
-
-```bash
-# List contents without extracting
-tar -tzf packdev-1.0.0.tgz
-
-# Extract to temporary directory for inspection
-mkdir temp-extract
-tar -xzf packdev-1.0.0.tgz -C temp-extract
-ls -la temp-extract/package/
-```
-
-## Development Workflow
-
-For active development with frequent testing:
-
-1. **Make changes** to the source code
-2. **Test locally** with `npm run dev` or `yarn dev`
-3. **Build and pack** with `npm run pack` or `yarn pack`
-4. **Install in test project** from tarball
-5. **Test the installation**
-6. **Repeat** as needed
-
-### Continuous Testing Setup
-
-You can set up a test project that automatically uses the latest build:
-
-**With npm:**
-```bash
-# In your test project
-npm install file:../path/to/packdev
-
-# This will use the built version and update when you rebuild
-```
-
-**With Yarn:**
-```bash
-# In your test project
-yarn add file:../path/to/packdev
-
-# This will use the built version and update when you rebuild
-```
-
-## Publishing to npm Registry
-
-When ready to publish to the public npm registry:
-
-**With npm:**
-```bash
-# Login to npm (one time setup)
-npm login
-
-# Publish (make sure to update version in package.json first)
-npm publish
-
-# Or for scoped packages
-npm publish --access public
-
-# Dry run first to see what would be published
-npm publish --dry-run
-```
-
-**With Yarn:**
-```bash
-# Login to npm registry (Yarn uses npm registry)
-yarn login
-
-# Publish (make sure to update version in package.json first)
-yarn publish
-
-# Or for scoped packages
-yarn publish --access public
-```
-
-Remember to:
-- Update the version number in `package.json`
-- Update the `CHANGELOG.md` or release notes
-- Test thoroughly before publishing
-- Consider using dry-run first to see what would be published
+This repo publishes via CI, not manual `npm publish` — see **[Contributing Guide → Release Process](./CONTRIBUTING.md#release-process)**: a GitHub Release (not a bare git tag) triggers `.github/workflows/deploy.yml`, which runs the full test suite and publishes to npm.

@@ -1884,6 +1884,40 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffNoFalseEsmAdvisoryWhenTypeModuleAddedButExportsKeepsRequireTarget() {
+    await this.run('api-diff regression guard: no false ESM-only advisory when a candidate adds "type":"module" but its exports map still declares an explicit require target', async () => {
+      // Control has no "type" field at all (implicitly CJS) and no
+      // "exports" override. Candidate adds "type":"module" — the naive
+      // check alone would flag this — but also ships an explicit "exports"
+      // map with a "require" condition, so CJS consumers keep working via
+      // that condition regardless of "type". Must NOT advise ESM-only.
+      const appDir = this.tmp('api-diff-esm-type-module-but-dual-exports');
+      writeNodeModulesPackage(appDir, 'fx-dual-type-module', { name: 'fx-dual-type-module', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'exports.x = 1;',
+      });
+
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-dual-type-module', version: '2.0.0', type: 'module',
+          exports: { '.': { types: './index.d.ts', import: './index.mjs', require: './index.cjs' } },
+        }),
+        'index.d.ts': 'export declare const x: number;',
+        'index.cjs': 'exports.x = 1;',
+        'index.mjs': 'export const x = 1;',
+      });
+      const registryUrl = await this.registry('fx-dual-type-module', { '2.0.0': { tarballBuffer: v2 } });
+
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { x } from "fx-dual-type-module";\nx;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-dual-type-module', '--range', '>=2.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].esmOnlyAdvisory, undefined, JSON.stringify(json.versions[0]));
+    });
+  }
+
   // --- api-diff: ESM-only dep + CJS interop is safe (issue #9 regression) --
 
   async testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault() {
@@ -2292,6 +2326,113 @@ class FeatureTests {
     });
   }
 
+  async testCompatSeedLockfileCopiesLockfileIntoSandbox() {
+    await this.run('createSandbox copies the source lockfile into the sandbox only when seedLockfileName is passed', async () => {
+      const compat = require('../../dist/compat.js');
+      const srcDir = this.tmp('seed-lockfile-source');
+      writeJson(path.join(srcDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(srcDir, 'package-lock.json'), '{"marker":"seed-me"}\n');
+
+      const seededDir = await compat.createSandbox(
+        srcDir, '1.0.0', [{ name: 'fake-lib', section: 'dependencies' }], '',
+        undefined, 'package-lock.json',
+      );
+      try {
+        assert.ok(
+          fs.existsSync(path.join(seededDir, 'package-lock.json')),
+          'expected package-lock.json to be copied into the sandbox when seedLockfileName is set',
+        );
+        assert.strictEqual(
+          fs.readFileSync(path.join(seededDir, 'package-lock.json'), 'utf-8'),
+          '{"marker":"seed-me"}\n',
+        );
+      } finally {
+        await compat.cleanupSandbox(seededDir);
+      }
+
+      const unseededDir = await compat.createSandbox(
+        srcDir, '1.0.0', [{ name: 'fake-lib', section: 'dependencies' }], '',
+      );
+      try {
+        assert.ok(
+          !fs.existsSync(path.join(unseededDir, 'package-lock.json')),
+          'expected package-lock.json to stay excluded when seedLockfileName is not set',
+        );
+      } finally {
+        await compat.cleanupSandbox(unseededDir);
+      }
+    });
+  }
+
+  async testCompatSeedLockfileReportFields() {
+    await this.run('compat reports seededLockfile + lockfileSeedNote for the three states: off, on, and check-dupes-without-seed', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-seed-lockfile-report');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'package-lock.json'), JSON.stringify({
+        name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: {},
+      }));
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Neither flag: no note.
+      const rNeither = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const jsonNeither = parseJson(rNeither.stdout, 'compat');
+      assert.strictEqual(jsonNeither.seededLockfile, false);
+      assert.strictEqual(jsonNeither.lockfileSeedNote, null);
+
+      // --seed-lockfile alone: hermeticity-reduced note.
+      const rSeeded = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--seed-lockfile', '--json',
+      ]);
+      const jsonSeeded = parseJson(rSeeded.stdout, 'compat');
+      assert.strictEqual(jsonSeeded.seededLockfile, true);
+      assert.match(jsonSeeded.lockfileSeedNote, /less hermetic/);
+
+      // --check-dupes without --seed-lockfile: recommends turning it on.
+      const rCheckDupesOnly = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--check-dupes', '--json',
+      ]);
+      const jsonCheckDupesOnly = parseJson(rCheckDupesOnly.stdout, 'compat');
+      assert.strictEqual(jsonCheckDupesOnly.seededLockfile, false);
+      assert.match(jsonCheckDupesOnly.lockfileSeedNote, /Add --seed-lockfile/);
+    });
+  }
+
+  async testCompatSeedLockfileFalseWhenRequestedButNoLockfilePresent() {
+    await this.run('compat --seed-lockfile reports seededLockfile:false (not true) when no lockfile actually exists to seed', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      // No lockfile written at all — --seed-lockfile has nothing to copy.
+      const appDir = this.tmp('compat-seed-lockfile-missing');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--seed-lockfile', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.seededLockfile, false, 'must not claim a seed that could not actually happen');
+      assert.match(json.lockfileSeedNote, /no lockfile.*was found|nothing was actually seeded/);
+    });
+  }
+
   async testCompatRejectsBisectWithCheckDupes() {
     await this.run('compat rejects --bisect combined with --check-dupes rather than silently ignoring the regression check', async () => {
       const appDir = this.tmp('compat-bisect-check-dupes-rejected');
@@ -2619,6 +2760,216 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutCatchesABreakOnlyAConsumerHits() {
+    await this.run('compat --fan-out catches a break the owning app misses but a consumer workspace hits', async () => {
+      // The shape of the real-world gap this closes: the app declaring the
+      // package passes its own tests, but a sibling workspace that actually
+      // depends on the changed behavior fails. Testing --app alone would
+      // report PASSED for 2.0.0; fan-out must report FAILED.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: true };',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: false };',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const monorepoRoot = this.tmp('compat-fanout-monorepo');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node check.js' },
+      });
+      // The primary app never actually looks at fake-lib's behavior — this
+      // is exactly why testing it alone can't catch the regression.
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node check.js' },
+      });
+      fs.writeFileSync(
+        path.join(consumerDir, 'check.js'),
+        'process.exit(require("fake-lib").thing ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test-script', 'test', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/consumer']);
+
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v1Result.status, 'PASSED', JSON.stringify(v1Result));
+      assert.strictEqual(v1Result.consumers.length, 2);
+      assert.deepStrictEqual(v1Result.consumers.map((c) => c.status), ['PASSED', 'PASSED']);
+
+      assert.strictEqual(v2Result.status, 'FAILED', 'the app itself never exercises fake-lib, but the consumer must still fail the overall version');
+      const primaryConsumer = v2Result.consumers.find((c) => c.dir === '.');
+      const siblingConsumer = v2Result.consumers.find((c) => c.dir === 'packages/consumer');
+      assert.strictEqual(primaryConsumer.status, 'PASSED', 'the primary app itself does not exercise the broken behavior');
+      assert.strictEqual(siblingConsumer.status, 'FAILED', 'the consumer workspace does exercise it and must fail');
+      assert.strictEqual(siblingConsumer.name, 'consumer');
+
+      // Regression guard: the top-level exitCode/output must explain the
+      // rollup, not silently mirror the passing primary — a client that
+      // only reads status/exitCode/output (never `consumers`) must not see
+      // "FAILED, exitCode 0, no output", which would be self-contradictory.
+      assert.strictEqual(v2Result.exitCode, siblingConsumer.exitCode);
+      assert.strictEqual(v2Result.exitCode, 1);
+      assert.ok(v2Result.output, 'top-level output must be populated from the failing consumer');
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test-script', 'test', '--fan-out',
+      ]);
+      assert.match(human.stdout, /Fan-out consumers: packages\/consumer/);
+      assert.match(human.stdout, /consumer \(packages\/consumer\): FAILED/);
+    });
+  }
+
+  async testCompatExplicitAppCommaListTestsExtraConsumers() {
+    await this.run('compat --app a,b tests the extra comma-separated dirs as fan-out consumers', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-explicit-app-list');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const otherDir = path.join(monorepoRoot, 'packages', 'other');
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeJson(path.join(otherDir, 'package.json'), {
+        name: 'other', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0',
+        '--app', `${appDir},${otherDir}`,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/other']);
+      assert.strictEqual(json.versions[0].consumers.length, 2);
+      assert.deepStrictEqual(json.versions[0].consumers.map((c) => c.dir), ['.', 'packages/other']);
+    });
+  }
+
+  async testCompatGlobAppSelectsPrimaryDeterministically() {
+    await this.run('compat --app "packages/*" always picks the same (sorted) primary app, regardless of directory creation order', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-glob-app-order');
+      writeJson(path.join(monorepoRoot, 'package.json'), { name: 'root', private: true, workspaces: ['packages/*'] });
+
+      // Create "zzz" before "aaa" on disk — if primary selection ever
+      // relied on unsorted readdir order, this would be the case most
+      // likely to expose it.
+      for (const name of ['zzz', 'aaa']) {
+        const dir = path.join(monorepoRoot, 'packages', name);
+        fs.mkdirSync(dir, { recursive: true });
+        writeJson(path.join(dir, 'package.json'), { name, version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+        fs.writeFileSync(path.join(dir, 'check.js'), 'process.exit(0);\n');
+      }
+
+      const r = await runPackdev(monorepoRoot, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', 'packages/*',
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      // "aaa" sorts first — it must be the primary, "zzz" the fan-out consumer.
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/zzz']);
+      assert.deepStrictEqual(json.versions[0].consumers.map((c) => c.name), ['aaa', 'zzz']);
+    });
+  }
+
+  async testCompatFanOutRequiresDiscoverableMonorepoRoot() {
+    await this.run('compat --fan-out errors clearly when no workspaces root can be found', async () => {
+      const appDir = this.tmp('compat-fanout-no-root');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /Fan-out .* requires a discoverable workspaces root/);
+    });
+  }
+
+  async testCompatRejectsExplicitAppListCombinedWithFanOut() {
+    await this.run('compat rejects a multi-target --app combined with --fan-out rather than silently preferring the explicit list', async () => {
+      const monorepoRoot = this.tmp('compat-fanout-both-modes');
+      writeJson(path.join(monorepoRoot, 'package.json'), { name: 'root', private: true, workspaces: ['packages/*'] });
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      const otherDir = path.join(monorepoRoot, 'packages', 'other');
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeJson(path.join(otherDir, 'package.json'), { name: 'other', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', `${appDir},${otherDir}`,
+        '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /mutually exclusive/);
+    });
+  }
+
+  async testCompatFanOutRejectsConsumerOutsideMonorepoRoot() {
+    await this.run('compat rejects an explicit fan-out consumer that resolves outside the monorepo root', async () => {
+      const monorepoRoot = this.tmp('compat-fanout-escape-monorepo');
+      writeJson(path.join(monorepoRoot, 'package.json'), { name: 'root', private: true, workspaces: ['packages/*'] });
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // A completely separate directory tree, not nested under monorepoRoot
+      // at all — simulates an --app value (or a malicious/mistaken one)
+      // that tries to point fan-out at something outside the sandbox.
+      const outsideDir = this.tmp('compat-fanout-escape-outside');
+      writeJson(path.join(outsideDir, 'package.json'), { name: 'outside', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', `${appDir},${outsideDir}`,
+        '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /resolves outside the monorepo root/);
+    });
+  }
+
   async testCompatNothingTestedExitCodeAndMessage() {
     await this.run('compat exits 6 and says nothing was tested when every version is SKIPPED (not "no version passed")', async () => {
       const v1 = await buildFakeTarball({
@@ -2728,6 +3079,180 @@ class FeatureTests {
       ]);
       const json2 = parseJson(r2.stdout, 'compat');
       assert.strictEqual(json2.testCommandCaveat, null);
+    });
+  }
+
+  async testCompatWarnsOnPassWithNoTests() {
+    await this.run('compat surfaces a PASS_WITH_NO_TESTS caveat when --passWithNoTests is set', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-pass-with-no-tests-caveat');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Not a real jest invocation — just needs "jest" and "--passWithNoTests"
+      // in the command for the heuristic to fire, while actually running
+      // check.js so the version still PASSES.
+      const jestLikeCommand = 'node check.js # jest --passWithNoTests';
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+    });
+  }
+
+  async testCompatTestScriptOnlyRunsStillGetHarnessAnalysis() {
+    await this.run('compat --test-script (no --test) still analyzes the actual script body for harness caveats, not the empty invocation string', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-test-script-only-harness');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        // The literal invocation ("npm run test") never contains "jest" —
+        // only the script BODY does. Harness analysis must read this, not
+        // the empty/absent --test string.
+        scripts: { test: 'node check.js # jest --passWithNoTests' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test-script', 'test', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)} — the script body must have been analyzed, not an empty testCommand`);
+    });
+  }
+
+  async testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand() {
+    await this.run('compat fan-out analyzes every consumer\'s own jest config even with a shared --test command (no --test-script)', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-shared-command-harness');
+      writeJson(path.join(monorepoRoot, 'package.json'), { name: 'root', private: true, workspaces: ['packages/*'] });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      // The primary's own jest config is clean — only the consumer's is
+      // transpile-only. A shared --test command runs the SAME command
+      // string in each target's own directory, so the caveat can only be
+      // found by reading each directory's own jest config, not by
+      // inspecting the (identical) command string once.
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+        jest: { transform: { '^.+\\.ts$': ['ts-jest', { isolatedModules: true }] } },
+      });
+      fs.writeFileSync(path.join(consumerDir, 'check.js'), 'process.exit(0);\n');
+
+      // Not a real jest invocation — just needs "jest" in the shared
+      // command for the heuristic to fire, while actually running check.js
+      // so both targets still PASS.
+      const jestLikeCommand = 'node check.js # jest --silent';
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', jestLikeCommand, '--fan-out', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('TRANSPILE_ONLY'), `expected TRANSPILE_ONLY (from the consumer's own jest config) in ${JSON.stringify(codes)}`);
+    });
+  }
+
+  async testCompatWarnsOnTypeCheckOnlyTestCommand() {
+    await this.run('compat surfaces a TYPE_CHECK_ONLY caveat when --test is bare tsc', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-type-check-only-caveat');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'npx tsc --noEmit', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('TYPE_CHECK_ONLY'), `expected TYPE_CHECK_ONLY in ${JSON.stringify(codes)}`);
+
+      // A command that chains a real runner after tsc isn't type-check-only.
+      const r2 = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl, '--test', 'tsc --noEmit && node -e "process.exit(0)"', '--json',
+      ]);
+      const json2 = parseJson(r2.stdout, 'compat');
+      const codes2 = json2.testCommandCaveats.map((c) => c.code);
+      assert.ok(!codes2.includes('TYPE_CHECK_ONLY'), `did not expect TYPE_CHECK_ONLY in ${JSON.stringify(codes2)}`);
+    });
+  }
+
+  async testCompatWarnsOnEsmMismatchAgainstCjsBlindJest() {
+    await this.run('compat surfaces a per-version esmMismatch when a candidate goes ESM-only under a CJS-blind jest command', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', type: 'module', main: 'index.js' }),
+        'index.js': 'export default {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('compat-esm-mismatch');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '1.0.0' },
+      });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const jestLikeCommand = 'node check.js # jest --silent';
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl, '--test', jestLikeCommand, '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.ok(v2Result.esmMismatch, 'expected 2.0.0 to carry an esmMismatch advisory');
+      assert.match(v2Result.esmMismatch, /type.*module/i);
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      assert.strictEqual(v1Result.esmMismatch, undefined, 'control-identical version should not carry an esmMismatch');
     });
   }
 
@@ -3314,6 +3839,613 @@ class FeatureTests {
     });
   }
 
+  // --- behavior-diff (experimental) ------------------------------------------
+
+  async testBehaviorDiffRequiresExperimentalFlag() {
+    await this.run('behavior-diff refuses to run without --experimental', async () => {
+      const appDir = this.tmp('behavior-diff-no-flag');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir, '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.match(json.error, /--experimental/);
+    });
+  }
+
+  async testBehaviorDiffValidatesMaxDepthAndMaxResults() {
+    await this.run('behavior-diff rejects invalid --max-depth/--max-results and accepts the valid boundary values (0 and 1)', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v1"; }\nmodule.exports = { realEntry };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v2"; }\nmodule.exports = { realEntry };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-max-options-validation');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'function realEntry() { return "v1"; }\nmodule.exports = { realEntry };\n' },
+      );
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { realEntry } = require('fake-lib');\nrealEntry();\n");
+
+      const base = ['behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir, '--registry', registryUrl, '--experimental', '--json'];
+
+      // --max-depth 0 must be honored as-is, not silently coerced to the
+      // default 3 by a `Number(x) || 3` style fallback (0 is falsy).
+      const zeroDepth = await runPackdev(appDir, [...base, '--max-depth', '0']);
+      assert.strictEqual(zeroDepth.code, 0, `expected exit 0, got ${zeroDepth.code}: ${zeroDepth.stderr}`);
+      const zeroDepthJson = parseJson(zeroDepth.stdout, 'behavior-diff');
+      assert.strictEqual(zeroDepthJson.degraded, null);
+
+      // --max-results 1 is the valid minimum.
+      const oneResult = await runPackdev(appDir, [...base, '--max-results', '1']);
+      assert.strictEqual(oneResult.code, 0, `expected exit 0, got ${oneResult.code}: ${oneResult.stderr}`);
+
+      const negativeDepth = await runPackdev(appDir, [...base, '--max-depth', '-1']);
+      assert.notStrictEqual(negativeDepth.code, 0);
+      assert.match(parseJson(negativeDepth.stdout, 'behavior-diff').error, /--max-depth must be an integer/);
+
+      const zeroResults = await runPackdev(appDir, [...base, '--max-results', '0']);
+      assert.notStrictEqual(zeroResults.code, 0);
+      assert.match(parseJson(zeroResults.stdout, 'behavior-diff').error, /--max-results must be an integer/);
+
+      const nonIntegerResults = await runPackdev(appDir, [...base, '--max-results', 'abc']);
+      assert.notStrictEqual(nonIntegerResults.code, 0);
+      assert.match(parseJson(nonIntegerResults.stdout, 'behavior-diff').error, /--max-results must be an integer/);
+    });
+  }
+
+  async testBehaviorDiffDegradesOnDynamicOnlyUsageWithNoSeeds() {
+    await this.run('behavior-diff reports degraded (not a false-clean empty result) when the app only uses the package dynamically', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v1"; }\nmodule.exports = { realEntry };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v2"; }\nmodule.exports = { realEntry };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-dynamic-only');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      // Namespace import — no destructured symbol names, so a plain scan
+      // finds zero seeds even though realEntry genuinely changed and is
+      // genuinely reachable (lib.realEntry()).
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const lib = require('fake-lib');\nlib.realEntry();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.ok(json.degraded, 'must not silently report changes:[] as if verified clean when there were zero seeds to check');
+      assert.deepStrictEqual(json.changes, []);
+      assert.strictEqual(json.seedSymbols.length, 0);
+    });
+  }
+
+  async testBehaviorDiffSurfacesDynamicUsageCaveatAlongsideRealResults() {
+    await this.run('behavior-diff still runs and reports a dynamicUsageCaveat (not degraded) when dynamic usage coexists with real named seeds', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function namedThing() { return "v1"; }\nmodule.exports = { namedThing };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function namedThing() { return "v2"; }\nmodule.exports = { namedThing };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-mixed-dynamic');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'function namedThing() { return "v1"; }\nmodule.exports = { namedThing };\n' },
+      );
+      // A real destructured seed (namedThing) alongside an unrelated
+      // namespace import elsewhere in the app — a real result should still
+      // come back, just with the caveat attached.
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { namedThing } = require('fake-lib');\nconst ns = require('fake-lib');\nnamedThing();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      assert.ok(json.dynamicUsageCaveat, 'expected a dynamicUsageCaveat even though a real result was produced');
+      assert.ok(json.changes.some((c) => c.name === 'namedThing'), JSON.stringify(json.changes));
+    });
+  }
+
+  async testBehaviorDiffFindsTheReachableSemanticChange() {
+    await this.run('behavior-diff surfaces a semantic change reachable via an option key passed to an imported symbol', async () => {
+      // Mirrors the sqs-consumer shape: handleMessage returning undefined
+      // changes meaning between versions, in a function whose parameter is
+      // literally named after the option key the app passes in — nothing
+      // about the app's own import list changes, only shipped behavior.
+      const makeIndexJs = (returnOnUndefined) => `
+function executeHandler(message, handleMessage) {
+  var result = handleMessage(message);
+  if (result === undefined) {
+    return ${returnOnUndefined};
+  }
+  return result;
+}
+class Consumer {
+  static create(options) {
+    return new Consumer(options);
+  }
+  constructor(options) {
+    this.handleMessage = options.handleMessage;
+  }
+}
+module.exports = { Consumer, executeHandler };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('message'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('null'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-reachable');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': makeIndexJs('message') },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { Consumer } = require('fake-lib');\nConsumer.create({ handleMessage: (m) => {} });\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      assert.strictEqual(json.from, '1.0.0');
+      assert.strictEqual(json.to, '2.0.0');
+      assert.ok(json.seedSymbols.includes('Consumer'), JSON.stringify(json.seedSymbols));
+      assert.ok(json.seedOptionKeys.includes('handleMessage'), JSON.stringify(json.seedOptionKeys));
+
+      const executeHandlerChange = json.changes.find((c) => c.name === 'executeHandler');
+      assert.ok(executeHandlerChange, `expected executeHandler in changes: ${JSON.stringify(json.changes.map((c) => c.name))}`);
+      assert.strictEqual(executeHandlerChange.kind, 'changed');
+      assert.ok(executeHandlerChange.reachableVia.includes('handleMessage'), JSON.stringify(executeHandlerChange.reachableVia));
+      assert.ok(executeHandlerChange.diff.some((l) => l.startsWith('-') && l.includes('return message')), JSON.stringify(executeHandlerChange.diff));
+      assert.ok(executeHandlerChange.diff.some((l) => l.startsWith('+') && l.includes('return null')), JSON.stringify(executeHandlerChange.diff));
+
+      // Ranked first: it's the only change, but also confirm score > 0 so
+      // the ranking heuristic actually fired on a return-statement change.
+      assert.strictEqual(json.changes[0].name, 'executeHandler');
+      assert.ok(json.changes[0].score > 0);
+
+      const human = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental',
+      ]);
+      assert.match(human.stdout, /EXPERIMENTAL/);
+      assert.match(human.stdout, /executeHandler/);
+      assert.match(human.stdout, /reachable via: handleMessage/);
+    });
+  }
+
+  async testBehaviorDiffSeedsOptionKeysThroughDefaultAndAliasedImports() {
+    await this.run('behavior-diff seeds option keys through default imports and aliased named imports, not just plain named imports', async () => {
+      const makeIndexJs = (returnOnUndefined) => `
+function executeHandler(message, handleMessage) {
+  var result = handleMessage(message);
+  if (result === undefined) {
+    return ${returnOnUndefined};
+  }
+  return result;
+}
+class Consumer {
+  static create(options) {
+    return new Consumer(options);
+  }
+  constructor(options) {
+    this.handleMessage = options.handleMessage;
+  }
+}
+module.exports = Consumer;
+module.exports.executeHandler = executeHandler;
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('message'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('null'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-default-aliased-import');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': makeIndexJs('message') },
+      );
+      // Default import, called under a LOCAL name ("MyConsumer") that
+      // shares nothing textually with the package's own export name
+      // ("default") — the old export-name-based matching could never
+      // catch this call site at all.
+      fs.writeFileSync(
+        path.join(appDir, 'app.ts'),
+        "import MyConsumer from 'fake-lib';\nMyConsumer.create({ handleMessage: (m) => {} });\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.ok(json.seedOptionKeys.includes('handleMessage'), `expected handleMessage seeded via the default import's local name: ${JSON.stringify(json.seedOptionKeys)}`);
+      assert.ok(json.changes.some((c) => c.name === 'executeHandler'), JSON.stringify(json.changes));
+    });
+  }
+
+  async testBehaviorDiffFollowsOneMoreHopThroughACaller() {
+    await this.run('behavior-diff marks a callee reachable when an already-reachable caller\'s body mentions it, not just direct seed mentions', async () => {
+      // publicApi is the seed (imported); it calls helper() by name, but
+      // the app never imports/mentions "helper" itself. Reachability must
+      // follow that one hop: an already-reachable caller's own body
+      // mentioning "helper" is what makes helper reachable — not the
+      // reverse (checking whether helper's body mentions "publicApi").
+      const makeIndexJs = (helperReturn) => `
+function helper() {
+  return "${helperReturn}";
+}
+function publicApi() {
+  return helper();
+}
+module.exports = { publicApi };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('v1'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('v2'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-one-hop');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': makeIndexJs('v1') },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { publicApi } = require('fake-lib');\npublicApi();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      const helperChange = json.changes.find((c) => c.name === 'helper');
+      assert.ok(helperChange, `expected helper (reachable one hop through publicApi) in changes: ${JSON.stringify(json.changes.map((c) => c.name))}`);
+      assert.deepStrictEqual(helperChange.reachableVia, ['publicApi']);
+    });
+  }
+
+  async testBehaviorDiffIgnoresUnreachableChanges() {
+    await this.run('behavior-diff does not report a changed function the app never reaches', async () => {
+      const makeIndexJs = (internalConstant) => `
+function unrelatedInternal() {
+  return ${internalConstant};
+}
+function publicApi() {
+  return "stable";
+}
+module.exports = { publicApi };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('1'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('2'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-unreachable');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': makeIndexJs('1') },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { publicApi } = require('fake-lib');\npublicApi();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      assert.ok(!json.changes.some((c) => c.name === 'unrelatedInternal'), JSON.stringify(json.changes));
+      assert.ok(!json.changes.some((c) => c.name === 'publicApi'), 'publicApi text is identical across versions, must not be reported as changed');
+    });
+  }
+
+  async testBehaviorDiffWalksExtensionlessAndDirectoryRequires() {
+    await this.run('behavior-diff resolves require("./helper") (extensionless -> helper.js) and require("./dist") (directory -> dist/index.js), not just the entry file itself', async () => {
+      const makeHelperJs = (returnValue) => `
+function doThing() {
+  return "${returnValue}";
+}
+module.exports = { doThing };
+`;
+      // index.js only re-exports from two local requires that need real
+      // resolution: an extensionless specifier where only "helper.js"
+      // exists on disk, and a directory specifier where only
+      // "dist/index.js" exists — neither "helper" nor "dist" themselves
+      // are real files.
+      const indexJs = `
+module.exports = { ...require('./helper'), ...require('./dist') };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': indexJs,
+        'helper.js': makeHelperJs('v1-helper'),
+        'dist/index.js': makeHelperJs('v1-dist').replace('doThing', 'doOtherThing'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': indexJs,
+        'helper.js': makeHelperJs('v2-helper'),
+        'dist/index.js': makeHelperJs('v2-dist').replace('doThing', 'doOtherThing'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-nested-requires');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        {
+          'index.js': indexJs,
+          'helper.js': makeHelperJs('v1-helper'),
+          'dist/index.js': makeHelperJs('v1-dist').replace('doThing', 'doOtherThing'),
+        },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { doThing, doOtherThing } = require('fake-lib');\ndoThing();\ndoOtherThing();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      const names = json.changes.map((c) => c.name);
+      assert.ok(names.includes('doThing'), `expected doThing (from helper.js) in changes: ${JSON.stringify(names)}`);
+      assert.ok(names.includes('doOtherThing'), `expected doOtherThing (from dist/index.js) in changes: ${JSON.stringify(names)}`);
+    });
+  }
+
+  async testBehaviorDiffReadsFromInstalledDirNotRegistry() {
+    await this.run('behavior-diff reads "from" from the actual installed directory, not by re-downloading that version from the registry', async () => {
+      // Only "2.0.0" exists on the registry — the installed version below
+      // is a locally-patched build that was never published under this
+      // version string at all. If behavior-diff tried to re-download
+      // "1.0.0-local" from the registry, this would fail outright.
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v2"; }\nmodule.exports = { realEntry };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', { '2.0.0': { tarballBuffer: v2 } });
+
+      const appDir = this.tmp('behavior-diff-installed-not-registry');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0-local' } });
+      // A locally-patched install, content deliberately distinct from
+      // anything ever published, so the assertion can tell whether the
+      // installed content or the (nonexistent) registry content was used.
+      writeNodeModulesPackage(
+        appDir, 'fake-lib',
+        { name: 'fake-lib', version: '1.0.0-local', main: 'index.js' },
+        { 'index.js': 'function realEntry() { return "installed-local-patch"; }\nmodule.exports = { realEntry };\n' },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { realEntry } = require('fake-lib');\nrealEntry();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0 (from should never hit the registry), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.from, '1.0.0-local');
+      assert.strictEqual(json.degraded, null);
+      const change = json.changes.find((c) => c.name === 'realEntry');
+      assert.ok(change, JSON.stringify(json.changes));
+      assert.ok(change.diff.some((l) => l.startsWith('-') && l.includes('installed-local-patch')), `expected the installed content, not a registry re-download: ${JSON.stringify(change.diff)}`);
+    });
+  }
+
+  async testBehaviorDiffDegradesWhenExportsIsSubpathOnlyRatherThanFallingBackToMain() {
+    await this.run('behavior-diff degrades (does not silently fall back to "main") when "exports" exists but has no resolvable root ("." ) entry', async () => {
+      // "exports" is present but subpath-only (no "." key at all) — Node
+      // blocks root-level `require("fake-lib")` entirely once "exports"
+      // exists, it does NOT fall back to "main". A version in this shape
+      // must degrade, not silently get diffed through "main" as if the
+      // app could actually load it that way.
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '2.0.0', main: 'index.js',
+          exports: { './subpath': './subpath.js' },
+        }),
+        'index.js': 'module.exports = { realEntry: () => "v2" };',
+        'subpath.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '2.0.0': { tarballBuffer: v2 } });
+
+      const appDir = this.tmp('behavior-diff-subpath-only-exports');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'module.exports = { realEntry: () => "v1" };' },
+      );
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { realEntry } = require('fake-lib');\nrealEntry();\n");
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.ok(json.degraded, 'must degrade rather than silently diff through "main"');
+      assert.match(json.degraded, /exports.*no root|root.*resolved/i);
+      assert.deepStrictEqual(json.changes, []);
+    });
+  }
+
+  async testBehaviorDiffPrefersExportsMapOverMainField() {
+    await this.run('behavior-diff resolves the entry through "exports" (not "main") when both are present, matching real Node resolution', async () => {
+      const makeModernJs = (returnValue) => `
+function realEntry() {
+  return "${returnValue}";
+}
+module.exports = { realEntry };
+`;
+      // "main" points at a legacy file the app can never actually load
+      // once "exports" is present — Node ignores "main" entirely in that
+      // case. If behavior-diff analyzed "main" instead, it would parse
+      // legacy.js (which never changes) and report zero changes.
+      const legacyJs = 'function realEntry() { return "legacy-unused"; }\nmodule.exports = { realEntry };\n';
+
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'legacy.js',
+          exports: { '.': { require: './modern.js' } },
+        }),
+        'legacy.js': legacyJs,
+        'modern.js': makeModernJs('v1'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '2.0.0', main: 'legacy.js',
+          exports: { '.': { require: './modern.js' } },
+        }),
+        'legacy.js': legacyJs,
+        'modern.js': makeModernJs('v2'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-exports-over-main');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib',
+        { name: 'fake-lib', version: '1.0.0', main: 'legacy.js', exports: { '.': { require: './modern.js' } } },
+        { 'legacy.js': legacyJs, 'modern.js': makeModernJs('v1') },
+      );
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { realEntry } = require('fake-lib');\nrealEntry();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      const change = json.changes.find((c) => c.name === 'realEntry');
+      assert.ok(change, `expected realEntry (from modern.js via exports) in changes: ${JSON.stringify(json.changes)}`);
+      assert.strictEqual(change.file, 'modern.js', 'must have analyzed the exports-mapped file, not legacy.js from "main"');
+    });
+  }
+
+  async testBehaviorDiffReportsNativeBinaryAsDegraded() {
+    await this.run('behavior-diff reports degraded, not a misleading diff, for a package shipping a native binary', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+        'build/Release/native.node': 'not-really-a-binary',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+        'build/Release/native.node': 'not-really-a-binary-v2',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-native');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'module.exports = {};', 'build/Release/native.node': 'not-really-a-binary' },
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.match(json.degraded, /native|WebAssembly/);
+      assert.deepStrictEqual(json.changes, []);
+    });
+  }
+
   // --- dupes (duplicate package instances in the tree) ----------------------
 
   async testDupesFindsDuplicate() {
@@ -3571,8 +4703,8 @@ class FeatureTests {
 
   // --- mcp --------------------------------------------------------------
 
-  async testMcpServerListsAllThreeTools() {
-    await this.run('mcp lists api_diff/compat/dupes as MCP tools over stdio', async () => {
+  async testMcpServerListsAllFourTools() {
+    await this.run('mcp lists api_diff/compat/dupes/behavior_diff as MCP tools over stdio', async () => {
       const dir = this.tmp('mcp-list-tools');
       const client = createMcpClient(dir);
       try {
@@ -3580,7 +4712,7 @@ class FeatureTests {
         const listResponse = await client.listTools();
         assert.ok(!client.stderr.trim(), `expected no stderr output, got: ${client.stderr}`);
         const toolNames = listResponse.result.tools.map((t) => t.name).sort();
-        assert.deepStrictEqual(toolNames, ['api_diff', 'compat', 'dupes']);
+        assert.deepStrictEqual(toolNames, ['api_diff', 'behavior_diff', 'compat', 'dupes']);
       } finally {
         await client.close();
       }
@@ -3770,6 +4902,51 @@ class FeatureTests {
       } finally {
         await client.close();
       }
+    });
+  }
+
+  async testMcpBehaviorDiffToolMatchesCliOutput() {
+    await this.run('mcp behavior_diff tool call returns exactly the same JSON as `packdev behavior-diff --experimental --json`', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function greet() { return "hi"; }\nmodule.exports = { greet };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function greet() { return "hello"; }\nmodule.exports = { greet };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('mcp-call-behavior-diff');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'function greet() { return "hi"; }\nmodule.exports = { greet };\n' },
+      );
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { greet } = require('fake-lib');\ngreet();\n");
+
+      const client = createMcpClient(appDir);
+      let payload;
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('behavior_diff', {
+          package: 'fake-lib', to: '2.0.0', app: appDir, registry: registryUrl,
+        });
+        payload = JSON.parse(callResponse.result.content[0].text);
+      } finally {
+        await client.close();
+      }
+
+      const cli = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(cli.code, 0, `expected exit 0, got ${cli.code}: ${cli.stderr}`);
+      const cliJson = parseJson(cli.stdout, 'behavior-diff');
+      assert.deepStrictEqual(payload, cliJson);
+      assert.ok(payload.changes.some((c) => c.name === 'greet'), JSON.stringify(payload.changes));
     });
   }
 
@@ -4010,6 +5187,7 @@ class FeatureTests {
       await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateAddsTypeModule();
       await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateDropsCjsExportCondition();
       await this.testApiDiffNoEsmAdvisoryWhenCjsConditionSurvives();
+      await this.testApiDiffNoFalseEsmAdvisoryWhenTypeModuleAddedButExportsKeepsRequireTarget();
       await this.testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault();
       await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
       await this.testApiDiffAuthenticatesWithTokenFlag();
@@ -4022,6 +5200,9 @@ class FeatureTests {
       await this.testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion();
       await this.testCompatRejectsBisectWithCheckDupes();
       await this.testCompatWithoutCheckDupesFlagDoesNotComputeDupeCounts();
+      await this.testCompatSeedLockfileCopiesLockfileIntoSandbox();
+      await this.testCompatSeedLockfileReportFields();
+      await this.testCompatSeedLockfileFalseWhenRequestedButNoLockfilePresent();
       await this.testCompatReportsHermeticModeAndDetectedPackageManager();
       await this.testCompatHonoursPackageManagerFieldPin();
       await this.testCompatAncestorPackageManagerFieldBeatsACloserLockfile();
@@ -4032,9 +5213,20 @@ class FeatureTests {
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
       await this.testCompatAttemptsRealInstallWhenMonorepoRootFound();
+      await this.testCompatFanOutCatchesABreakOnlyAConsumerHits();
+      await this.testCompatExplicitAppCommaListTestsExtraConsumers();
+      await this.testCompatGlobAppSelectsPrimaryDeterministically();
+      await this.testCompatFanOutRequiresDiscoverableMonorepoRoot();
+      await this.testCompatRejectsExplicitAppListCombinedWithFanOut();
+      await this.testCompatFanOutRejectsConsumerOutsideMonorepoRoot();
       await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
+      await this.testCompatWarnsOnPassWithNoTests();
+      await this.testCompatTestScriptOnlyRunsStillGetHarnessAnalysis();
+      await this.testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand();
+      await this.testCompatWarnsOnTypeCheckOnlyTestCommand();
+      await this.testCompatWarnsOnEsmMismatchAgainstCjsBlindJest();
       await this.testCompatCleansUpSandboxOnSuccess();
       await this.testCompatCleansUpSandboxOnSigint();
       await this.testCompatDoesNotMutateRealApp();
@@ -4051,6 +5243,19 @@ class FeatureTests {
       await this.testCompatBisectEverythingPasses();
       await this.testCompatBisectNothingPasses();
       await this.testCompatBisectFallsBackOnFlakyBoundary();
+      await this.testBehaviorDiffRequiresExperimentalFlag();
+      await this.testBehaviorDiffValidatesMaxDepthAndMaxResults();
+      await this.testBehaviorDiffDegradesOnDynamicOnlyUsageWithNoSeeds();
+      await this.testBehaviorDiffSurfacesDynamicUsageCaveatAlongsideRealResults();
+      await this.testBehaviorDiffFindsTheReachableSemanticChange();
+      await this.testBehaviorDiffSeedsOptionKeysThroughDefaultAndAliasedImports();
+      await this.testBehaviorDiffFollowsOneMoreHopThroughACaller();
+      await this.testBehaviorDiffIgnoresUnreachableChanges();
+      await this.testBehaviorDiffWalksExtensionlessAndDirectoryRequires();
+      await this.testBehaviorDiffReadsFromInstalledDirNotRegistry();
+      await this.testBehaviorDiffDegradesWhenExportsIsSubpathOnlyRatherThanFallingBackToMain();
+      await this.testBehaviorDiffPrefersExportsMapOverMainField();
+      await this.testBehaviorDiffReportsNativeBinaryAsDegraded();
       await this.testDupesFindsDuplicate();
       await this.testDupesSingleResolution();
       await this.testDupesNotInstalled();
@@ -4063,13 +5268,14 @@ class FeatureTests {
       await this.testDupesNoPrereleaseNoteWhenAllSameVersion();
       await this.testDupesResolvedViaParent();
       await this.testDupesGenuinelyNotADependency();
-      await this.testMcpServerListsAllThreeTools();
+      await this.testMcpServerListsAllFourTools();
       await this.testMcpDupesToolMatchesCliOutput();
       await this.testMcpApiDiffToolMatchesCliOutput();
       await this.testMcpApiDiffToolReturnsIsErrorOnFailure();
       await this.testMcpCompatToolMatchesCliOutput();
       await this.testMcpCompatToolSupportsRangeAndBisect();
       await this.testMcpCompatToolRejectsMissingRangeAndVersions();
+      await this.testMcpBehaviorDiffToolMatchesCliOutput();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

@@ -36,7 +36,7 @@ Seventeen seconds. No install into your repo, no branch, no PR.
 npm install -g packdev
 ```
 
-## The three checks
+## The checks
 
 ```bash
 # 1. Static, no install: which published versions have every symbol my app imports?
@@ -56,6 +56,11 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 #    even when your test command itself passes.
 packdev dupes commander --json
 # {"duplicate":false,"copies":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
+
+# 4. (EXPERIMENTAL) compat says FAILED but you want to know why, not just that:
+#    diffs the package's shipped code between versions, filtered to what your
+#    app actually reaches. Evidence, never a verdict — read the diff yourself.
+packdev behavior-diff sqs-consumer --to 15.0.3 --experimental --json
 ```
 
 Sometimes `api-diff` can't fully verify a package's types — a barrel `.d.ts` that re-exports from
@@ -87,7 +92,8 @@ packdev --json compat <pkg> --versions <list> --app <dir> --test "<your CI comma
 
 ### Install as an MCP server
 
-`packdev mcp` runs the same three checks as MCP tools (`api_diff`, `compat`, `dupes`) over stdio, so
+`packdev mcp` runs the same checks as MCP tools (`api_diff`, `compat`, `dupes`, and the experimental
+`behavior_diff`) over stdio, so
 an agent can call them directly instead of shelling out to the CLI. It runs entirely on your
 machine — your dependency tree is never uploaded anywhere.
 
@@ -195,8 +201,6 @@ packdev finish                           # Back to npm version
 - **When to use Verdaccio**: team needs a full private npm registry with authentication
 - **When to use Yalc**: prefer a publish/push workflow, need package copying over `file:` links
 
-📖 **[Detailed Comparison →](docs/WORKFLOW.md#-detailed-comparison-with-alternatives)**
-
 ### Examples
 
 <details>
@@ -265,7 +269,7 @@ packdev init  # Resume local development
 
 **Benefits**: No package.json conflicts, clean git status, fast context switching
 
-📖 **[Git Workflows →](docs/WORKFLOW.md#git-branch-switching)**
+📖 **[Git Workflows →](docs/WORKFLOW.md#branch-switching-without-conflicts)**
 
 </details>
 
@@ -355,7 +359,7 @@ jobs:
 
 This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1, experimental+v2) to ensure compatibility across all combinations.
 
-📖 **[CI/CD Integration Guide →](docs/WORKFLOW.md#-advanced-workflows)**
+📖 **[More git-dependency patterns →](docs/WORKFLOW.md#git-repository-dependencies)**
 
 </details>
 
@@ -410,18 +414,20 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 - **Status checks**: Always know if you're in dev or production mode
 - **Per-developer config**: `.packdev.json` lives on your machine — add it to `.gitignore` since paths are local to each developer
 
-📖 **[Safety Best Practices →](docs/WORKFLOW.md#-safety-features)**
+📖 **[Safety Best Practices →](docs/GITHUB-HOOKS.md)**
 
 ---
 
 ## 📖 Documentation
 
+- **[Documentation Index](./docs/README.md)** - Full guide list with a "what do I need" table
 - **[Quick Start Guide](docs/QUICK-START.md)** - Get up and running in 5 minutes
 - **[Workflow & Best Practices](docs/WORKFLOW.md)** - Team collaboration, CI/CD, safety
-- **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, flags, real output, agent notes
+- **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes`/`behavior-diff` — decision table, flags, real output, agent notes
 - **[Git Hooks](docs/GITHUB-HOOKS.md)** - Auto-commit protection and safety checks
 - **[Packaging Guide](docs/PACKAGING.md)** - Building, testing, and distributing
 - **[Yarn Support](docs/YARN-SUPPORT.md)** - Using PackDev with Yarn
+- **[Contributing Guide](docs/CONTRIBUTING.md)** - Dev setup, testing, release process
 
 ## 🔧 Commands Reference
 
@@ -431,7 +437,8 @@ packdev api <pkg>                            # Show the export map of the instal
 packdev api-diff <pkg> --range <semver>      # Which published versions satisfy what your app imports (static, no install)
 packdev compat <pkg> --test <cmd>            # Does your real test suite pass against a candidate version (sandboxed install)
 packdev dupes <pkg>                          # Find every distinct copy of a package resolved in the tree
-packdev mcp                                  # Run as a local MCP server (stdio) exposing api_diff/compat/dupes as tools
+packdev behavior-diff <pkg> --to <ver> --experimental  # EXPERIMENTAL: diff shipped code between versions, filtered to what your app reaches
+packdev mcp                                  # Run as a local MCP server (stdio) exposing api_diff/compat/dupes/behavior_diff as tools
 
 # Develop against local packages
 packdev create-config                        # Initialize .packdev.json (optional — add does this automatically)

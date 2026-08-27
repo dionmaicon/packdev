@@ -182,9 +182,15 @@ class DocumentationValidator {
         continue;
       }
 
+      // Strip a #fragment before checking file existence — a fragment is a
+      // section anchor within the target file, not part of its path, and
+      // literally appending it (e.g. "WORKFLOW.md#some-section") never
+      // resolves to a real file even when the link is perfectly valid.
+      const filePathOnly = linkPath.split('#')[0];
+
       // Resolve relative path
       const baseDir = path.dirname(path.join(this.projectRoot, fileName));
-      const resolvedPath = path.resolve(baseDir, linkPath);
+      const resolvedPath = path.resolve(baseDir, filePathOnly);
 
       if (fs.existsSync(resolvedPath)) {
         this.stats.validLinks++;

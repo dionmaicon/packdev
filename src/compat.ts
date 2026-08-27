@@ -16,7 +16,7 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as semver from "semver";
-import { fileExists, readJsonFile, writeJsonFile } from "./utils";
+import { fileExists, readJsonFile, writeJsonFile, type PackageInfo } from "./utils";
 import {
   detectPackageManager,
   LOCK_FILE_BY_MANAGER,
@@ -26,6 +26,8 @@ import {
 import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
+import { esmOnlyAdvisory } from "./apiDiff";
+import { scanImportedSymbols } from "./appScan";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -53,6 +55,40 @@ export interface CompatVersionResult {
   // the repo declares, nesting a second copy). Never computed for the control
   // itself, only for candidates compared against it.
   dupesRegression?: DupesRegressionEntry[] | undefined;
+  // Set only when this candidate looks ESM-only relative to the control AND
+  // the app's own test command is a CJS-blind jest run (see
+  // detectEsmMismatch) — unlike the other testCommandCaveats, this is
+  // necessarily per-version: a package can go ESM-only in exactly one
+  // candidate, not the whole range.
+  esmMismatch?: string | undefined;
+  // Set only when fan-out (--app with multiple targets, or --fan-out) is
+  // active: one entry per tested consumer, including the primary --app
+  // itself (dir "."), each run against this same already-installed
+  // sandbox. When present, `status` above is the rollup — PASSED only if
+  // every consumer passed — because "the owning workspace's tests still
+  // pass" is a much weaker claim than "every tested dependent still works."
+  consumers?: ConsumerTestResult[] | undefined;
+}
+
+export interface ConsumerTestResult {
+  // Relative to the sandboxed monorepo root; "." for the primary --app.
+  dir: string;
+  // The consumer's own package.json "name", or null if it has none.
+  name: string | null;
+  status: "PASSED" | "FAILED";
+  exitCode: number | null;
+  output?: string | undefined;
+}
+
+export type TestHarnessCaveatCode =
+  | "TRANSPILE_ONLY"
+  | "TYPE_CHECK_ONLY"
+  | "PASS_WITH_NO_TESTS";
+
+export interface TestHarnessCaveat {
+  code: TestHarnessCaveatCode;
+  severity: "warning";
+  message: string;
 }
 
 export interface CompatReport {
@@ -64,7 +100,14 @@ export interface CompatReport {
   group?: string[] | undefined;
   snapshotDir: string;
   concurrency: number;
+  // The first entry of testCommandCaveats' message, or null — kept for
+  // back-compat with agents/scripts already reading this scalar field.
   testCommandCaveat: string | null;
+  // Every static caveat detected about the app's own --test command/harness
+  // (transpile-only jest, type-check-only, --passWithNoTests). Does NOT
+  // include esmMismatch, which is per-candidate and lives on each version's
+  // own CompatVersionResult instead.
+  testCommandCaveats: TestHarnessCaveat[];
   // The currently-installed version of the package, tested the same way as
   // every candidate — null when it isn't resolvable in appDir's node_modules
   // (e.g. never installed, or a workspace-hoisted layout compat can't see).
@@ -85,13 +128,34 @@ export interface CompatReport {
   // "yarn@1.22.22" or "npm" when no version could be pinned down. Traces a
   // recommendation back to what actually produced it.
   packageManager: string;
+  // True when --seed-lockfile copied the source app's own lockfile into
+  // every sandbox before install, reproducing real resolution stickiness —
+  // the pinned candidate then forces a minimal update against that existing
+  // tree instead of a fresh solve.
+  seededLockfile: boolean;
+  // Non-null exactly when there's something worth saying about that choice:
+  // a reduced-hermeticity warning when seededLockfile is true (a stale
+  // lockfile can mask a resolution a fresh solve would have surfaced), or a
+  // recommendation to turn it on when checkDupes is set without it (nested-
+  // fork duplicates are systematically under-reported against a fresh
+  // solve, which re-flattens the tree checkDupes was built to catch).
+  lockfileSeedNote: string | null;
+  // Relative-to-monorepo-root dirs of every fan-out consumer tested
+  // alongside the primary --app, in the same order as each version's own
+  // `consumers[1..]` — empty when fan-out wasn't requested. Report-level so
+  // the human/CLI summary can name them without digging into a version.
+  fanOutConsumers: string[];
 }
 
 export interface CompatOptions {
   range?: string | undefined;
   versions?: string[] | undefined;
   appDir: string;
-  testCommand: string;
+  // Required unless testScript is set (which runs "<manager> run <script>"
+  // per target instead). Callers must enforce that at least one is present
+  // — this stays optional at the type level so a testScript-only run
+  // type-checks without a dummy string.
+  testCommand?: string | undefined;
   registryUrl: string;
   token?: string | undefined;
   includePrerelease?: boolean | undefined;
@@ -101,6 +165,36 @@ export interface CompatOptions {
   concurrency?: number | undefined;
   preferOffline?: boolean | undefined;
   checkDupes?: boolean | undefined;
+  // Copy the source app's own lockfile into every sandbox before install,
+  // reproducing real resolution stickiness instead of a fresh solve. Off by
+  // default (a fresh solve is more hermetic — no chance of a stale lockfile
+  // masking a resolution the fresh solve would surface), but the condition
+  // --check-dupes actually needs to see a nested-fork regression.
+  seedLockfile?: boolean | undefined;
+  // Explicit extra workspace directories to test as consumers, in addition
+  // to appDir, in the same sandbox — e.g. from expanding --app 'apps/*' or
+  // --app libs/a,libs/b down to everything after the first match. Forces
+  // workspace sandbox mode: consumers are sibling packages, so they must
+  // physically exist alongside appDir in the sandbox. Mutually exclusive
+  // with fanOut.
+  consumerApps?: string[] | undefined;
+  // Auto-discover consumers instead of listing them: every workspace under
+  // the monorepo root (other than appDir) that directly declares pkgName in
+  // dependencies/devDependencies/peerDependencies, ranked by how many
+  // distinct symbols it actually imports from pkgName (scanImportedSymbols)
+  // and capped at fanOutTop. A workspace that only gets pkgName through
+  // hoisting (imports it but doesn't declare it) is not eligible — pinning
+  // requires a section to pin it into.
+  fanOut?: boolean | undefined;
+  // Cap on auto-discovered consumers (fanOut only) — fan-out multiplies
+  // wall clock per version, so this bounds it. Default 5.
+  fanOutTop?: number | undefined;
+  // Run `<packageManager> run <testScript>` in each consumer's own
+  // directory instead of the single `testCommand` for all of them.
+  // Consumers rarely share one test command; forcing them to is how a
+  // fan-out ends up only really testing one app. Ignored (testCommand
+  // applies to every target) when not set.
+  testScript?: string | undefined;
   // Force sandboxing to only appDir ("hermetic") or the whole discovered
   // monorepo root ("workspace"), overriding the automatic workspace:-protocol
   // detection. Errors if "workspace" is requested but no root is found.
@@ -271,6 +365,73 @@ async function findWorkspacesDeclaring(
   return declaring.sort();
 }
 
+export interface ConsumerTarget {
+  // Absolute path on the real (unsandboxed) disk.
+  absoluteDir: string;
+  // Relative to the monorepo root — this is what locates it again once
+  // copied into the sandbox.
+  relativeDir: string;
+}
+
+/**
+ * Auto-discover fan-out consumers: every workspace under monorepoRoot
+ * (other than appDir) that directly declares pkgName in
+ * dependencies/devDependencies/peerDependencies — a workspace that only
+ * gets pkgName through hoisting doesn't have a section to pin it into, so
+ * it's not eligible here even if it imports it. Ranked by how many
+ * distinct symbols it actually imports from pkgName (scanImportedSymbols),
+ * descending, and capped at `top`.
+ */
+// Resolves symlinks on both sides before comparing, so a workspace dir that
+// only *looks* contained (e.g. a symlink pointing outside monorepoRoot)
+// can't slip through — relativeDir is later joined straight into a sandbox
+// path (createSandbox, testOneVersion), so an uncontained target isn't just
+// a bookkeeping error, it's compat rewriting/executing a real external
+// directory while believing it's sandboxed. Falls back to the
+// non-realpath'd absolute dir if either side doesn't exist yet (lets the
+// caller's own "no package.json found" error fire with a clearer message
+// than an ENOENT from realpath would).
+async function assertConsumerWithinMonorepo(monorepoRoot: string, absoluteDir: string): Promise<void> {
+  const [realRoot, realTarget] = await Promise.all([
+    fs.realpath(monorepoRoot).catch(() => path.resolve(monorepoRoot)),
+    fs.realpath(absoluteDir).catch(() => path.resolve(absoluteDir)),
+  ]);
+  const rel = path.relative(realRoot, realTarget);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error(
+      `Fan-out consumer "${absoluteDir}" resolves outside the monorepo root "${monorepoRoot}" ` +
+        `(possibly via a symlink or a "../" path) — refusing to sandbox it. Fan-out consumers must ` +
+        `be real subdirectories of the discovered workspaces root.`,
+    );
+  }
+}
+
+export async function resolveFanOutConsumers(
+  pkgName: string,
+  monorepoRoot: string,
+  appDir: string,
+  top: number,
+): Promise<ConsumerTarget[]> {
+  const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
+  const resolvedAppDir = path.resolve(appDir);
+
+  const candidates: { dir: string; symbolCount: number }[] = [];
+  for (const dir of workspaceDirs) {
+    if (path.resolve(dir) === resolvedAppDir) continue;
+    const packageJson = await readJsonFile<PackageJson>(path.join(dir, "package.json"));
+    if (!packageJson || !findDependencySection(packageJson, pkgName)) continue;
+    const { symbols } = await scanImportedSymbols(dir, pkgName);
+    candidates.push({ dir, symbolCount: symbols.size });
+  }
+
+  candidates.sort((a, b) => b.symbolCount - a.symbolCount || a.dir.localeCompare(b.dir));
+
+  return candidates.slice(0, top).map(({ dir }) => ({
+    absoluteDir: path.resolve(dir),
+    relativeDir: path.relative(monorepoRoot, path.resolve(dir)),
+  }));
+}
+
 const SANDBOX_PREFIX = "packdev-compat-sandbox-";
 const EXCLUDED_COPY_NAMES = new Set([
   "node_modules",
@@ -318,33 +479,66 @@ export async function createSandbox(
   // was only ever reflected in the JSON report, never in which binary
   // actually ran the install.
   packageManagerPin?: { manager: PackageManagerInfo["manager"]; version: string },
+  // The detected package manager's own lock file name (e.g. "yarn.lock"),
+  // only when --seed-lockfile is on. Copying it in reproduces the real
+  // repo's resolution stickiness — the pinned version then forces a minimal
+  // update against that existing tree instead of a fresh solve, which is
+  // the condition under which --check-dupes can actually see a nested-fork
+  // regression. Undefined/other lockfiles stay excluded either way; a
+  // pnpm-lock.yaml has no business in an npm sandbox regardless.
+  seedLockfileName?: string,
+  // Fan-out consumers: each gets `version` pinned into its own package.json
+  // at `sandboxDir/relativePath`, the same way as the primary appRelativePath
+  // above — a lockstep group pin (pinTargets may include --group members
+  // too) applied per consumer, since each consumer declares its own range
+  // for pkgName independently of the primary app's.
+  extraPinTargets?: { relativePath: string; pinTargets: PinTarget[] }[],
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
 
   await fs.cp(sourceDir, sandboxDir, {
     recursive: true,
-    filter: (source: string) => !EXCLUDED_COPY_NAMES.has(path.basename(source)),
+    filter: (source: string) => {
+      const base = path.basename(source);
+      if (seedLockfileName && base === seedLockfileName) return true;
+      return !EXCLUDED_COPY_NAMES.has(base);
+    },
   });
 
-  const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
-  const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
-  if (!packageJson) {
-    throw new Error(
-      `No package.json found in sandboxed copy of ${path.join(sourceDir, appRelativePath)}`,
-    );
+  const pinOnePackageJson = async (
+    relativePath: string,
+    targets: PinTarget[],
+  ): Promise<void> => {
+    const packageJsonPath = path.join(sandboxDir, relativePath, "package.json");
+    const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
+    if (!packageJson) {
+      throw new Error(
+        `No package.json found in sandboxed copy of ${path.join(sourceDir, relativePath)}`,
+      );
+    }
+    for (const { name, section } of targets) {
+      packageJson[section] = {
+        ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
+        [name]: version,
+      };
+    }
+    await writeJsonFile(packageJsonPath, packageJson);
+  };
+
+  await pinOnePackageJson(appRelativePath, pinTargets);
+  for (const consumer of extraPinTargets ?? []) {
+    await pinOnePackageJson(consumer.relativePath, consumer.pinTargets);
   }
 
-  for (const { name, section } of pinTargets) {
-    packageJson[section] = {
-      ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
-      [name]: version,
-    };
-  }
   if (packageManagerPin) {
-    packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+    const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
+    const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
+    if (packageJson) {
+      packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+      await writeJsonFile(packageJsonPath, packageJson);
+    }
   }
-  await writeJsonFile(packageJsonPath, packageJson);
 
   // Install always runs from sandboxDir's own root (see testOneVersion), not
   // appRelativePath — in a sandboxed monorepo that's a different package.json
@@ -538,6 +732,11 @@ async function collectDupeCounts(
   return counts;
 }
 
+export interface EsmCheckContext {
+  consumerIsCjsBlind: boolean;
+  controlInfo: PackageInfo | null;
+}
+
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
 async function testOneVersion(
@@ -550,6 +749,8 @@ async function testOneVersion(
   workspaceProtocolDeps: string[],
   monorepoRoot: string | null,
   appRelativePath: string,
+  esmCheck: EsmCheckContext,
+  consumerTargets: ResolvedConsumerTarget[],
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
 
@@ -586,6 +787,10 @@ async function testOneVersion(
       packageManagerInfo.version !== undefined
         ? { manager: packageManagerInfo.manager, version: packageManagerInfo.version }
         : undefined,
+      options.seedLockfile ? packageManagerInfo.lockFile : undefined,
+      consumerTargets.length > 0
+        ? consumerTargets.map((c) => ({ relativePath: c.relativePath, pinTargets: c.pinTargets }))
+        : undefined,
     );
 
     const installResult = await runInstall(
@@ -618,17 +823,83 @@ async function testOneVersion(
       ? await collectDupeCounts(pkgName, sandboxDir, testCwdRelative)
       : undefined;
 
+    const esmMismatch = esmCheck.consumerIsCjsBlind
+      ? await (async () => {
+          const candidateDir = await resolveInstalledPackage(
+            pkgName,
+            path.join(sandboxDir!, testCwdRelative),
+          );
+          const candidateInfo = candidateDir
+            ? await readJsonFile<PackageInfo>(path.join(candidateDir, "package.json"))
+            : null;
+          return detectEsmMismatch(true, esmCheck.controlInfo, candidateInfo);
+        })()
+      : undefined;
+
+    const effectiveTestCommand = options.testScript
+      ? `${packageManagerInfo.manager} run ${options.testScript}`
+      : (options.testCommand ?? "");
+
     const testCwd = path.join(sandboxDir, testCwdRelative);
-    const testResult = await runTestCommand(testCwd, options.testCommand);
+    const testResult = await runTestCommand(testCwd, effectiveTestCommand);
+
+    let consumers: ConsumerTestResult[] | undefined;
+    // The exitCode/output a caller sees when `status` is the fan-out
+    // rollup: default to the primary's own result, but if the primary
+    // itself passed and a consumer is what actually failed, surface that
+    // consumer's exitCode/output instead — otherwise a top-level
+    // "FAILED, exitCode 0, no output" would be internally contradictory
+    // for any caller that doesn't also inspect `consumers`.
+    let rolledUpExitCode = testResult.exitCode;
+    let rolledUpOutput = testResult.success ? undefined : testResult.output;
+    let overallSuccess = testResult.success;
+    if (consumerTargets.length > 0) {
+      const primaryPackageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(testCwd, "package.json"),
+      );
+      consumers = [
+        {
+          dir: ".",
+          name: primaryPackageJson?.name ?? null,
+          status: testResult.success ? "PASSED" : "FAILED",
+          exitCode: testResult.exitCode,
+          output: testResult.success ? undefined : testResult.output,
+        },
+      ];
+      for (const consumer of consumerTargets) {
+        const consumerCwd = path.join(sandboxDir, consumer.relativePath);
+        const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
+        const consumerPackageJson = await readJsonFile<PackageJson & { name?: string }>(
+          path.join(consumerCwd, "package.json"),
+        );
+        consumers.push({
+          dir: consumer.relativePath,
+          name: consumerPackageJson?.name ?? null,
+          status: consumerResult.success ? "PASSED" : "FAILED",
+          exitCode: consumerResult.exitCode,
+          output: consumerResult.success ? undefined : consumerResult.output,
+        });
+        if (overallSuccess && !consumerResult.success) {
+          // First failure seen — the primary passed, so this consumer is
+          // the one actually explaining the rollup.
+          rolledUpExitCode = consumerResult.exitCode;
+          rolledUpOutput = consumerResult.output;
+        }
+        overallSuccess = overallSuccess && consumerResult.success;
+      }
+    }
+
     return {
       version,
-      status: testResult.success ? "PASSED" : "FAILED",
-      exitCode: testResult.exitCode,
+      status: overallSuccess ? "PASSED" : "FAILED",
+      exitCode: rolledUpExitCode,
       durationMs: Date.now() - startedAt,
-      output: testResult.success ? undefined : testResult.output,
+      output: rolledUpOutput,
       lockfileHash: snapshot.hash,
       lockfileSnapshotPath: snapshot.path,
       dupeCounts,
+      esmMismatch,
+      consumers,
     };
   } finally {
     if (sandboxDir) await cleanupSandbox(sandboxDir);
@@ -652,6 +923,12 @@ function parsePackageManagerOverride(spec: string): PackageManagerInfo {
   };
 }
 
+export interface ResolvedConsumerTarget {
+  relativePath: string;
+  pinTargets: PinTarget[];
+  absoluteDir: string;
+}
+
 async function resolveRunContext(
   pkgName: string,
   options: CompatOptions,
@@ -662,7 +939,16 @@ async function resolveRunContext(
   monorepoRoot: string | null;
   appRelativePath: string;
   sandboxMode: "hermetic" | "workspace";
+  consumerTargets: ResolvedConsumerTarget[];
 }> {
+  if (options.consumerApps && options.consumerApps.length > 0 && options.fanOut) {
+    throw new Error(
+      "`consumerApps` (explicit fan-out targets) and `fanOut` (auto-discovery) are mutually " +
+        "exclusive — pick one. Silently preferring the explicit list would make a requested " +
+        "auto-discovery disappear without any indication why.",
+    );
+  }
+
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
   if (!appPackageJson) {
@@ -686,10 +972,14 @@ async function resolveRunContext(
   }
   const workspaceProtocolDeps = findWorkspaceProtocolDeps(appPackageJson);
 
+  const wantsFanOut = (options.consumerApps && options.consumerApps.length > 0) || !!options.fanOut;
+
   let monorepoRoot: string | null = null;
   let appRelativePath = "";
   const wantsWorkspaceRoot =
-    options.mode === "workspace" || (options.mode === undefined && workspaceProtocolDeps.length > 0);
+    options.mode === "workspace" ||
+    wantsFanOut ||
+    (options.mode === undefined && workspaceProtocolDeps.length > 0);
   if (wantsWorkspaceRoot) {
     monorepoRoot = await findMonorepoRoot(options.appDir);
     if (monorepoRoot) {
@@ -702,12 +992,55 @@ async function resolveRunContext(
         `pnpm-workspace.yaml) could be found anywhere above ${options.appDir}.`,
     );
   }
+  if (wantsFanOut && !monorepoRoot) {
+    throw new Error(
+      `Fan-out (multiple --app targets, or --fan-out) requires a discoverable workspaces root ` +
+        `(package.json "workspaces" or pnpm-workspace.yaml) above ${options.appDir}, but none ` +
+        `was found — consumers are sibling packages, so they must physically exist alongside ` +
+        `--app in the sandbox.`,
+    );
+  }
   const sandboxMode: "hermetic" | "workspace" = monorepoRoot ? "workspace" : "hermetic";
+
+  const consumerTargets: ResolvedConsumerTarget[] = [];
+  if (wantsFanOut && monorepoRoot) {
+    const consumers: ConsumerTarget[] =
+      options.consumerApps && options.consumerApps.length > 0
+        ? options.consumerApps.map((d) => ({
+            absoluteDir: path.resolve(d),
+            relativeDir: path.relative(monorepoRoot!, path.resolve(d)),
+          }))
+        : await resolveFanOutConsumers(pkgName, monorepoRoot, options.appDir, options.fanOutTop ?? 5);
+
+    for (const consumer of consumers) {
+      await assertConsumerWithinMonorepo(monorepoRoot, consumer.absoluteDir);
+      const consumerPackageJson = await readJsonFile<PackageJson>(
+        path.join(consumer.absoluteDir, "package.json"),
+      );
+      if (!consumerPackageJson) {
+        throw new Error(`No package.json found in consumer directory: ${consumer.absoluteDir}`);
+      }
+      const consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
+      consumerTargets.push({
+        relativePath: consumer.relativeDir,
+        pinTargets: consumerPinTargets,
+        absoluteDir: consumer.absoluteDir,
+      });
+    }
+  }
 
   const packageManagerInfo = options.packageManager
     ? parsePackageManagerOverride(options.packageManager)
     : await detectPackageManager(options.appDir);
-  return { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode };
+  return {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  };
 }
 
 /**
@@ -737,32 +1070,17 @@ async function runWithConcurrencyLimit<T, R>(
   return results;
 }
 
-/**
- * PASSED/FAILED from compat is only as trustworthy as the --test command
- * itself: a transpile-only jest setup (ts-jest isolatedModules, babel-jest,
- * @swc/jest with no separate type-check step) never actually reads the
- * dependency's .d.ts, so a version with a genuinely broken type surface can
- * still "pass" a test suite that never type-checks. This is a best-effort
- * heuristic over the app's jest config — false negatives (missing a real
- * transpile-only setup) are expected and fine; it only needs to catch the
- * common cases well enough to warn.
- */
-async function detectTranspileOnlyTestSetup(
-  appDir: string,
-  testCommand: string,
-): Promise<string | null> {
-  if (!/\bjest\b/i.test(testCommand)) return null;
+const JEST_CONFIG_CANDIDATES = [
+  "jest.config.js",
+  "jest.config.cjs",
+  "jest.config.mjs",
+  "jest.config.ts",
+  "jest.config.json",
+];
 
-  const configCandidates = [
-    "jest.config.js",
-    "jest.config.cjs",
-    "jest.config.mjs",
-    "jest.config.ts",
-    "jest.config.json",
-  ];
-
+async function readJestConfigSources(appDir: string): Promise<string[]> {
   const sources: string[] = [];
-  for (const name of configCandidates) {
+  for (const name of JEST_CONFIG_CANDIDATES) {
     const configPath = path.join(appDir, name);
     if (await fileExists(configPath)) {
       sources.push(await fs.readFile(configPath, "utf-8"));
@@ -772,15 +1090,166 @@ async function detectTranspileOnlyTestSetup(
   if (await fileExists(pkgJsonPath)) {
     sources.push(await fs.readFile(pkgJsonPath, "utf-8"));
   }
+  return sources;
+}
 
-  const combined = sources.join("\n");
-  if (/isolatedModules["']?\s*:\s*true/.test(combined)) {
-    return "jest config uses ts-jest with isolatedModules:true — this transpiles TypeScript without type-checking it, so a version with a broken type surface can still pass";
+// Resolves what "the test command" actually is for harness-analysis
+// purposes at `dir`: with --test-script, that's each target's OWN
+// package.json script body (e.g. "jest --coverage"), not the literal
+// "<manager> run <script>" invocation — the latter never contains the word
+// "jest" even when the script it runs does, which would otherwise make
+// every TRANSPILE_ONLY/TYPE_CHECK_ONLY/PASS_WITH_NO_TESTS/ESM-mismatch
+// check silently no-op for the --test-script path (the recommended way to
+// run fan-out, where this would matter most). Falls back to the literal
+// invocation if the script name isn't found in package.json (e.g. defined
+// some other way) rather than analyzing nothing.
+async function resolveHarnessCommand(
+  dir: string,
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+): Promise<string> {
+  if (!options.testScript) return options.testCommand ?? "";
+  const packageJson = await readJsonFile<PackageJson & { scripts?: Record<string, string> }>(
+    path.join(dir, "package.json"),
+  );
+  return packageJson?.scripts?.[options.testScript] ?? `${packageManagerInfo.manager} run ${options.testScript}`;
+}
+
+/**
+ * analyzeTestHarness against every target's own effective command (primary
+ * --app, plus each fan-out consumer when --test-script is set — each may
+ * define a different script), merged by caveat code so a gap found in any
+ * one target's harness is still surfaced once. Report-level
+ * testCommandCaveats is necessarily a single merged list, not attributed
+ * per-target; consumers[].output on a FAILED run still names which target
+ * actually failed if that's what's needed next.
+ */
+async function analyzeTestHarnessAcrossTargets(
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  consumerTargets: ResolvedConsumerTarget[],
+): Promise<TestHarnessCaveat[]> {
+  const merged = new Map<string, TestHarnessCaveat>();
+  const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
+  for (const caveat of await analyzeTestHarness(options.appDir, primaryCommand)) {
+    merged.set(caveat.code, caveat);
   }
-  if (/@swc\/jest|babel-jest/.test(combined)) {
-    return "jest config transforms TypeScript via @swc/jest or babel-jest — these transpile without type-checking, so a version with a broken type surface can still pass";
+  // Every consumer gets analyzed, --test-script or not: with a shared
+  // --test command (no --test-script), testOneVersion still runs that same
+  // command from each consumer's OWN directory, which reads that
+  // consumer's OWN jest config — a consumer using isolatedModules/
+  // babel-jest/passWithNoTests would otherwise never surface here just
+  // because the command string itself is shared. resolveHarnessCommand
+  // already falls back to the shared testCommand when testScript is unset.
+  for (const consumer of consumerTargets) {
+    const consumerCommand = await resolveHarnessCommand(consumer.absoluteDir, options, packageManagerInfo);
+    for (const caveat of await analyzeTestHarness(consumer.absoluteDir, consumerCommand)) {
+      if (!merged.has(caveat.code)) merged.set(caveat.code, caveat);
+    }
   }
-  return null;
+  return [...merged.values()];
+}
+
+/**
+ * PASSED/FAILED from compat is only as trustworthy as the --test command
+ * itself. This is a best-effort heuristic over the app's test command and
+ * jest config — false negatives are expected and fine; it only needs to
+ * catch the common cases well enough to warn:
+ *
+ * - TRANSPILE_ONLY: a transpile-only jest setup (ts-jest isolatedModules,
+ *   babel-jest, @swc/jest with no separate type-check step) never actually
+ *   reads the dependency's .d.ts, so a version with a genuinely broken type
+ *   surface can still "pass".
+ * - TYPE_CHECK_ONLY: the exact mirror — a bare `tsc --noEmit` and nothing
+ *   else can see a broken type surface, but nothing runtime-only (an
+ *   ESM-only bump, a duplicate-copy regression, a behavior change).
+ * - PASS_WITH_NO_TESTS: jest's --passWithNoTests makes a suite that matches
+ *   zero test files exit 0 — PASSED then asserts nothing at all.
+ */
+export async function analyzeTestHarness(
+  appDir: string,
+  testCommand: string,
+): Promise<TestHarnessCaveat[]> {
+  const caveats: TestHarnessCaveat[] = [];
+  const isJest = /\bjest\b/i.test(testCommand);
+
+  if (isJest) {
+    const combined = (await readJestConfigSources(appDir)).join("\n");
+    if (/isolatedModules["']?\s*:\s*true/.test(combined)) {
+      caveats.push({
+        code: "TRANSPILE_ONLY",
+        severity: "warning",
+        message:
+          "jest config uses ts-jest with isolatedModules:true — this transpiles TypeScript without type-checking it, so a version with a broken type surface can still pass",
+      });
+    } else if (/@swc\/jest|babel-jest/.test(combined)) {
+      caveats.push({
+        code: "TRANSPILE_ONLY",
+        severity: "warning",
+        message:
+          "jest config transforms TypeScript via @swc/jest or babel-jest — these transpile without type-checking, so a version with a broken type surface can still pass",
+      });
+    }
+    if (/--passWithNoTests\b/.test(testCommand) || /passWithNoTests["']?\s*:\s*true/.test(combined)) {
+      caveats.push({
+        code: "PASS_WITH_NO_TESTS",
+        severity: "warning",
+        message:
+          "--passWithNoTests is set — a run that matches zero test files still exits 0, so PASSED here may mean the suite never actually ran against this version",
+      });
+    }
+  }
+
+  // Only a bare `tsc`/`tsc --noEmit` counts — a command that pipes into or
+  // chains after a real runner (`tsc --noEmit && jest`, `npm test`) isn't
+  // type-check-only, and testCommand is a whole shell command, not just
+  // the binary name, so this must anchor rather than substring-match.
+  if (/^\s*(npx\s+)?tsc(\s+--\S+)*\s*$/i.test(testCommand.trim())) {
+    caveats.push({
+      code: "TYPE_CHECK_ONLY",
+      severity: "warning",
+      message:
+        "--test only runs tsc — this can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change); include your real test suite for ground-truth coverage",
+    });
+  }
+
+  return caveats;
+}
+
+/**
+ * True when the app's own test command is a jest run that will choke on an
+ * ESM-only dependency: not itself "type":"module" (an ESM package can import
+ * another ESM package fine) and no evidence the app customized jest's
+ * default transformIgnorePatterns (['/node_modules/']), which otherwise
+ * leaves every package under node_modules untransformed. Best-effort by
+ * design — a custom transformIgnorePatterns override that still blocks this
+ * particular package is a false negative this can't see, and that's fine.
+ */
+async function isConsumerCjsBlindToEsm(appDir: string, testCommand: string): Promise<boolean> {
+  if (!/\bjest\b/i.test(testCommand)) return false;
+
+  const appPackageJson = await readJsonFile<PackageJson>(path.join(appDir, "package.json"));
+  if ((appPackageJson as { type?: string } | null)?.type === "module") return false;
+
+  const combined = (await readJestConfigSources(appDir)).join("\n");
+  return !/transformIgnorePatterns/.test(combined);
+}
+
+/**
+ * Per-candidate ESM-only advisory: fires only when the app's test harness is
+ * CJS-blind to jest's default node_modules transform-skip AND this specific
+ * candidate looks ESM-only relative to the control. Unlike
+ * analyzeTestHarness's caveats, this can't be computed once up front — a
+ * package can go ESM-only in exactly one candidate version, not the whole
+ * tested range.
+ */
+async function detectEsmMismatch(
+  consumerIsCjsBlind: boolean,
+  controlInfo: PackageInfo | null,
+  candidateInfo: PackageInfo | null,
+): Promise<string | undefined> {
+  if (!consumerIsCjsBlind || !controlInfo || !candidateInfo) return undefined;
+  return esmOnlyAdvisory(controlInfo, candidateInfo);
 }
 
 // The version currently resolved in appDir's node_modules — null when it
@@ -809,6 +1278,8 @@ async function resolveControlResult(
   monorepoRoot: string | null,
   appRelativePath: string,
   alreadyTested: CompatVersionResult[],
+  esmCheck: EsmCheckContext,
+  consumerTargets: ResolvedConsumerTarget[],
 ): Promise<CompatVersionResult | null> {
   const controlVersion = await resolveControlVersion(pkgName, options.appDir);
   if (!controlVersion) return null;
@@ -826,7 +1297,28 @@ async function resolveControlResult(
     workspaceProtocolDeps,
     monorepoRoot,
     appRelativePath,
+    esmCheck,
+    consumerTargets,
   );
+}
+
+// Resolves once per run: whether the app's own test command is CJS-blind to
+// an ESM-only jest transform gap, and — only if so — the control's package.json,
+// since detectEsmMismatch needs both to say anything.
+async function resolveEsmCheckContext(
+  pkgName: string,
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+): Promise<EsmCheckContext> {
+  const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
+  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, primaryCommand);
+  if (!consumerIsCjsBlind) return { consumerIsCjsBlind: false, controlInfo: null };
+
+  const controlDir = await resolveInstalledPackage(pkgName, options.appDir);
+  const controlInfo = controlDir
+    ? await readJsonFile<PackageInfo>(path.join(controlDir, "package.json"))
+    : null;
+  return { consumerIsCjsBlind: true, controlInfo };
 }
 
 // Mutates `versions` in place: for each one with dupeCounts, compares each
@@ -857,6 +1349,47 @@ function applyDupesRegressions(
   }
 }
 
+// The actual sandbox source root matches testOneVersion's own choice
+// (monorepoRoot when set, appDir otherwise) — --seed-lockfile only does
+// anything if that root really has the detected/overridden manager's
+// lockfile; a manager override naming a manager whose lockfile isn't
+// actually present there means createSandbox silently copies nothing, and
+// the report must say so rather than claiming a seed that didn't happen.
+async function resolveSeededLockfile(
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  monorepoRoot: string | null,
+): Promise<boolean> {
+  if (!options.seedLockfile) return false;
+  const sourceRoot = monorepoRoot ?? options.appDir;
+  return fileExists(path.join(sourceRoot, packageManagerInfo.lockFile));
+}
+
+function computeLockfileSeedNote(options: CompatOptions, seededLockfile: boolean): string | null {
+  if (options.seedLockfile && !seededLockfile) {
+    return (
+      "--seed-lockfile was requested, but no lockfile for the detected/overridden package " +
+      "manager was found at the sandbox source root — nothing was actually seeded, every " +
+      "sandbox got a fresh solve as if the flag were off."
+    );
+  }
+  if (seededLockfile) {
+    return (
+      "--seed-lockfile is on: every sandbox started from the app's own lockfile, so the " +
+      "install is less hermetic than a fresh solve — a resolution a clean install would have " +
+      "surfaced can stay masked if the seeded lockfile is already stale."
+    );
+  }
+  if (options.checkDupes) {
+    return (
+      "--check-dupes is on without --seed-lockfile: a fresh solve re-flattens the dependency " +
+      "tree, which can hide exactly the nested-fork duplicate class --check-dupes was built to " +
+      "catch. Add --seed-lockfile to reproduce the real repo's resolution stickiness."
+    );
+  }
+  return null;
+}
+
 export async function runCompat(
   pkgName: string,
   options: CompatOptions,
@@ -864,14 +1397,19 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
-    await resolveRunContext(pkgName, options);
+  const {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  } = await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
-  const testCommandCaveat = await detectTranspileOnlyTestSetup(
-    options.appDir,
-    options.testCommand,
-  );
+  const testCommandCaveats = await analyzeTestHarnessAcrossTargets(options, packageManagerInfo, consumerTargets);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options, packageManagerInfo);
 
   const versions = await runWithConcurrencyLimit(
     candidateVersions,
@@ -887,6 +1425,8 @@ export async function runCompat(
         workspaceProtocolDeps,
         monorepoRoot,
         appRelativePath,
+        esmCheck,
+        consumerTargets,
       ),
   );
 
@@ -900,6 +1440,8 @@ export async function runCompat(
     monorepoRoot,
     appRelativePath,
     versions,
+    esmCheck,
+    consumerTargets,
   );
   if (options.checkDupes) applyDupesRegressions(versions, control);
   const controlFailed = control !== null && control.status !== "PASSED";
@@ -907,6 +1449,8 @@ export async function runCompat(
   const passedVersions = versions
     .filter((v) => v.status === "PASSED")
     .map((v) => v.version);
+
+  const seededLockfile = await resolveSeededLockfile(options, packageManagerInfo, monorepoRoot);
 
   return {
     package: pkgName,
@@ -922,11 +1466,15 @@ export async function runCompat(
     group: options.group,
     snapshotDir,
     concurrency,
-    testCommandCaveat,
+    testCommandCaveat: testCommandCaveats[0]?.message ?? null,
+    testCommandCaveats,
     control,
     controlFailed,
     sandboxMode,
     packageManager: formatPackageManager(packageManagerInfo),
+    seededLockfile,
+    lockfileSeedNote: computeLockfileSeedNote(options, seededLockfile),
+    fanOutConsumers: consumerTargets.map((c) => c.relativePath),
   };
 }
 
@@ -945,11 +1493,14 @@ function finishBisect(
   recommendedVersion: string | null,
   fellBackToLinearScan: boolean,
   snapshotDir: string,
-  testCommandCaveat: string | null,
+  testCommandCaveats: TestHarnessCaveat[],
   group: string[] | undefined,
   control: CompatVersionResult | null,
   sandboxMode: "hermetic" | "workspace",
   packageManagerInfo: PackageManagerInfo,
+  seededLockfile: boolean,
+  lockfileSeedNote: string | null,
+  fanOutConsumers: string[],
 ): CompatBisectReport {
   const controlFailed = control !== null && control.status !== "PASSED";
   return {
@@ -965,11 +1516,15 @@ function finishBisect(
     group,
     snapshotDir,
     concurrency: 1,
-    testCommandCaveat,
+    testCommandCaveat: testCommandCaveats[0]?.message ?? null,
+    testCommandCaveats,
     control,
     controlFailed,
     sandboxMode,
     packageManager: formatPackageManager(packageManagerInfo),
+    seededLockfile,
+    lockfileSeedNote,
+    fanOutConsumers,
   };
 }
 
@@ -1004,12 +1559,19 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
-  const testCommandCaveat = await detectTranspileOnlyTestSetup(
-    options.appDir,
-    options.testCommand,
-  );
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
-    await resolveRunContext(pkgName, options);
+  const {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  } = await resolveRunContext(pkgName, options);
+  const testCommandCaveats = await analyzeTestHarnessAcrossTargets(options, packageManagerInfo, consumerTargets);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options, packageManagerInfo);
+
+  const seededLockfile = await resolveSeededLockfile(options, packageManagerInfo, monorepoRoot);
 
   const tested: CompatVersionResult[] = [];
   const finish = async (
@@ -1026,6 +1588,8 @@ export async function runCompatBisect(
       monorepoRoot,
       appRelativePath,
       tested,
+      esmCheck,
+      consumerTargets,
     );
     return finishBisect(
       pkgName,
@@ -1035,11 +1599,14 @@ export async function runCompatBisect(
       recommendedVersion,
       false,
       snapshotDir,
-      testCommandCaveat,
+      testCommandCaveats,
       options.group,
       control,
       sandboxMode,
       packageManagerInfo,
+      seededLockfile,
+      computeLockfileSeedNote(options, seededLockfile),
+      consumerTargets.map((c) => c.relativePath),
     );
   };
 
@@ -1058,6 +1625,8 @@ export async function runCompatBisect(
       workspaceProtocolDeps,
       monorepoRoot,
       appRelativePath,
+      esmCheck,
+      consumerTargets,
     );
 
   const topIndex = candidateVersions.length - 1;

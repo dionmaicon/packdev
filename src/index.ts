@@ -35,7 +35,8 @@ import {
   type CompatReport,
   type CompatBisectReport,
 } from "./compat";
-import { findDuplicateResolutions } from "./dupes";
+import { findDuplicateResolutions, expandGlob } from "./dupes";
+import { runBehaviorDiff } from "./behaviorDiff";
 
 const program = new Command();
 
@@ -637,15 +638,61 @@ program
     }
   });
 
+// `Number(value) || fallback` silently turns a genuinely valid 0 into the
+// fallback (0 is falsy) — the exact bug that let `--max-depth 0` become 3.
+// These parse strictly instead: reject non-integers and out-of-range values
+// outright rather than coercing them into something else, matching the
+// MCP tool schema's own z.number().int().min(...) validation.
+function parseIntOption(value: string, flagName: string, min: number): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    throw new Error(`${flagName} must be an integer >= ${min}, got "${value}"`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeIntOption(value: string, flagName: string): number {
+  return parseIntOption(value, flagName, 0);
+}
+
+function parsePositiveIntOption(value: string, flagName: string): number {
+  return parseIntOption(value, flagName, 1);
+}
+
+// Expands `--app`'s three accepted forms into a list of directories: a
+// single dir (unchanged), a comma-separated list, or a glob (containing
+// "*", expanded from the current directory — the common case is running
+// packdev from the monorepo root). The first entry is always the primary
+// app; the rest become fan-out consumers. A glob that matches nothing falls
+// back to the literal string as a single dir, so a non-glob value with a
+// literal "*" in a path segment (unusual, but not this function's call to
+// reject) still resolves to something rather than silently vanishing.
+async function resolveAppTargets(appOption: string): Promise<string[]> {
+  if (appOption.includes("*")) {
+    const matches = await expandGlob(process.cwd(), appOption);
+    // readdir order (what expandGlob walks) isn't guaranteed across
+    // platforms/filesystems, and the first match becomes the primary app
+    // used for --range/control resolution — sort so the same invocation
+    // always picks the same primary, not whichever the filesystem happens
+    // to list first.
+    matches.sort();
+    return matches.length > 0 ? matches : [appOption];
+  }
+  return appOption
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 program
   .command("compat")
   .description(
     "Runtime compatibility matrix: install each candidate version in an isolated sandbox and run the app's test command",
   )
   .argument("<package>", "Package name to check")
-  .requiredOption(
+  .option(
     "--test <cmd>",
-    'Command to run in each sandboxed version, e.g. "npm run build" — should include a type-check or build step; a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version',
+    'Command to run in each sandboxed version/target, e.g. "npm run build && npm test" — should include your real test suite, not just a type check: a bare `tsc --noEmit` can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change), while a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version — compat warns on both, see testCommandCaveats in --json. Required unless --test-script is given.',
   )
   .option(
     "--range <semver>",
@@ -655,7 +702,35 @@ program
     "--versions <list>",
     "Comma-separated explicit versions to test (mutually exclusive with --range)",
   )
-  .option("--app <dir>", "App directory to test", ".")
+  .option(
+    "--app <dir>",
+    'App directory to test. Accepts a single directory (default), a comma-separated list ' +
+      '("libs/a,libs/b"), or a glob ("apps/*", expanded from the current directory) — the ' +
+      "first match is the primary app (used for --range/control resolution), the rest become " +
+      "fan-out consumers tested in the same sandbox alongside it. A comma-list/glob implies " +
+      "workspace sandbox mode: consumers are sibling packages, so a discoverable monorepo root " +
+      "is required.",
+    ".",
+  )
+  .option(
+    "--fan-out",
+    "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
+      "monorepo root (other than --app) that directly declares <package>, ranked by how many " +
+      "distinct symbols it imports from it and capped at --top. Testing only the owning " +
+      "workspace's own tests is a much weaker claim than testing what actually depends on it.",
+    false,
+  )
+  .option(
+    "--top <n>",
+    "Cap on auto-discovered fan-out consumers (--fan-out only) — fan-out multiplies wall clock per version",
+    "5",
+  )
+  .option(
+    "--test-script <name>",
+    'Run "<detected package manager> run <name>" in each target\'s own directory instead of ' +
+      "--test for all of them. Consumers rarely share one test command; forcing them to is how " +
+      "a fan-out ends up only really testing one app.",
+  )
   .option(
     "--registry <url>",
     "npm registry URL, also passed to the sandbox install (defaults to .npmrc's @scope:registry mapping, then its registry line, then the public npm registry)",
@@ -695,6 +770,11 @@ program
     false,
   )
   .option(
+    "--seed-lockfile",
+    "Copy the app's own lockfile into every sandbox before install, reproducing real resolution stickiness instead of a fresh solve — recommended with --check-dupes, which otherwise under-reports nested-fork duplicates a fresh solve re-flattens away. Less hermetic: a stale lockfile can mask a resolution a clean install would surface.",
+    false,
+  )
+  .option(
     "--mode <mode>",
     "Force sandbox mode: hermetic (copy only --app) or workspace (copy the whole discovered monorepo root) — overrides automatic workspace:-protocol detection",
   )
@@ -713,8 +793,15 @@ program
       if (options.mode && options.mode !== "hermetic" && options.mode !== "workspace") {
         throw new Error(`--mode must be "hermetic" or "workspace", got "${options.mode}"`);
       }
+      if (!options.test && !options.testScript) {
+        throw new Error("Either --test or --test-script must be provided");
+      }
 
-      const npmrc = await loadNpmrcConfig(options.app);
+      const appTargets = await resolveAppTargets(options.app);
+      const appDir = appTargets[0]!;
+      const consumerApps = appTargets.slice(1);
+
+      const npmrc = await loadNpmrcConfig(appDir);
       const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
       const token = resolveAuthToken(registryUrl, npmrc, options.token);
 
@@ -726,7 +813,7 @@ program
               .map((v: string) => v.trim())
               .filter(Boolean)
           : undefined,
-        appDir: options.app,
+        appDir,
         testCommand: options.test,
         registryUrl,
         token,
@@ -742,6 +829,11 @@ program
         concurrency: Number(options.concurrency) || 1,
         preferOffline: !!options.preferOffline,
         checkDupes: !!options.checkDupes,
+        seedLockfile: !!options.seedLockfile,
+        consumerApps: consumerApps.length > 0 ? consumerApps : undefined,
+        fanOut: !!options.fanOut,
+        fanOutTop: Number(options.top) || 5,
+        testScript: options.testScript,
         mode: options.mode as "hermetic" | "workspace" | undefined,
         packageManager: options.packageManager,
       };
@@ -777,9 +869,15 @@ program
           console.log(`⚡ Concurrency: ${report.concurrency}`);
         }
         console.log(`🧪 Sandbox mode: ${report.sandboxMode}, package manager: ${report.packageManager}`);
+        if (report.fanOutConsumers.length > 0) {
+          console.log(`🔀 Fan-out consumers: ${report.fanOutConsumers.join(", ")}`);
+        }
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
-        if (report.testCommandCaveat) {
-          console.log(`⚠️  ${report.testCommandCaveat}`);
+        for (const caveat of report.testCommandCaveats) {
+          console.log(`⚠️  ${caveat.message}`);
+        }
+        if (report.lockfileSeedNote) {
+          console.log(`⚠️  ${report.lockfileSeedNote}`);
         }
         console.log("");
 
@@ -811,6 +909,23 @@ program
               console.log(
                 `      ⚠️  ${r.package} copies ${r.controlCopies} → ${r.candidateCopies} after install`,
               );
+            }
+          }
+          if (v.esmMismatch) {
+            console.log(`      ⚠️  ${v.esmMismatch}`);
+          }
+          if (v.consumers) {
+            for (const c of v.consumers) {
+              const consumerMark = c.status === "PASSED" ? "✅" : "❌";
+              const label = c.dir === "." ? `${c.name ?? "app"} (primary)` : `${c.name ?? c.dir} (${c.dir})`;
+              console.log(`      ${consumerMark} ${label}: ${c.status}`);
+              if (c.status === "FAILED" && c.output) {
+                const indented = c.output
+                  .split("\n")
+                  .map((line) => `          ${line}`)
+                  .join("\n");
+                console.log(indented);
+              }
             }
           }
         }
@@ -884,6 +999,100 @@ program
         () => console.error("❌ Error running compat:", error),
       );
       process.exit(exitCodeFor(String(error)));
+    }
+  });
+
+program
+  .command("behavior-diff")
+  .description(
+    "EXPERIMENTAL: diffs a package's shipped code between the installed version and --to, " +
+      "filtered to functions reachable from what --app actually imports/passes. Reports " +
+      "evidence (which lines changed, which import/option-key pulled them in), never a " +
+      "verdict — requires --experimental.",
+  )
+  .argument("<package>", "Package name to check")
+  .requiredOption("--to <version>", "Version to diff against the installed (control) version")
+  .option("--app <dir>", "App directory to scan for usage, and to resolve the installed (--from) version from", ".")
+  .option(
+    "--registry <url>",
+    "npm registry URL (defaults to .npmrc resolution, then the public registry)",
+  )
+  .option("--token <token>", "Bearer token for a private registry")
+  .option("--max-depth <n>", "Local-require hops to walk out from the entry file, per version", "3")
+  .option("--max-results <n>", "Cap on distinct changed/added/removed functions returned", "20")
+  .option(
+    "--experimental",
+    "Required flag acknowledging this command's matching/reachability are both best-effort heuristics, not a sound analysis",
+    false,
+  )
+  .action(async (packageName: string, options) => {
+    try {
+      if (!options.experimental) {
+        throw new Error(
+          "behavior-diff is experimental — pass --experimental to run it. Its function-matching " +
+            "(by name, across two versions' shipped code) and reachability (textual mention, not a " +
+            "real call graph) are both best-effort heuristics: expect false negatives, and read its " +
+            "output as evidence to investigate, never as a verdict.",
+        );
+      }
+      const maxDepth = parseNonNegativeIntOption(options.maxDepth, "--max-depth");
+      const maxResults = parsePositiveIntOption(options.maxResults, "--max-results");
+
+      const npmrc = await loadNpmrcConfig(options.app);
+      const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
+      const token = resolveAuthToken(registryUrl, npmrc, options.token);
+
+      const report = await runBehaviorDiff(packageName, options.to, {
+        appDir: options.app,
+        registryUrl,
+        token,
+        maxDepth,
+        maxResults,
+      });
+
+      output({ command: "behavior-diff", ...report }, () => {
+        console.log(`🔬 ${report.package} — behavior diff ${report.from} → ${report.to} (EXPERIMENTAL)`);
+        if (report.degraded) {
+          console.log(`⚠️  ${report.degraded}`);
+          console.log("No diff could be produced.");
+          return;
+        }
+        console.log(
+          `🌱 Seed: ${report.seedSymbols.length} imported symbol(s), ${report.seedOptionKeys.length} option key(s)`,
+        );
+        if (report.seedSymbols.length > 0) console.log(`   symbols: ${report.seedSymbols.join(", ")}`);
+        if (report.seedOptionKeys.length > 0) console.log(`   option keys: ${report.seedOptionKeys.join(", ")}`);
+        if (report.dynamicUsageCaveat) console.log(`⚠️  ${report.dynamicUsageCaveat}`);
+        console.log("");
+        if (report.changes.length === 0) {
+          console.log("No changes found in code reachable from your app's usage.");
+          return;
+        }
+        for (const change of report.changes) {
+          const mark = change.kind === "added" ? "➕" : change.kind === "removed" ? "➖" : "🔀";
+          console.log(
+            `${mark} ${change.name} (${change.file}, ${change.kind}, score ${change.score}) — reachable via: ${change.reachableVia.join(", ")}`,
+          );
+          if (change.diff) {
+            for (const line of change.diff) console.log(`    ${line}`);
+          }
+          console.log("");
+        }
+        if (report.truncated) {
+          console.log(`... ${report.totalChanges - report.changes.length} more changes not shown (--max-results)`);
+        }
+      });
+    } catch (error) {
+      output(
+        {
+          command: "behavior-diff",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error running behavior-diff:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
     }
   });
 
