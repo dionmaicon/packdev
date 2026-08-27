@@ -167,17 +167,48 @@ export function createPackdevMcpServer(): McpServer {
           .describe(
             'Version range to resolve candidates from instead of listing them explicitly, e.g. ">=1.0.0 <3.0.0" — mutually exclusive with `versions`',
           ),
-        app: z.string().default(".").describe("App directory to test"),
+        app: z.string().default(".").describe("Primary app directory to test — used for `range`/control resolution"),
+        consumerApps: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Extra workspace directories to test as fan-out consumers alongside `app`, in the " +
+              "same sandbox. Testing only the owning package's own tests is a much weaker claim " +
+              "than testing what actually depends on it. Requires a discoverable monorepo root " +
+              "above `app` (consumers are sibling packages). Mutually exclusive with `fanOut`.",
+          ),
+        fanOut: z
+          .boolean()
+          .optional()
+          .describe(
+            "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
+              "monorepo root (other than `app`) that directly declares `package`, ranked by how " +
+              "many distinct symbols it imports from it and capped at `fanOutTop`.",
+          ),
+        fanOutTop: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Cap on auto-discovered fan-out consumers (`fanOut` only). Default 5."),
+        testScript: z
+          .string()
+          .optional()
+          .describe(
+            'Run "<detected package manager> run <testScript>" in each target\'s own directory ' +
+              "instead of `test` for all of them — consumers rarely share one test command.",
+          ),
         test: z
           .string()
+          .optional()
           .describe(
-            'Command to run in each sandboxed version, e.g. "npm run build && npm test" — ' +
+            'Command to run in each sandboxed version/target, e.g. "npm run build && npm test" — ' +
               "should include your real test suite, not just a type check: a bare `tsc --noEmit` " +
               "can see a broken type surface but nothing runtime-only (an ESM-only bump, a " +
               "duplicate-copy regression, an actual behavior change), while a transpile-only " +
               "jest setup (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the " +
               "dependency's types at all. The response's testCommandCaveats[] reports which of " +
-              "these it detected for this exact command.",
+              "these it detected for this exact command. Required unless testScript is given.",
           ),
         registry: z.string().optional().describe("npm registry URL, used for the sandboxed install"),
         token: z
@@ -246,6 +277,9 @@ export function createPackdevMcpServer(): McpServer {
         if (args.range && args.versions && args.versions.length > 0) {
           throw new Error("`range` and `versions` are mutually exclusive");
         }
+        if (!args.test && !args.testScript) {
+          throw new Error("Either `test` or `testScript` must be provided");
+        }
         const appDir = args.app ?? ".";
         const { registryUrl, token } = await resolveRegistryAndToken(
           args.package,
@@ -272,6 +306,10 @@ export function createPackdevMcpServer(): McpServer {
           ...(args.preferOffline !== undefined ? { preferOffline: args.preferOffline } : {}),
           ...(args.checkDupes !== undefined ? { checkDupes: args.checkDupes } : {}),
           ...(args.seedLockfile !== undefined ? { seedLockfile: args.seedLockfile } : {}),
+          ...(args.consumerApps !== undefined ? { consumerApps: args.consumerApps } : {}),
+          ...(args.fanOut !== undefined ? { fanOut: args.fanOut } : {}),
+          ...(args.fanOutTop !== undefined ? { fanOutTop: args.fanOutTop } : {}),
+          ...(args.testScript !== undefined ? { testScript: args.testScript } : {}),
           ...(args.mode !== undefined ? { mode: args.mode } : {}),
           ...(args.packageManager !== undefined ? { packageManager: args.packageManager } : {}),
         };

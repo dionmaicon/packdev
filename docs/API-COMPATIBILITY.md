@@ -150,15 +150,18 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
       "lockfileHash": "394e9906…", "lockfileSnapshotPath": "/tmp/packdev-compat-snapshots-.../is-odd-3.0.1-npm-package-lock.json" }
   ],
   "snapshotDir": "/tmp/packdev-compat-snapshots-...", "concurrency": 1, "testCommandCaveat": null, "testCommandCaveats": [],
-  "seededLockfile": false, "lockfileSeedNote": null
+  "seededLockfile": false, "lockfileSeedNote": null, "fanOutConsumers": []
 }
 ```
 
 | Flag | Purpose |
 |---|---|
-| `--test <cmd>` | **Required.** Command to run in each sandbox, e.g. `"npm test"`. |
+| `--test <cmd>` | Command to run in each sandbox, e.g. `"npm test"`. Required unless `--test-script` is given. |
+| `--test-script <name>` | Run `"<detected package manager> run <name>"` in each target's own directory instead of `--test` for all of them — consumers rarely share one test command, so with `--fan-out`/multi-target `--app` this is usually what you want. |
 | `--range <semver>` / `--versions <list>` | Mutually exclusive — a registry range, or an explicit comma-separated list. |
-| `--app <dir>`, `--registry <url>`, `--token <token>`, `--include-prerelease`, `--include-deprecated` | Same meaning and `.npmrc` auto-detection as `api-diff`. `--registry`/`--token` here only resolve `--range` — the sandbox's own real install always uses its package manager's normal `.npmrc` auth, unaffected by `--token`. |
+| `--app <dir>`, `--registry <url>`, `--token <token>`, `--include-prerelease`, `--include-deprecated` | Same meaning and `.npmrc` auto-detection as `api-diff`. `--registry`/`--token` here only resolve `--range` — the sandbox's own real install always uses its package manager's normal `.npmrc` auth, unaffected by `--token`. `--app` also accepts a comma-separated list (`libs/a,libs/b`) or a glob (`apps/*`, expanded from the current directory) — the first match is the primary app, the rest become fan-out consumers (see below). |
+| `--fan-out` | Auto-discover fan-out consumers instead of listing them in `--app`: every workspace under the monorepo root (other than `--app`) that directly declares `<pkg>`, ranked by how many distinct symbols it imports from it, capped at `--top`. |
+| `--top <n>` | Cap on auto-discovered fan-out consumers (`--fan-out` only, default 5) — fan-out multiplies wall clock per version. |
 | `--bisect` | Binary-search the pass/fail boundary instead of testing every version (fewer runs). Re-confirms the boundary once to catch flakiness/non-monotonicity, falling back to a full linear scan if the confirmation disagrees — never trusts a fast-but-wrong answer. |
 | `--group <pkgs>` | Comma-separated peer packages to pin to the **same** version as `<pkg>` in every run (NestJS's `@nestjs/*` family, or any set that must move in lockstep). Without this, only `<pkg>` moves — its declared peers stay wherever your `package.json` already has them, which usually isn't a combination anyone actually ships. |
 | `--snapshot-dir <dir>` | Save a hashed copy of each version's resolved lockfile — the target version pins exactly, but its *own* dependencies still resolve by range, so the same target version can mean a different dependency tree across two runs. Point repeated runs at the same directory to build a diffable history. |
@@ -182,6 +185,7 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 
   `testCommandCaveat` (the first caveat's message, `null` if none) is kept for back-compat; `testCommandCaveats` is the full list of `{ code, severity, message }`. Both print in human output.
 - **`seededLockfile`/`lockfileSeedNote`**: `seededLockfile` is `true` when `--seed-lockfile` was on. `lockfileSeedNote` is non-null exactly when there's something worth saying about that choice — a reduced-hermeticity warning when seeding is on, or a recommendation to turn it on when `--check-dupes` is set without it (a fresh solve re-flattens the tree, which can hide exactly the nested-fork duplicate class `--check-dupes` was built to catch).
+- **Fan-out: test the dependents, not just the owner.** Testing only the package that declares `<pkg>` is a weak claim in a monorepo — its own tests can pass while a sibling workspace that actually exercises the changed behavior breaks. With `--fan-out` or a multi-target `--app`, every target is pinned and tested in **one shared sandbox** (this forces workspace sandbox mode — consumers are sibling packages, so a discoverable monorepo root is required above the primary `--app`). Each `CompatVersionResult.consumers[]` entry — `{ dir, name, status, exitCode, output }`, `dir: "."` for the primary app — is one target's own test run against that already-installed version; `status` at the top level becomes the **rollup**, `"PASSED"` only if every consumer passed. Report-level `fanOutConsumers` lists which dirs were actually tested (auto-discovered ones too), so you don't have to dig into a version to see who was covered. A workspace only reachable via hoisting (imports `<pkg>` but doesn't declare it) isn't eligible for auto-discovery — there's no section of its own `package.json` to pin the candidate version into.
 - **Non-zero exit on a real failure** (linear scan only): if any version comes back `FAILED` or `INSTALL_FAILED`, `compat` exits **`7`**, so it can gate a CI job the same way `dupes` gates on `5`. This does **not** apply to `--bisect` — its per-step `FAILED` results while narrowing the boundary are expected search mechanics, not a verdict, so they never flip the exit code; check `minimumCompatibleVersion`/`recommendedVersion` instead for a bisected run.
 
 **Exit codes**: `0` success, `1` generic error (package not declared, `--range`/`--versions` both/neither given, a `--group` member not declared, etc.), `6` every version was `SKIPPED` (nothing was actually tested), `7` at least one version genuinely `FAILED`/`INSTALL_FAILED` (linear scan only, not `--bisect`).

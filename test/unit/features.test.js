@@ -2703,6 +2703,132 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutCatchesABreakOnlyAConsumerHits() {
+    await this.run('compat --fan-out catches a break the owning app misses but a consumer workspace hits', async () => {
+      // The shape of the real-world gap this closes: the app declaring the
+      // package passes its own tests, but a sibling workspace that actually
+      // depends on the changed behavior fails. Testing --app alone would
+      // report PASSED for 2.0.0; fan-out must report FAILED.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: true };',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: false };',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const monorepoRoot = this.tmp('compat-fanout-monorepo');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node check.js' },
+      });
+      // The primary app never actually looks at fake-lib's behavior — this
+      // is exactly why testing it alone can't catch the regression.
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node check.js' },
+      });
+      fs.writeFileSync(
+        path.join(consumerDir, 'check.js'),
+        'process.exit(require("fake-lib").thing ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test-script', 'test', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/consumer']);
+
+      const v1Result = json.versions.find((v) => v.version === '1.0.0');
+      const v2Result = json.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v1Result.status, 'PASSED', JSON.stringify(v1Result));
+      assert.strictEqual(v1Result.consumers.length, 2);
+      assert.deepStrictEqual(v1Result.consumers.map((c) => c.status), ['PASSED', 'PASSED']);
+
+      assert.strictEqual(v2Result.status, 'FAILED', 'the app itself never exercises fake-lib, but the consumer must still fail the overall version');
+      const primaryConsumer = v2Result.consumers.find((c) => c.dir === '.');
+      const siblingConsumer = v2Result.consumers.find((c) => c.dir === 'packages/consumer');
+      assert.strictEqual(primaryConsumer.status, 'PASSED', 'the primary app itself does not exercise the broken behavior');
+      assert.strictEqual(siblingConsumer.status, 'FAILED', 'the consumer workspace does exercise it and must fail');
+      assert.strictEqual(siblingConsumer.name, 'consumer');
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test-script', 'test', '--fan-out',
+      ]);
+      assert.match(human.stdout, /Fan-out consumers: packages\/consumer/);
+      assert.match(human.stdout, /consumer \(packages\/consumer\): FAILED/);
+    });
+  }
+
+  async testCompatExplicitAppCommaListTestsExtraConsumers() {
+    await this.run('compat --app a,b tests the extra comma-separated dirs as fan-out consumers', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-explicit-app-list');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const otherDir = path.join(monorepoRoot, 'packages', 'other');
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeJson(path.join(otherDir, 'package.json'), {
+        name: 'other', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0',
+        '--app', `${appDir},${otherDir}`,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/other']);
+      assert.strictEqual(json.versions[0].consumers.length, 2);
+      assert.deepStrictEqual(json.versions[0].consumers.map((c) => c.dir), ['.', 'packages/other']);
+    });
+  }
+
+  async testCompatFanOutRequiresDiscoverableMonorepoRoot() {
+    await this.run('compat --fan-out errors clearly when no workspaces root can be found', async () => {
+      const appDir = this.tmp('compat-fanout-no-root');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /Fan-out .* requires a discoverable workspaces root/);
+    });
+  }
+
   async testCompatNothingTestedExitCodeAndMessage() {
     await this.run('compat exits 6 and says nothing was tested when every version is SKIPPED (not "no version passed")', async () => {
       const v1 = await buildFakeTarball({
@@ -4215,6 +4341,9 @@ class FeatureTests {
       await this.testCompatDistinguishesInstallFailure();
       await this.testCompatSkipsAppsWithWorkspaceProtocolDeps();
       await this.testCompatAttemptsRealInstallWhenMonorepoRootFound();
+      await this.testCompatFanOutCatchesABreakOnlyAConsumerHits();
+      await this.testCompatExplicitAppCommaListTestsExtraConsumers();
+      await this.testCompatFanOutRequiresDiscoverableMonorepoRoot();
       await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();

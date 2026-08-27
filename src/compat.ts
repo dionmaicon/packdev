@@ -27,6 +27,7 @@ import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
 import { esmOnlyAdvisory } from "./apiDiff";
+import { scanImportedSymbols } from "./appScan";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -60,6 +61,23 @@ export interface CompatVersionResult {
   // necessarily per-version: a package can go ESM-only in exactly one
   // candidate, not the whole range.
   esmMismatch?: string | undefined;
+  // Set only when fan-out (--app with multiple targets, or --fan-out) is
+  // active: one entry per tested consumer, including the primary --app
+  // itself (dir "."), each run against this same already-installed
+  // sandbox. When present, `status` above is the rollup — PASSED only if
+  // every consumer passed — because "the owning workspace's tests still
+  // pass" is a much weaker claim than "every tested dependent still works."
+  consumers?: ConsumerTestResult[] | undefined;
+}
+
+export interface ConsumerTestResult {
+  // Relative to the sandboxed monorepo root; "." for the primary --app.
+  dir: string;
+  // The consumer's own package.json "name", or null if it has none.
+  name: string | null;
+  status: "PASSED" | "FAILED";
+  exitCode: number | null;
+  output?: string | undefined;
 }
 
 export type TestHarnessCaveatCode =
@@ -122,13 +140,22 @@ export interface CompatReport {
   // fork duplicates are systematically under-reported against a fresh
   // solve, which re-flattens the tree checkDupes was built to catch).
   lockfileSeedNote: string | null;
+  // Relative-to-monorepo-root dirs of every fan-out consumer tested
+  // alongside the primary --app, in the same order as each version's own
+  // `consumers[1..]` — empty when fan-out wasn't requested. Report-level so
+  // the human/CLI summary can name them without digging into a version.
+  fanOutConsumers: string[];
 }
 
 export interface CompatOptions {
   range?: string | undefined;
   versions?: string[] | undefined;
   appDir: string;
-  testCommand: string;
+  // Required unless testScript is set (which runs "<manager> run <script>"
+  // per target instead). Callers must enforce that at least one is present
+  // — this stays optional at the type level so a testScript-only run
+  // type-checks without a dummy string.
+  testCommand?: string | undefined;
   registryUrl: string;
   token?: string | undefined;
   includePrerelease?: boolean | undefined;
@@ -144,6 +171,30 @@ export interface CompatOptions {
   // masking a resolution the fresh solve would surface), but the condition
   // --check-dupes actually needs to see a nested-fork regression.
   seedLockfile?: boolean | undefined;
+  // Explicit extra workspace directories to test as consumers, in addition
+  // to appDir, in the same sandbox — e.g. from expanding --app 'apps/*' or
+  // --app libs/a,libs/b down to everything after the first match. Forces
+  // workspace sandbox mode: consumers are sibling packages, so they must
+  // physically exist alongside appDir in the sandbox. Mutually exclusive
+  // with fanOut.
+  consumerApps?: string[] | undefined;
+  // Auto-discover consumers instead of listing them: every workspace under
+  // the monorepo root (other than appDir) that directly declares pkgName in
+  // dependencies/devDependencies/peerDependencies, ranked by how many
+  // distinct symbols it actually imports from pkgName (scanImportedSymbols)
+  // and capped at fanOutTop. A workspace that only gets pkgName through
+  // hoisting (imports it but doesn't declare it) is not eligible — pinning
+  // requires a section to pin it into.
+  fanOut?: boolean | undefined;
+  // Cap on auto-discovered consumers (fanOut only) — fan-out multiplies
+  // wall clock per version, so this bounds it. Default 5.
+  fanOutTop?: number | undefined;
+  // Run `<packageManager> run <testScript>` in each consumer's own
+  // directory instead of the single `testCommand` for all of them.
+  // Consumers rarely share one test command; forcing them to is how a
+  // fan-out ends up only really testing one app. Ignored (testCommand
+  // applies to every target) when not set.
+  testScript?: string | undefined;
   // Force sandboxing to only appDir ("hermetic") or the whole discovered
   // monorepo root ("workspace"), overriding the automatic workspace:-protocol
   // detection. Errors if "workspace" is requested but no root is found.
@@ -314,6 +365,49 @@ async function findWorkspacesDeclaring(
   return declaring.sort();
 }
 
+export interface ConsumerTarget {
+  // Absolute path on the real (unsandboxed) disk.
+  absoluteDir: string;
+  // Relative to the monorepo root — this is what locates it again once
+  // copied into the sandbox.
+  relativeDir: string;
+}
+
+/**
+ * Auto-discover fan-out consumers: every workspace under monorepoRoot
+ * (other than appDir) that directly declares pkgName in
+ * dependencies/devDependencies/peerDependencies — a workspace that only
+ * gets pkgName through hoisting doesn't have a section to pin it into, so
+ * it's not eligible here even if it imports it. Ranked by how many
+ * distinct symbols it actually imports from pkgName (scanImportedSymbols),
+ * descending, and capped at `top`.
+ */
+export async function resolveFanOutConsumers(
+  pkgName: string,
+  monorepoRoot: string,
+  appDir: string,
+  top: number,
+): Promise<ConsumerTarget[]> {
+  const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
+  const resolvedAppDir = path.resolve(appDir);
+
+  const candidates: { dir: string; symbolCount: number }[] = [];
+  for (const dir of workspaceDirs) {
+    if (path.resolve(dir) === resolvedAppDir) continue;
+    const packageJson = await readJsonFile<PackageJson>(path.join(dir, "package.json"));
+    if (!packageJson || !findDependencySection(packageJson, pkgName)) continue;
+    const { symbols } = await scanImportedSymbols(dir, pkgName);
+    candidates.push({ dir, symbolCount: symbols.size });
+  }
+
+  candidates.sort((a, b) => b.symbolCount - a.symbolCount || a.dir.localeCompare(b.dir));
+
+  return candidates.slice(0, top).map(({ dir }) => ({
+    absoluteDir: path.resolve(dir),
+    relativeDir: path.relative(monorepoRoot, path.resolve(dir)),
+  }));
+}
+
 const SANDBOX_PREFIX = "packdev-compat-sandbox-";
 const EXCLUDED_COPY_NAMES = new Set([
   "node_modules",
@@ -369,6 +463,12 @@ export async function createSandbox(
   // regression. Undefined/other lockfiles stay excluded either way; a
   // pnpm-lock.yaml has no business in an npm sandbox regardless.
   seedLockfileName?: string,
+  // Fan-out consumers: each gets `version` pinned into its own package.json
+  // at `sandboxDir/relativePath`, the same way as the primary appRelativePath
+  // above — a lockstep group pin (pinTargets may include --group members
+  // too) applied per consumer, since each consumer declares its own range
+  // for pkgName independently of the primary app's.
+  extraPinTargets?: { relativePath: string; pinTargets: PinTarget[] }[],
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
@@ -382,24 +482,39 @@ export async function createSandbox(
     },
   });
 
-  const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
-  const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
-  if (!packageJson) {
-    throw new Error(
-      `No package.json found in sandboxed copy of ${path.join(sourceDir, appRelativePath)}`,
-    );
+  const pinOnePackageJson = async (
+    relativePath: string,
+    targets: PinTarget[],
+  ): Promise<void> => {
+    const packageJsonPath = path.join(sandboxDir, relativePath, "package.json");
+    const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
+    if (!packageJson) {
+      throw new Error(
+        `No package.json found in sandboxed copy of ${path.join(sourceDir, relativePath)}`,
+      );
+    }
+    for (const { name, section } of targets) {
+      packageJson[section] = {
+        ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
+        [name]: version,
+      };
+    }
+    await writeJsonFile(packageJsonPath, packageJson);
+  };
+
+  await pinOnePackageJson(appRelativePath, pinTargets);
+  for (const consumer of extraPinTargets ?? []) {
+    await pinOnePackageJson(consumer.relativePath, consumer.pinTargets);
   }
 
-  for (const { name, section } of pinTargets) {
-    packageJson[section] = {
-      ...((packageJson[section] as Record<string, string> | undefined) ?? {}),
-      [name]: version,
-    };
-  }
   if (packageManagerPin) {
-    packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+    const packageJsonPath = path.join(sandboxDir, appRelativePath, "package.json");
+    const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
+    if (packageJson) {
+      packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+      await writeJsonFile(packageJsonPath, packageJson);
+    }
   }
-  await writeJsonFile(packageJsonPath, packageJson);
 
   // Install always runs from sandboxDir's own root (see testOneVersion), not
   // appRelativePath — in a sandboxed monorepo that's a different package.json
@@ -611,6 +726,7 @@ async function testOneVersion(
   monorepoRoot: string | null,
   appRelativePath: string,
   esmCheck: EsmCheckContext,
+  consumerTargets: ResolvedConsumerTarget[],
 ): Promise<CompatVersionResult> {
   const startedAt = Date.now();
 
@@ -648,6 +764,9 @@ async function testOneVersion(
         ? { manager: packageManagerInfo.manager, version: packageManagerInfo.version }
         : undefined,
       options.seedLockfile ? packageManagerInfo.lockFile : undefined,
+      consumerTargets.length > 0
+        ? consumerTargets.map((c) => ({ relativePath: c.relativePath, pinTargets: c.pinTargets }))
+        : undefined,
     );
 
     const installResult = await runInstall(
@@ -693,11 +812,48 @@ async function testOneVersion(
         })()
       : undefined;
 
+    const effectiveTestCommand = options.testScript
+      ? `${packageManagerInfo.manager} run ${options.testScript}`
+      : (options.testCommand ?? "");
+
     const testCwd = path.join(sandboxDir, testCwdRelative);
-    const testResult = await runTestCommand(testCwd, options.testCommand);
+    const testResult = await runTestCommand(testCwd, effectiveTestCommand);
+
+    let consumers: ConsumerTestResult[] | undefined;
+    let overallSuccess = testResult.success;
+    if (consumerTargets.length > 0) {
+      const primaryPackageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(testCwd, "package.json"),
+      );
+      consumers = [
+        {
+          dir: ".",
+          name: primaryPackageJson?.name ?? null,
+          status: testResult.success ? "PASSED" : "FAILED",
+          exitCode: testResult.exitCode,
+          output: testResult.success ? undefined : testResult.output,
+        },
+      ];
+      for (const consumer of consumerTargets) {
+        const consumerCwd = path.join(sandboxDir, consumer.relativePath);
+        const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
+        const consumerPackageJson = await readJsonFile<PackageJson & { name?: string }>(
+          path.join(consumerCwd, "package.json"),
+        );
+        consumers.push({
+          dir: consumer.relativePath,
+          name: consumerPackageJson?.name ?? null,
+          status: consumerResult.success ? "PASSED" : "FAILED",
+          exitCode: consumerResult.exitCode,
+          output: consumerResult.success ? undefined : consumerResult.output,
+        });
+        overallSuccess = overallSuccess && consumerResult.success;
+      }
+    }
+
     return {
       version,
-      status: testResult.success ? "PASSED" : "FAILED",
+      status: overallSuccess ? "PASSED" : "FAILED",
       exitCode: testResult.exitCode,
       durationMs: Date.now() - startedAt,
       output: testResult.success ? undefined : testResult.output,
@@ -705,6 +861,7 @@ async function testOneVersion(
       lockfileSnapshotPath: snapshot.path,
       dupeCounts,
       esmMismatch,
+      consumers,
     };
   } finally {
     if (sandboxDir) await cleanupSandbox(sandboxDir);
@@ -728,6 +885,12 @@ function parsePackageManagerOverride(spec: string): PackageManagerInfo {
   };
 }
 
+export interface ResolvedConsumerTarget {
+  relativePath: string;
+  pinTargets: PinTarget[];
+  absoluteDir: string;
+}
+
 async function resolveRunContext(
   pkgName: string,
   options: CompatOptions,
@@ -738,6 +901,7 @@ async function resolveRunContext(
   monorepoRoot: string | null;
   appRelativePath: string;
   sandboxMode: "hermetic" | "workspace";
+  consumerTargets: ResolvedConsumerTarget[];
 }> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
@@ -762,10 +926,14 @@ async function resolveRunContext(
   }
   const workspaceProtocolDeps = findWorkspaceProtocolDeps(appPackageJson);
 
+  const wantsFanOut = (options.consumerApps && options.consumerApps.length > 0) || !!options.fanOut;
+
   let monorepoRoot: string | null = null;
   let appRelativePath = "";
   const wantsWorkspaceRoot =
-    options.mode === "workspace" || (options.mode === undefined && workspaceProtocolDeps.length > 0);
+    options.mode === "workspace" ||
+    wantsFanOut ||
+    (options.mode === undefined && workspaceProtocolDeps.length > 0);
   if (wantsWorkspaceRoot) {
     monorepoRoot = await findMonorepoRoot(options.appDir);
     if (monorepoRoot) {
@@ -778,12 +946,54 @@ async function resolveRunContext(
         `pnpm-workspace.yaml) could be found anywhere above ${options.appDir}.`,
     );
   }
+  if (wantsFanOut && !monorepoRoot) {
+    throw new Error(
+      `Fan-out (multiple --app targets, or --fan-out) requires a discoverable workspaces root ` +
+        `(package.json "workspaces" or pnpm-workspace.yaml) above ${options.appDir}, but none ` +
+        `was found — consumers are sibling packages, so they must physically exist alongside ` +
+        `--app in the sandbox.`,
+    );
+  }
   const sandboxMode: "hermetic" | "workspace" = monorepoRoot ? "workspace" : "hermetic";
+
+  const consumerTargets: ResolvedConsumerTarget[] = [];
+  if (wantsFanOut && monorepoRoot) {
+    const consumers: ConsumerTarget[] =
+      options.consumerApps && options.consumerApps.length > 0
+        ? options.consumerApps.map((d) => ({
+            absoluteDir: path.resolve(d),
+            relativeDir: path.relative(monorepoRoot!, path.resolve(d)),
+          }))
+        : await resolveFanOutConsumers(pkgName, monorepoRoot, options.appDir, options.fanOutTop ?? 5);
+
+    for (const consumer of consumers) {
+      const consumerPackageJson = await readJsonFile<PackageJson>(
+        path.join(consumer.absoluteDir, "package.json"),
+      );
+      if (!consumerPackageJson) {
+        throw new Error(`No package.json found in consumer directory: ${consumer.absoluteDir}`);
+      }
+      const consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
+      consumerTargets.push({
+        relativePath: consumer.relativeDir,
+        pinTargets: consumerPinTargets,
+        absoluteDir: consumer.absoluteDir,
+      });
+    }
+  }
 
   const packageManagerInfo = options.packageManager
     ? parsePackageManagerOverride(options.packageManager)
     : await detectPackageManager(options.appDir);
-  return { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode };
+  return {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  };
 }
 
 /**
@@ -965,6 +1175,7 @@ async function resolveControlResult(
   appRelativePath: string,
   alreadyTested: CompatVersionResult[],
   esmCheck: EsmCheckContext,
+  consumerTargets: ResolvedConsumerTarget[],
 ): Promise<CompatVersionResult | null> {
   const controlVersion = await resolveControlVersion(pkgName, options.appDir);
   if (!controlVersion) return null;
@@ -983,6 +1194,7 @@ async function resolveControlResult(
     monorepoRoot,
     appRelativePath,
     esmCheck,
+    consumerTargets,
   );
 }
 
@@ -993,7 +1205,7 @@ async function resolveEsmCheckContext(
   pkgName: string,
   options: CompatOptions,
 ): Promise<EsmCheckContext> {
-  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, options.testCommand);
+  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, options.testCommand ?? "");
   if (!consumerIsCjsBlind) return { consumerIsCjsBlind: false, controlInfo: null };
 
   const controlDir = await resolveInstalledPackage(pkgName, options.appDir);
@@ -1056,11 +1268,18 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
-    await resolveRunContext(pkgName, options);
+  const {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  } = await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
-  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand);
+  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand ?? "");
   const esmCheck = await resolveEsmCheckContext(pkgName, options);
 
   const versions = await runWithConcurrencyLimit(
@@ -1078,6 +1297,7 @@ export async function runCompat(
         monorepoRoot,
         appRelativePath,
         esmCheck,
+        consumerTargets,
       ),
   );
 
@@ -1092,6 +1312,7 @@ export async function runCompat(
     appRelativePath,
     versions,
     esmCheck,
+    consumerTargets,
   );
   if (options.checkDupes) applyDupesRegressions(versions, control);
   const controlFailed = control !== null && control.status !== "PASSED";
@@ -1122,6 +1343,7 @@ export async function runCompat(
     packageManager: formatPackageManager(packageManagerInfo),
     seededLockfile: !!options.seedLockfile,
     lockfileSeedNote: computeLockfileSeedNote(options),
+    fanOutConsumers: consumerTargets.map((c) => c.relativePath),
   };
 }
 
@@ -1147,6 +1369,7 @@ function finishBisect(
   packageManagerInfo: PackageManagerInfo,
   seededLockfile: boolean,
   lockfileSeedNote: string | null,
+  fanOutConsumers: string[],
 ): CompatBisectReport {
   const controlFailed = control !== null && control.status !== "PASSED";
   return {
@@ -1170,6 +1393,7 @@ function finishBisect(
     packageManager: formatPackageManager(packageManagerInfo),
     seededLockfile,
     lockfileSeedNote,
+    fanOutConsumers,
   };
 }
 
@@ -1204,10 +1428,17 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
-  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand);
+  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand ?? "");
   const esmCheck = await resolveEsmCheckContext(pkgName, options);
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
-    await resolveRunContext(pkgName, options);
+  const {
+    pinTargets,
+    packageManagerInfo,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    sandboxMode,
+    consumerTargets,
+  } = await resolveRunContext(pkgName, options);
 
   const tested: CompatVersionResult[] = [];
   const finish = async (
@@ -1225,6 +1456,7 @@ export async function runCompatBisect(
       appRelativePath,
       tested,
       esmCheck,
+      consumerTargets,
     );
     return finishBisect(
       pkgName,
@@ -1241,6 +1473,7 @@ export async function runCompatBisect(
       packageManagerInfo,
       !!options.seedLockfile,
       computeLockfileSeedNote(options),
+      consumerTargets.map((c) => c.relativePath),
     );
   };
 
@@ -1260,6 +1493,7 @@ export async function runCompatBisect(
       monorepoRoot,
       appRelativePath,
       esmCheck,
+      consumerTargets,
     );
 
   const topIndex = candidateVersions.length - 1;

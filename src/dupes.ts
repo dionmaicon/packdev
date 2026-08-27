@@ -235,7 +235,7 @@ async function expandGlobSegments(baseDir: string, segments: string[]): Promise<
   return expandGlobSegments(next, rest);
 }
 
-async function expandGlob(rootDir: string, pattern: string): Promise<string[]> {
+export async function expandGlob(rootDir: string, pattern: string): Promise<string[]> {
   const segments = pattern.split("/").filter(Boolean);
   return expandGlobSegments(rootDir, segments);
 }

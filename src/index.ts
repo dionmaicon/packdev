@@ -35,7 +35,7 @@ import {
   type CompatReport,
   type CompatBisectReport,
 } from "./compat";
-import { findDuplicateResolutions } from "./dupes";
+import { findDuplicateResolutions, expandGlob } from "./dupes";
 
 const program = new Command();
 
@@ -637,15 +637,34 @@ program
     }
   });
 
+// Expands `--app`'s three accepted forms into a list of directories: a
+// single dir (unchanged), a comma-separated list, or a glob (containing
+// "*", expanded from the current directory — the common case is running
+// packdev from the monorepo root). The first entry is always the primary
+// app; the rest become fan-out consumers. A glob that matches nothing falls
+// back to the literal string as a single dir, so a non-glob value with a
+// literal "*" in a path segment (unusual, but not this function's call to
+// reject) still resolves to something rather than silently vanishing.
+async function resolveAppTargets(appOption: string): Promise<string[]> {
+  if (appOption.includes("*")) {
+    const matches = await expandGlob(process.cwd(), appOption);
+    return matches.length > 0 ? matches : [appOption];
+  }
+  return appOption
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 program
   .command("compat")
   .description(
     "Runtime compatibility matrix: install each candidate version in an isolated sandbox and run the app's test command",
   )
   .argument("<package>", "Package name to check")
-  .requiredOption(
+  .option(
     "--test <cmd>",
-    'Command to run in each sandboxed version, e.g. "npm run build && npm test" — should include your real test suite, not just a type check: a bare `tsc --noEmit` can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change), while a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version — compat warns on both, see testCommandCaveats in --json',
+    'Command to run in each sandboxed version/target, e.g. "npm run build && npm test" — should include your real test suite, not just a type check: a bare `tsc --noEmit` can see a broken type surface but nothing runtime-only (an ESM-only bump, a duplicate-copy regression, an actual behavior change), while a transpile-only test runner (ts-jest isolatedModules, babel-jest, @swc/jest) never reads the dependency\'s types and can report PASSED for a genuinely incompatible version — compat warns on both, see testCommandCaveats in --json. Required unless --test-script is given.',
   )
   .option(
     "--range <semver>",
@@ -655,7 +674,35 @@ program
     "--versions <list>",
     "Comma-separated explicit versions to test (mutually exclusive with --range)",
   )
-  .option("--app <dir>", "App directory to test", ".")
+  .option(
+    "--app <dir>",
+    'App directory to test. Accepts a single directory (default), a comma-separated list ' +
+      '("libs/a,libs/b"), or a glob ("apps/*", expanded from the current directory) — the ' +
+      "first match is the primary app (used for --range/control resolution), the rest become " +
+      "fan-out consumers tested in the same sandbox alongside it. A comma-list/glob implies " +
+      "workspace sandbox mode: consumers are sibling packages, so a discoverable monorepo root " +
+      "is required.",
+    ".",
+  )
+  .option(
+    "--fan-out",
+    "Auto-discover fan-out consumers instead of listing them: every workspace under the " +
+      "monorepo root (other than --app) that directly declares <package>, ranked by how many " +
+      "distinct symbols it imports from it and capped at --top. Testing only the owning " +
+      "workspace's own tests is a much weaker claim than testing what actually depends on it.",
+    false,
+  )
+  .option(
+    "--top <n>",
+    "Cap on auto-discovered fan-out consumers (--fan-out only) — fan-out multiplies wall clock per version",
+    "5",
+  )
+  .option(
+    "--test-script <name>",
+    'Run "<detected package manager> run <name>" in each target\'s own directory instead of ' +
+      "--test for all of them. Consumers rarely share one test command; forcing them to is how " +
+      "a fan-out ends up only really testing one app.",
+  )
   .option(
     "--registry <url>",
     "npm registry URL, also passed to the sandbox install (defaults to .npmrc's @scope:registry mapping, then its registry line, then the public npm registry)",
@@ -718,8 +765,15 @@ program
       if (options.mode && options.mode !== "hermetic" && options.mode !== "workspace") {
         throw new Error(`--mode must be "hermetic" or "workspace", got "${options.mode}"`);
       }
+      if (!options.test && !options.testScript) {
+        throw new Error("Either --test or --test-script must be provided");
+      }
 
-      const npmrc = await loadNpmrcConfig(options.app);
+      const appTargets = await resolveAppTargets(options.app);
+      const appDir = appTargets[0]!;
+      const consumerApps = appTargets.slice(1);
+
+      const npmrc = await loadNpmrcConfig(appDir);
       const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
       const token = resolveAuthToken(registryUrl, npmrc, options.token);
 
@@ -731,7 +785,7 @@ program
               .map((v: string) => v.trim())
               .filter(Boolean)
           : undefined,
-        appDir: options.app,
+        appDir,
         testCommand: options.test,
         registryUrl,
         token,
@@ -748,6 +802,10 @@ program
         preferOffline: !!options.preferOffline,
         checkDupes: !!options.checkDupes,
         seedLockfile: !!options.seedLockfile,
+        consumerApps: consumerApps.length > 0 ? consumerApps : undefined,
+        fanOut: !!options.fanOut,
+        fanOutTop: Number(options.top) || 5,
+        testScript: options.testScript,
         mode: options.mode as "hermetic" | "workspace" | undefined,
         packageManager: options.packageManager,
       };
@@ -783,6 +841,9 @@ program
           console.log(`⚡ Concurrency: ${report.concurrency}`);
         }
         console.log(`🧪 Sandbox mode: ${report.sandboxMode}, package manager: ${report.packageManager}`);
+        if (report.fanOutConsumers.length > 0) {
+          console.log(`🔀 Fan-out consumers: ${report.fanOutConsumers.join(", ")}`);
+        }
         console.log(`📁 Lockfile snapshots: ${report.snapshotDir}`);
         for (const caveat of report.testCommandCaveats) {
           console.log(`⚠️  ${caveat.message}`);
@@ -824,6 +885,20 @@ program
           }
           if (v.esmMismatch) {
             console.log(`      ⚠️  ${v.esmMismatch}`);
+          }
+          if (v.consumers) {
+            for (const c of v.consumers) {
+              const consumerMark = c.status === "PASSED" ? "✅" : "❌";
+              const label = c.dir === "." ? `${c.name ?? "app"} (primary)` : `${c.name ?? c.dir} (${c.dir})`;
+              console.log(`      ${consumerMark} ${label}: ${c.status}`);
+              if (c.status === "FAILED" && c.output) {
+                const indented = c.output
+                  .split("\n")
+                  .map((line) => `          ${line}`)
+                  .join("\n");
+                console.log(indented);
+              }
+            }
           }
         }
 
