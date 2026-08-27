@@ -16,7 +16,13 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as semver from "semver";
-import { fileExists, readJsonFile, writeJsonFile, type PackageInfo } from "./utils";
+import {
+  fileExists,
+  readJsonFile,
+  writeJsonFile,
+  runWithConcurrencyLimit,
+  type PackageInfo,
+} from "./utils";
 import {
   detectPackageManager,
   LOCK_FILE_BY_MANAGER,
@@ -27,7 +33,7 @@ import { fetchPackageMetadata, listVersionsInRange } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
 import { esmOnlyAdvisory } from "./apiDiff";
-import { scanImportedSymbols } from "./appScan";
+import { scanImportedSymbols, scanPassedOptionKeys, createScanCache } from "./appScan";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
 
@@ -178,13 +184,8 @@ export interface CompatOptions {
   // physically exist alongside appDir in the sandbox. Mutually exclusive
   // with fanOut.
   consumerApps?: string[] | undefined;
-  // Auto-discover consumers instead of listing them: every workspace under
-  // the monorepo root (other than appDir) that directly declares pkgName in
-  // dependencies/devDependencies/peerDependencies, ranked by how many
-  // distinct symbols it actually imports from pkgName (scanImportedSymbols)
-  // and capped at fanOutTop. A workspace that only gets pkgName through
-  // hoisting (imports it but doesn't declare it) is not eligible — pinning
-  // requires a section to pin it into.
+  // Auto-discover consumers instead of listing them — see
+  // resolveFanOutConsumers for the tiered discovery/ranking this drives.
   fanOut?: boolean | undefined;
   // Cap on auto-discovered consumers (fanOut only) — fan-out multiplies
   // wall clock per version, so this bounds it. Default 5.
@@ -303,6 +304,114 @@ export function findWorkspaceProtocolDeps(packageJson: PackageJson): string[] {
  * outside any discoverable workspaces config), which is the only situation
  * compat still has to report SKIPPED for.
  */
+// Everything needed about a tier-0 candidate to check whether some OTHER
+// workspace's dependency on it (by name) actually resolves locally.
+interface LocalLinkTarget {
+  version: string | undefined;
+  // Absolute directory — needed to validate a file:/link: specifier
+  // actually points AT this workspace, not just to something sharing its
+  // name.
+  dir: string;
+}
+
+// True when `spec` (declared under dependency key `dependencyKey`, in a
+// package.json at `consumerDir`) actually resolves to `target` — found by
+// looking `dependencyKey` up in the candidates map, so `target`'s real name
+// IS `dependencyKey` by construction — rather than a same-named registry/
+// alias/git package, a `file:`/`link:` path that merely happens to share
+// the name, or a pnpm `workspace:<alias>@<range>` that aliases the key to a
+// DIFFERENT package entirely. Local-workspace linking isn't gated on the
+// `workspace:` protocol string — npm/yarn classic auto-link a same-named
+// local workspace off a plain "*" or matching semver range too — but a
+// plain semver range only links locally when the local package's own
+// version actually satisfies it; otherwise the package manager installs a
+// separate copy from the registry, and an `npm:`/git/URL specifier never
+// resolves locally at all regardless of name. `target.version` undefined
+// (no "version" field on the candidate) falls back to permissive for the
+// plain-semver-range case — this is expected to be rare enough in practice
+// that failing open beats a false negative.
+//
+// KNOWN LIMITATION, accepted rather than fixed: a satisfying plain semver
+// range is still not a hard guarantee under pnpm specifically — with
+// `linkWorkspacePackages` (pnpm-workspace.yaml or .npmrc) turned off, pnpm
+// installs the REGISTRY copy for a plain-range dependency even when the
+// local version would satisfy it, requiring the `workspace:` protocol to
+// force a local link instead. Detecting that would need reading pnpm's own
+// config (and knowing its version-specific defaults) — real effort for a
+// narrow case (opting out of pnpm's normal auto-link behavior is uncommon),
+// and the failure mode is a wasted --top slot on a consumer that trivially
+// passes against its own already-installed version, not a false negative
+// that hides a real break. The alternative of dropping plain-semver
+// acceptance entirely would fix pnpm's edge case by breaking the far more
+// common one: npm and yarn classic have no `workspace:`-equivalent
+// protocol at all, so plain semver/glob is the ONLY way those managers
+// ever auto-link a local workspace — this is deliberately left as a
+// documented tradeoff, not silently unhandled.
+function specifierLinksToLocalWorkspace(
+  spec: string,
+  dependencyKey: string,
+  consumerDir: string,
+  target: LocalLinkTarget,
+): boolean {
+  if (spec.startsWith("workspace:")) {
+    const payload = spec.slice("workspace:".length);
+    // Plain form (workspace:*, workspace:^, workspace:~, a bare semver
+    // range, or no payload at all) — resolves to the workspace matching
+    // the DEPENDENCY KEY's own name, which is exactly `target` here.
+    if (payload === "" || payload === "*" || payload === "^" || payload === "~") {
+      return true;
+    }
+    // A relative/absolute path target (pnpm supports `workspace:../other`)
+    // — a literal filesystem path, validated the same way as file:/link:.
+    if (payload.startsWith(".") || payload.startsWith("/")) {
+      return path.resolve(consumerDir, payload) === path.resolve(target.dir);
+    }
+    // Alias form (pnpm's `workspace:<name>@<range>`, e.g.
+    // `"wrapper": "workspace:other-package@*"`) — the dependency is
+    // actually linked to <name>, NOT to whatever `dependencyKey` happens
+    // to equal. If <name> differs from dependencyKey, this specifier
+    // doesn't link to `target` at all, even though the key matched it.
+    const aliasMatch = /^(@[^@/]+\/[^@]+|[^@]+)@(.+)$/.exec(payload);
+    if (aliasMatch) return aliasMatch[1] === dependencyKey;
+    // A bare semver range as the payload (no "@") also falls under the
+    // plain form above via semver.validRange, for anything not already
+    // handled — e.g. "workspace:1.2.3".
+    return semver.validRange(payload) !== null;
+  }
+  if (spec.startsWith("file:") || spec.startsWith("link:")) {
+    const targetPath = spec.slice(spec.indexOf(":") + 1);
+    return path.resolve(consumerDir, targetPath) === path.resolve(target.dir);
+  }
+  if (spec.startsWith("npm:") || /^(git\+|git:|github:|https?:)/.test(spec)) {
+    return false;
+  }
+  if (target.version === undefined) return true;
+  return semver.validRange(spec) !== null && semver.satisfies(target.version, spec);
+}
+
+// Dependency keys (in any of dependencies/devDependencies/peerDependencies)
+// declared in a package.json at `consumerDir` that name a workspace in
+// `candidates` AND whose declared specifier actually links to that local
+// workspace (see specifierLinksToLocalWorkspace).
+function findDependencyNamesAmong(
+  packageJson: PackageJson,
+  consumerDir: string,
+  candidates: Map<string, LocalLinkTarget>,
+): string[] {
+  const sections: DependencySection[] = ["dependencies", "devDependencies", "peerDependencies"];
+  const found = new Set<string>();
+  for (const section of sections) {
+    const entries = packageJson[section] as Record<string, string> | undefined;
+    if (!entries) continue;
+    for (const [name, spec] of Object.entries(entries)) {
+      const target = candidates.get(name);
+      if (!target) continue;
+      if (specifierLinksToLocalWorkspace(spec, name, consumerDir, target)) found.add(name);
+    }
+  }
+  return [...found];
+}
+
 export async function findMonorepoRoot(appDir: string): Promise<string | null> {
   let dir = path.resolve(appDir);
   for (;;) {
@@ -339,30 +448,88 @@ export function resolvePinTargets(
   });
 }
 
+/**
+ * Like resolvePinTargets, but for a fan-out consumer that isn't required to
+ * declare pkgName (or every --group member) itself: pins whichever of
+ * [pkgName, ...group] this workspace actually declares, instead of
+ * all-or-nothing. All-or-nothing would silently drop the pin even for a
+ * consumer that DOES declare pkgName directly, just because it's missing
+ * one unrelated lockstep group member — leaving that consumer's own
+ * dependency at its original version and defeating the point of testing it.
+ */
+function resolveAvailablePinTargets(
+  pkgName: string,
+  group: string[] | undefined,
+  packageJson: PackageJson,
+): PinTarget[] {
+  const names = [...new Set([pkgName, ...(group ?? [])])];
+  const targets: PinTarget[] = [];
+  for (const name of names) {
+    const section = findDependencySection(packageJson, name);
+    if (section) targets.push({ name, section });
+  }
+  return targets;
+}
+
+// Cap on in-flight package.json reads / AST scans during workspace
+// discovery (findWorkspacesDeclaring, resolveFanOutConsumers). This is
+// lightweight fs+parse work, not a full install/test process, so a higher
+// cap than the version-testing --concurrency default is fine — it's not
+// user-configurable because there's no comparable per-workspace resource
+// cost to tune against.
+const DISCOVERY_CONCURRENCY = 8;
+
 // When --app doesn't declare the package, a monorepo often has some sibling
 // workspace that does — this is usually the actual fix (point --app there),
 // not evidence the package name is wrong. Scans every workspace's own
 // package.json rather than just appDir's, so the error names candidates
 // instead of leaving the caller to `grep` the monorepo by hand.
+interface DeclaringWorkspace {
+  // package.json "name", falling back to the monorepo-relative dir when unnamed.
+  name: string;
+  // Monorepo-relative dir — usable directly in a suggested --app value.
+  dir: string;
+  // Absolute dir — needed (alongside version) to check whether a
+  // dependency on this workspace (by name) actually resolves locally
+  // (specifierLinksToLocalWorkspace) rather than to a same-named
+  // registry/alias/git/vendored-elsewhere package.
+  absoluteDir: string;
+  // package.json "version" — see above.
+  version: string | undefined;
+}
+
 async function findWorkspacesDeclaring(
   pkgName: string,
   appDir: string,
-): Promise<string[]> {
+): Promise<DeclaringWorkspace[]> {
   const monorepoRoot = await findMonorepoRoot(appDir);
   if (!monorepoRoot) return [];
 
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
-  const declaring: string[] = [];
-  for (const dir of workspaceDirs) {
-    if (path.resolve(dir) === path.resolve(appDir)) continue;
-    const packageJson = await readJsonFile<PackageJson & { name?: string }>(
-      path.join(dir, "package.json"),
-    );
-    if (packageJson && findDependencySection(packageJson, pkgName)) {
-      declaring.push(packageJson.name ?? path.relative(monorepoRoot, dir));
-    }
-  }
-  return declaring.sort();
+  const resolvedAppDir = path.resolve(appDir);
+  // Independent per-workspace package.json reads — no ordering dependency
+  // between them, so run them off the same concurrency-limited pool used
+  // for everything else in this file rather than one at a time.
+  const entries = await runWithConcurrencyLimit(
+    workspaceDirs.filter((dir) => path.resolve(dir) !== resolvedAppDir),
+    DISCOVERY_CONCURRENCY,
+    async (dir): Promise<DeclaringWorkspace | null> => {
+      const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(dir, "package.json"),
+      );
+      if (!packageJson || !findDependencySection(packageJson, pkgName)) return null;
+      const relDir = path.relative(monorepoRoot, dir);
+      return {
+        name: packageJson.name ?? relDir,
+        dir: relDir,
+        absoluteDir: path.resolve(dir),
+        version: packageJson.version,
+      };
+    },
+  );
+  return entries
+    .filter((e): e is DeclaringWorkspace => e !== null)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export interface ConsumerTarget {
@@ -374,13 +541,40 @@ export interface ConsumerTarget {
 }
 
 /**
- * Auto-discover fan-out consumers: every workspace under monorepoRoot
- * (other than appDir) that directly declares pkgName in
- * dependencies/devDependencies/peerDependencies — a workspace that only
- * gets pkgName through hoisting doesn't have a section to pin it into, so
- * it's not eligible here even if it imports it. Ranked by how many
- * distinct symbols it actually imports from pkgName (scanImportedSymbols),
- * descending, and capped at `top`.
+ * Auto-discover fan-out consumers, widened by exactly one hop past direct
+ * declarers so the wrapper pattern (a lib wraps pkgName, apps depend on the
+ * lib rather than pkgName directly) is actually reachable:
+ *
+ *   tier 0 — every workspace under monorepoRoot (other than appDir) that
+ *            directly declares pkgName in dependencies/devDependencies/
+ *            peerDependencies.
+ *   tier 1 — every workspace that depends on a tier-0 workspace by name,
+ *            with a specifier that actually resolves locally (`workspace:`,
+ *            `file:`/`link:`, or a plain/semver range the tier-0
+ *            workspace's own version satisfies — see
+ *            specifierLinksToLocalWorkspace; excludes `npm:` aliases, git,
+ *            and URL specifiers, and a semver range the local version
+ *            doesn't actually satisfy, since a package manager would
+ *            install a separate registry copy for those, not link the
+ *            wrapper this fan-out is trying to reach) — but does not itself
+ *            declare pkgName. This is the one hop that makes a wrapper's
+ *            own consumers discoverable — going deeper
+ *            (consumer-of-a-consumer) would risk pulling in the whole repo,
+ *            so it stops here.
+ *
+ * A workspace that only gets pkgName through hoisting (imports it but
+ * doesn't declare it, and doesn't depend locally on a declarer) isn't
+ * eligible in either tier — pinning requires either a section to pin
+ * pkgName into directly (tier 0) or a wrapper whose own pin already carries
+ * the version through (tier 1).
+ *
+ * Ranked: tier 0 before tier 1; within a tier, by distinct symbols imported
+ * from the thing that makes it eligible (pkgName for tier 0, the
+ * connecting wrapper(s) for tier 1), descending; then by whether it passes
+ * an object literal into a call on that import (scanPassedOptionKeys) —
+ * the signal that distinguishes a consumer handing the wrapper real
+ * options (and so most likely to break on a structural change) from one
+ * that only calls a bare decorator. Capped at `top`.
  */
 // Resolves symlinks on both sides before comparing, so a workspace dir that
 // only *looks* contained (e.g. a symlink pointing outside monorepoRoot)
@@ -406,6 +600,13 @@ async function assertConsumerWithinMonorepo(monorepoRoot: string, absoluteDir: s
   }
 }
 
+interface FanOutCandidate {
+  dir: string;
+  tier: 0 | 1;
+  symbolCount: number;
+  hasObjectArg: boolean;
+}
+
 export async function resolveFanOutConsumers(
   pkgName: string,
   monorepoRoot: string,
@@ -414,17 +615,103 @@ export async function resolveFanOutConsumers(
 ): Promise<ConsumerTarget[]> {
   const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
   const resolvedAppDir = path.resolve(appDir);
+  // Scoped to exactly this call — file-list/AST reuse across the tier-0 and
+  // tier-1 scans below (and across scanImportedSymbols/scanPassedOptionKeys,
+  // which otherwise each re-glob and re-parse the same directory), never
+  // held past this function returning. See createScanCache's own doc for
+  // why this can't be a module-level cache (the MCP server is long-lived
+  // and source files can change between separate tool calls).
+  const scanCache = createScanCache();
 
-  const candidates: { dir: string; symbolCount: number }[] = [];
-  for (const dir of workspaceDirs) {
-    if (path.resolve(dir) === resolvedAppDir) continue;
-    const packageJson = await readJsonFile<PackageJson>(path.join(dir, "package.json"));
-    if (!packageJson || !findDependencySection(packageJson, pkgName)) continue;
-    const { symbols } = await scanImportedSymbols(dir, pkgName);
-    candidates.push({ dir, symbolCount: symbols.size });
-  }
+  // Read every workspace, INCLUDING appDir — appDir itself may be the
+  // direct declarer (the common case: --app points at the wrapper), and
+  // its name has to be in tier0Names for tier-1 detection to find anything
+  // that depends on it. appDir is excluded only when building the actual
+  // candidate list below, never from this name-resolution pass. Each read
+  // is independent, so run them concurrently rather than one at a time.
+  const workspaceEntries = await runWithConcurrencyLimit(
+    workspaceDirs,
+    DISCOVERY_CONCURRENCY,
+    async (dir): Promise<{ dir: string; packageJson: PackageJson & { name?: string } } | null> => {
+      const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+        path.join(dir, "package.json"),
+      );
+      return packageJson ? { dir, packageJson } : null;
+    },
+  );
+  const workspaces = workspaceEntries.filter(
+    (w): w is { dir: string; packageJson: PackageJson & { name?: string } } => w !== null,
+  );
 
-  candidates.sort((a, b) => b.symbolCount - a.symbolCount || a.dir.localeCompare(b.dir));
+  const tier0 = workspaces.filter((w) => findDependencySection(w.packageJson, pkgName));
+  // Resolved directories, not names — a tier-0 workspace's package.json
+  // "name" field is optional, and excluding "already tier 0" by name would
+  // silently fail to exclude an unnamed one (tier0Names.has("") is always
+  // false), letting it ALSO qualify for tier 1 if it happens to depend on
+  // some other named tier-0 workspace: a duplicate, mis-tiered candidate
+  // for the exact same directory.
+  const tier0Dirs = new Set(tier0.map((w) => path.resolve(w.dir)));
+  // name -> { version, dir }, so a tier-1 dependency on it can be checked
+  // for actual local resolution (specifierLinksToLocalWorkspace — semver
+  // compatibility for a plain range, or the real target directory for a
+  // file:/link: path) rather than matched on name alone.
+  const tier0Info = new Map<string, LocalLinkTarget>(
+    tier0
+      .filter((w): w is typeof w & { packageJson: { name: string } } => !!w.packageJson.name)
+      .map((w) => [w.packageJson.name, { version: w.packageJson.version, dir: path.resolve(w.dir) }]),
+  );
+
+  const tier0Candidates = await runWithConcurrencyLimit(
+    tier0.filter((w) => path.resolve(w.dir) !== resolvedAppDir),
+    DISCOVERY_CONCURRENCY,
+    async (w): Promise<FanOutCandidate> => {
+      const [{ symbols }, optionKeys] = await Promise.all([
+        scanImportedSymbols(w.dir, pkgName, scanCache),
+        scanPassedOptionKeys(w.dir, pkgName, scanCache),
+      ]);
+      return {
+        dir: w.dir,
+        tier: 0,
+        symbolCount: symbols.size,
+        hasObjectArg: optionKeys.size > 0,
+      };
+    },
+  );
+
+  const tier1Inputs = workspaces.filter((w) => {
+    if (path.resolve(w.dir) === resolvedAppDir) return false;
+    if (tier0Dirs.has(path.resolve(w.dir))) return false; // already tier 0, named or not
+    return findDependencyNamesAmong(w.packageJson, w.dir, tier0Info).length > 0;
+  });
+
+  const tier1Candidates = await runWithConcurrencyLimit(
+    tier1Inputs,
+    DISCOVERY_CONCURRENCY,
+    async (w): Promise<FanOutCandidate> => {
+      const wrapperNames = findDependencyNamesAmong(w.packageJson, w.dir, tier0Info);
+      let symbolCount = 0;
+      let hasObjectArg = false;
+      for (const wrapperName of wrapperNames) {
+        const { symbols } = await scanImportedSymbols(w.dir, wrapperName, scanCache);
+        symbolCount += symbols.size;
+        if (!hasObjectArg) {
+          const optionKeys = await scanPassedOptionKeys(w.dir, wrapperName, scanCache);
+          if (optionKeys.size > 0) hasObjectArg = true;
+        }
+      }
+      return { dir: w.dir, tier: 1, symbolCount, hasObjectArg };
+    },
+  );
+
+  const candidates: FanOutCandidate[] = [...tier0Candidates, ...tier1Candidates];
+
+  candidates.sort(
+    (a, b) =>
+      a.tier - b.tier ||
+      b.symbolCount - a.symbolCount ||
+      Number(b.hasObjectArg) - Number(a.hasObjectArg) ||
+      a.dir.localeCompare(b.dir),
+  );
 
   return candidates.slice(0, top).map(({ dir }) => ({
     absoluteDir: path.resolve(dir),
@@ -724,12 +1011,22 @@ async function collectDupeCounts(
     : [];
 
   const namesToCheck = [...new Set([pkgName, ...directDeps])];
-  const counts: Record<string, number> = {};
-  for (const name of namesToCheck) {
-    const report = await findDuplicateResolutions(name, sandboxRoot);
-    counts[name] = report.resolutions.length;
-  }
-  return counts;
+  // sandboxRoot's workspace layout is fixed for the lifetime of this
+  // already-installed sandbox — resolve it once and hand it to every
+  // per-name call below instead of letting findDuplicateResolutions
+  // re-walk the identical layout once per name. The per-name walks
+  // themselves are independent (each over its own node_modules subtree),
+  // so run them concurrently too.
+  const workspaceDirs = await resolveWorkspaceDirs(sandboxRoot);
+  const entries = await runWithConcurrencyLimit(
+    namesToCheck,
+    DISCOVERY_CONCURRENCY,
+    async (name): Promise<[string, number]> => {
+      const report = await findDuplicateResolutions(name, sandboxRoot, { workspaceDirs });
+      return [name, report.resolutions.length];
+    },
+  );
+  return Object.fromEntries(entries);
 }
 
 export interface EsmCheckContext {
@@ -866,6 +1163,17 @@ async function testOneVersion(
           output: testResult.success ? undefined : testResult.output,
         },
       ];
+      // Deliberately serial, not concurrent: every consumer's test command
+      // runs against a subdirectory of the SAME sandbox as the primary and
+      // every other consumer, not an isolated copy. A shared workspace
+      // root can have shared mutable state a test/build script writes to
+      // (a root-level cache dir, coverage output, an incremental build-info
+      // file, a dev-server port) — running these concurrently would trade
+      // wall-clock time for a chance of nondeterministic cross-consumer
+      // interference, which is a bad trade for a tool whose entire value is
+      // a trustworthy pass/fail signal. (Testing different VERSIONS is
+      // still parallel via --concurrency — each version gets its own fully
+      // independent sandbox, so there's no shared state across versions.)
       for (const consumer of consumerTargets) {
         const consumerCwd = path.join(sandboxDir, consumer.relativePath);
         const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
@@ -963,9 +1271,68 @@ async function resolveRunContext(
     const missingName = /^"(.+)" is not declared/.exec(message)?.[1] ?? pkgName;
     const declaringWorkspaces = await findWorkspacesDeclaring(missingName, options.appDir);
     if (declaringWorkspaces.length > 0) {
+      // The wrapper hint below is specifically about REACHING pkgName
+      // (the package under test) transitively — it doesn't apply when the
+      // undeclared name is instead a --group member. resolvePinTargets
+      // throws on the first undeclared name in [pkgName, ...group], so
+      // missingName can be a group member; a workspace that wraps THAT
+      // member wouldn't necessarily declare pkgName at all, so both
+      // suggested --app commands below would just fail again with a
+      // different "not declared" error. Only special-case when pkgName
+      // itself is what's missing — otherwise fall through to the generic
+      // "declared in these workspaces" message, which is still correct
+      // (it just names where the missing group member lives).
+      const declaringTargets =
+        missingName === pkgName
+          ? new Map<string, LocalLinkTarget>(
+              declaringWorkspaces.map((w) => [w.name, { version: w.version, dir: w.absoluteDir }]),
+            )
+          : new Map<string, LocalLinkTarget>();
+      const reachableWrapperNames = findDependencyNamesAmong(
+        appPackageJson,
+        options.appDir,
+        declaringTargets,
+      );
+      const wrapperName =
+        reachableWrapperNames.length === 1 ? reachableWrapperNames[0] : undefined;
+      const wrapper = wrapperName
+        ? declaringWorkspaces.find((w) => w.name === wrapperName)
+        : undefined;
+      if (wrapper && wrapperName) {
+        const wrapperSpec =
+          (findDependencySection(appPackageJson, wrapperName) &&
+            (appPackageJson[findDependencySection(appPackageJson, wrapperName)!] as Record<
+              string,
+              string
+            >)[wrapperName]) ??
+          "*";
+        // wrapper.dir is relative to the monorepo root (that's what
+        // findWorkspacesDeclaring resolved it against), but a --app value
+        // the user types is resolved from the CURRENT WORKING DIRECTORY —
+        // often the consumer itself, not the monorepo root. Re-anchor it to
+        // cwd so the suggested command is actually copy-pasteable from the
+        // failing invocation, not silently wrong whenever cwd != monorepo
+        // root.
+        const monorepoRootForHint = await findMonorepoRoot(options.appDir);
+        const wrapperPathForCli = monorepoRootForHint
+          ? path.relative(process.cwd(), path.join(monorepoRootForHint, wrapper.dir)) || "."
+          : wrapper.dir;
+        throw new Error(
+          `"${missingName}" is not declared in ${options.appDir}, but it reaches it through ` +
+            `${wrapper.name} (${wrapperSpec}). Use one of:\n` +
+            `  --app ${wrapperPathForCli},${options.appDir}\n` +
+            `  --app ${wrapperPathForCli} --fan-out\n` +
+            // Both suggestions above put --app on the WRAPPER, not the
+            // current (non-declaring) --app value — just appending
+            // --fan-out to the original invocation would still fail here,
+            // since the primary would still be the non-declaring consumer.
+            `(pointing --app at the wrapper — appending --fan-out to this exact command won't help, ` +
+            `since the primary here would still be the non-declaring target)`,
+        );
+      }
       throw new Error(
         `${message} — but it is declared in these workspaces: ` +
-          `${declaringWorkspaces.join(", ")}. Point --app at one of them instead.`,
+          `${declaringWorkspaces.map((w) => w.name).join(", ")}. Point --app at one of them instead.`,
       );
     }
     throw error;
@@ -1020,7 +1387,20 @@ async function resolveRunContext(
       if (!consumerPackageJson) {
         throw new Error(`No package.json found in consumer directory: ${consumer.absoluteDir}`);
       }
-      const consumerPinTargets = resolvePinTargets(pkgName, options.group, consumerPackageJson);
+      // Unlike the primary, a consumer doesn't have to declare pkgName (or
+      // every --group member) itself — the wrapper pattern this fan-out
+      // widening exists to reach is exactly the case where it doesn't. Pin
+      // whichever of pkgName/group members it actually declares (possibly
+      // none): a consumer with nothing to pin just gets copied into the
+      // sandbox and tested as-is, seeing whatever version the primary's own
+      // pin resolves to through the workspace link — but a consumer that
+      // DOES declare pkgName itself must still get that pin, even if it's
+      // missing an unrelated --group member.
+      const consumerPinTargets = resolveAvailablePinTargets(
+        pkgName,
+        options.group,
+        consumerPackageJson,
+      );
       consumerTargets.push({
         relativePath: consumer.relativeDir,
         pinTargets: consumerPinTargets,
@@ -1041,33 +1421,6 @@ async function resolveRunContext(
     sandboxMode,
     consumerTargets,
   };
-}
-
-/**
- * Run `worker` over `items` with at most `limit` calls in flight at once.
- * Results are written back by index, so the returned order always matches
- * `items`' order regardless of which call finished first — every command's
- * report stays deterministically ordered whether or not concurrency is on.
- */
-async function runWithConcurrencyLimit<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let cursor = 0;
-
-  async function runLane(): Promise<void> {
-    for (;;) {
-      const index = cursor++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index]!);
-    }
-  }
-
-  const laneCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
-  return results;
 }
 
 const JEST_CONFIG_CANDIDATES = [

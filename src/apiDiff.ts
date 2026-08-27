@@ -10,7 +10,7 @@
 
 import * as path from "path";
 import * as ts from "typescript";
-import { readJsonFile, type PackageInfo } from "./utils";
+import { readJsonFile, runWithConcurrencyLimit, type PackageInfo } from "./utils";
 import {
   resolvePackageExportMap,
   resolveEntryPoint,
@@ -388,6 +388,13 @@ async function diffOneVersion(
   }
 }
 
+// api-diff never installs anything (that's the whole point — it's the
+// cheap static track), so this only bounds concurrent tarball
+// downloads/extractions against the registry, not process/disk pressure
+// like compat's --concurrency does. No CLI flag for it: unlike compat,
+// there's no expensive per-version install to trade off against.
+const API_DIFF_CONCURRENCY = 5;
+
 export async function runApiDiff(
   pkgName: string,
   options: ApiDiffOptions,
@@ -413,59 +420,69 @@ export async function runApiDiff(
     ? await readJsonFile<PackageInfo>(path.join(installedDir, "package.json"))
     : null;
 
-  const versions: ApiDiffVersionResult[] = [];
-  for (const version of versionsInRange) {
-    const dist = metadata.versions[version]?.dist;
-    if (!dist) continue;
+  // Each version is an independent tarball download+extract+parse against
+  // the registry — no ordering dependency between them — so run them off a
+  // small concurrency-limited pool instead of one at a time. Results come
+  // back in the same order as versionsInRange regardless of completion
+  // order, which minimumCompatibleVersion/recommendedVersion below depend
+  // on (first/last PASSED in version order).
+  const versionsWithDist = versionsInRange
+    .map((version) => ({ version, dist: metadata.versions[version]?.dist }))
+    .filter((v): v is { version: string; dist: NonNullable<typeof v.dist> } => !!v.dist);
 
-    const {
-      missingSymbols,
-      unresolvedSymbols,
-      exportCount,
-      typesSource,
-      typesPackage,
-      typesPackageVersion,
-      typesPackageVersionMismatch,
-      esmOnlyAdvisory: advisory,
-    } = await diffOneVersion(
-      pkgName,
-      version,
-      dist.tarball,
-      symbols,
-      options.registryUrl,
-      options.token,
-      allowSyntheticDefault,
-      controlInfo,
-    );
+  const versions: ApiDiffVersionResult[] = await runWithConcurrencyLimit(
+    versionsWithDist,
+    API_DIFF_CONCURRENCY,
+    async ({ version, dist }): Promise<ApiDiffVersionResult> => {
+      const {
+        missingSymbols,
+        unresolvedSymbols,
+        exportCount,
+        typesSource,
+        typesPackage,
+        typesPackageVersion,
+        typesPackageVersionMismatch,
+        esmOnlyAdvisory: advisory,
+      } = await diffOneVersion(
+        pkgName,
+        version,
+        dist.tarball,
+        symbols,
+        options.registryUrl,
+        options.token,
+        allowSyntheticDefault,
+        controlInfo,
+      );
 
-    // unresolvedSymbols is only non-empty when there was something to
-    // verify and resolution couldn't — apiCompatible: null then means
-    // "couldn't determine", never "incompatible". When the app doesn't
-    // import anything (usedSymbols empty), unresolvedSymbols stays empty
-    // even for an unresolved barrel, so apiCompatible correctly stays
-    // `true` (nothing to miss) rather than downgrading to unknown.
-    let apiCompatible: boolean | null =
-      unresolvedSymbols.length > 0 ? null : missingSymbols.length === 0;
-    // Types resolved via a @types/<pkg> version that doesn't share this
-    // candidate's major aren't a verified match — don't let a resulting
-    // false negative assert incompatibility with confidence it doesn't have.
-    if (typesPackageVersionMismatch && apiCompatible === false) {
-      apiCompatible = null;
-    }
+      // unresolvedSymbols is only non-empty when there was something to
+      // verify and resolution couldn't — apiCompatible: null then means
+      // "couldn't determine", never "incompatible". When the app doesn't
+      // import anything (usedSymbols empty), unresolvedSymbols stays empty
+      // even for an unresolved barrel, so apiCompatible correctly stays
+      // `true` (nothing to miss) rather than downgrading to unknown.
+      let apiCompatible: boolean | null =
+        unresolvedSymbols.length > 0 ? null : missingSymbols.length === 0;
+      // Types resolved via a @types/<pkg> version that doesn't share this
+      // candidate's major aren't a verified match — don't let a resulting
+      // false negative assert incompatibility with confidence it doesn't have.
+      if (typesPackageVersionMismatch && apiCompatible === false) {
+        apiCompatible = null;
+      }
 
-    versions.push({
-      version,
-      apiCompatible,
-      missingSymbols,
-      unresolvedSymbols,
-      exportCount,
-      typesSource,
-      ...(typesPackage ? { typesPackage } : {}),
-      ...(typesPackageVersion ? { typesPackageVersion } : {}),
-      ...(typesPackageVersionMismatch ? { typesPackageVersionMismatch } : {}),
-      ...(advisory ? { esmOnlyAdvisory: advisory } : {}),
-    });
-  }
+      return {
+        version,
+        apiCompatible,
+        missingSymbols,
+        unresolvedSymbols,
+        exportCount,
+        typesSource,
+        ...(typesPackage ? { typesPackage } : {}),
+        ...(typesPackageVersion ? { typesPackageVersion } : {}),
+        ...(typesPackageVersionMismatch ? { typesPackageVersionMismatch } : {}),
+        ...(advisory ? { esmOnlyAdvisory: advisory } : {}),
+      };
+    },
+  );
 
   const compatibleVersions = versions.filter((v) => v.apiCompatible === true);
   const minimumCompatibleVersion = compatibleVersions[0]?.version ?? null;

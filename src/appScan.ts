@@ -17,6 +17,68 @@ export interface ScanResult {
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", ".git"]);
 
+/**
+ * Optional cache a caller can create once and thread through several
+ * scanImportedSymbols/scanPassedOptionKeys calls that touch the same
+ * directories — e.g. compat's fan-out discovery, which scans the same
+ * consumer directory twice (imported-symbols, then option-keys) and scans
+ * many directories against several different package names each. Without
+ * it, every call re-globs the directory and re-parses every file from
+ * scratch, even when nothing on disk changed between calls.
+ *
+ * Deliberately NOT a module-level singleton: this package is also used from
+ * packdev's long-lived MCP stdio server, where source files can genuinely
+ * change between separate tool invocations. A cache instance must be
+ * created fresh per top-level operation (one `createScanCache()` per
+ * `resolveFanOutConsumers` call, say) and discarded when that operation
+ * returns, never reused across requests.
+ */
+export interface ScanCache {
+  files: Map<string, Promise<string[]>>;
+  sources: Map<string, Promise<ts.SourceFile | null>>;
+}
+
+export function createScanCache(): ScanCache {
+  return { files: new Map(), sources: new Map() };
+}
+
+function getSourceFiles(rootDir: string, cache?: ScanCache): Promise<string[]> {
+  if (!cache) return collectSourceFiles(rootDir);
+  const key = path.resolve(rootDir);
+  let cached = cache.files.get(key);
+  if (!cached) {
+    cached = collectSourceFiles(rootDir);
+    cache.files.set(key, cached);
+  }
+  return cached;
+}
+
+async function parseSourceFile(filePath: string): Promise<ts.SourceFile | null> {
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, "utf-8");
+  } catch {
+    return null;
+  }
+  return ts.createSourceFile(
+    filePath,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    filePath.endsWith(".tsx") || filePath.endsWith(".jsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+}
+
+function getParsedSourceFile(filePath: string, cache?: ScanCache): Promise<ts.SourceFile | null> {
+  if (!cache) return parseSourceFile(filePath);
+  let cached = cache.sources.get(filePath);
+  if (!cached) {
+    cached = parseSourceFile(filePath);
+    cache.sources.set(filePath, cached);
+  }
+  return cached;
+}
+
 async function collectSourceFiles(rootDir: string): Promise<string[]> {
   const results: string[] = [];
 
@@ -126,28 +188,15 @@ function scanSourceFile(
 export async function scanImportedSymbols(
   appDir: string,
   pkgName: string,
+  cache?: ScanCache,
 ): Promise<ScanResult> {
-  const files = await collectSourceFiles(appDir);
+  const files = await getSourceFiles(appDir, cache);
   const symbols = new Set<string>();
   let hasDynamicUsage = false;
 
   for (const filePath of files) {
-    let content: string;
-    try {
-      content = await fs.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-
-    const sourceFile = ts.createSourceFile(
-      filePath,
-      content,
-      ts.ScriptTarget.Latest,
-      true,
-      filePath.endsWith(".tsx") || filePath.endsWith(".jsx")
-        ? ts.ScriptKind.TSX
-        : ts.ScriptKind.TS,
-    );
+    const sourceFile = await getParsedSourceFile(filePath, cache);
+    if (!sourceFile) continue;
 
     if (scanSourceFile(sourceFile, pkgName, symbols)) {
       hasDynamicUsage = true;
@@ -245,29 +294,30 @@ function collectLocalImportBindings(sourceFile: ts.SourceFile, pkgName: string):
 export async function scanPassedOptionKeys(
   appDir: string,
   pkgName: string,
+  cache?: ScanCache,
 ): Promise<Set<string>> {
-  const { symbols: importedSymbols } = await scanImportedSymbols(appDir, pkgName);
-  if (importedSymbols.size === 0) return new Set();
+  const { symbols: importedSymbols, hasDynamicUsage } = await scanImportedSymbols(
+    appDir,
+    pkgName,
+    cache,
+  );
+  // A namespace import (`import * as wrapper from "pkg"`) or a bare
+  // CommonJS binding (`const wrapper = require("pkg")`, not destructured)
+  // reports hasDynamicUsage:true with an EMPTY symbol set — scanSourceFile
+  // can't attribute either to specific export names. Bailing out on
+  // importedSymbols.size alone would incorrectly treat "wrapper" as
+  // unimported here, missing calls like `wrapper.create({ handleMessage })`
+  // that collectLocalImportBindings below is otherwise fully able to find
+  // (it handles namespace imports and bare require bindings itself). Only
+  // bail out when there's truly no local binding to look for either way.
+  if (importedSymbols.size === 0 && !hasDynamicUsage) return new Set();
 
-  const files = await collectSourceFiles(appDir);
+  const files = await getSourceFiles(appDir, cache);
   const optionKeys = new Set<string>();
 
   for (const filePath of files) {
-    let content: string;
-    try {
-      content = await fs.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-    const sourceFile = ts.createSourceFile(
-      filePath,
-      content,
-      ts.ScriptTarget.Latest,
-      true,
-      filePath.endsWith(".tsx") || filePath.endsWith(".jsx")
-        ? ts.ScriptKind.TSX
-        : ts.ScriptKind.TS,
-    );
+    const sourceFile = await getParsedSourceFile(filePath, cache);
+    if (!sourceFile) continue;
 
     const localImportBindings = collectLocalImportBindings(sourceFile, pkgName);
 

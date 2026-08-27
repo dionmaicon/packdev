@@ -106,6 +106,65 @@ export function parseVersionRange(version: string): {
   return { operator: "", version };
 }
 
+/**
+ * Resolve `candidate` (typically a value read from a package's own
+ * manifest — "main"/"types"/"typings"/an "exports" condition — which is
+ * untrusted content: it comes from whatever was downloaded/installed, not
+ * from the local user) against `baseDir`, but only if the result stays
+ * within `baseDir`. Returns null when it would escape, so callers can treat
+ * it exactly as if the field had been absent instead of joining it into a
+ * path and reading/requiring whatever it points to.
+ *
+ * Without this, a malicious/compromised package's manifest containing e.g.
+ * `"main": "../../../../etc/passwd"` would let api/api-diff/behavior-diff
+ * read (and reflect in their output) or, under `api --introspect`,
+ * require() arbitrary files anywhere on disk — well beyond the
+ * already-accepted risk of running the downloaded package's own code.
+ *
+ * Checked twice: a lexical check first (cheap, and the only signal
+ * available for a candidate that doesn't exist yet — callers gate on
+ * fileExists afterward), then, when both sides exist, a realpath-resolved
+ * check too. The lexical check alone isn't enough for every caller: this
+ * is applied both to a tarball this process just extracted (registry.ts's
+ * extractTarball — node-tar's default extraction already refuses entries
+ * whose own path or symlink target lands outside the root, so lexical
+ * containment there is provably real containment) AND to an
+ * already-installed node_modules package (api.ts's `packdev api`, not just
+ * `api-diff`), where symlinks are routine and not attacker-exotic — pnpm's
+ * node_modules layout links every package in from a central store by
+ * design. A lexical check alone could be fooled there: baseDir or an
+ * ancestor of the resolved candidate being a symlink can make a
+ * string-contained path resolve to a real location outside baseDir.
+ */
+export async function resolveContainedPath(
+  baseDir: string,
+  candidate: string,
+): Promise<string | null> {
+  const resolvedBase = path.resolve(baseDir);
+  const resolved = path.resolve(resolvedBase, candidate);
+  const rel = path.relative(resolvedBase, resolved);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return null;
+  }
+
+  try {
+    const [realBase, realResolved] = await Promise.all([
+      fs.realpath(resolvedBase),
+      fs.realpath(resolved),
+    ]);
+    const realRel = path.relative(realBase, realResolved);
+    if (realRel === ".." || realRel.startsWith(`..${path.sep}`) || path.isAbsolute(realRel)) {
+      return null;
+    }
+  } catch {
+    // candidate (or an ancestor) doesn't exist yet — nothing to resolve;
+    // the lexical check above is the only signal available, and every
+    // caller gates on fileExists afterward regardless.
+  }
+
+  return resolved;
+}
+
 // File utilities
 export async function fileExists(filePath: string): Promise<boolean> {
   try {
@@ -436,6 +495,33 @@ export async function resolveLocalPackage(
 
   collect(await discoverSiblingPackages(rootDir));
   return matches;
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` calls in flight at once.
+ * Results are written back by index, so the returned order always matches
+ * `items`' order regardless of which call finished first — a caller's
+ * report stays deterministically ordered whether or not concurrency is on.
+ */
+export async function runWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  async function runLane(): Promise<void> {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]!);
+    }
+  }
+
+  const laneCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
+  return results;
 }
 
 // Array and object utilities

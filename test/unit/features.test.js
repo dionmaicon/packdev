@@ -607,6 +607,118 @@ class FeatureTests {
     });
   }
 
+  async testApiEntryPointCannotEscapePackageDirViaMaliciousTypesField() {
+    await this.run('api does not read outside the package dir when a "types" field escapes via ../ traversal (malicious/compromised package)', async () => {
+      // A package's manifest fields are untrusted content (they come from
+      // whatever was installed/downloaded, not from the local user) — a
+      // malicious or compromised package could declare "types" pointing
+      // outside its own directory. If that escape isn't blocked, `api`
+      // would read an arbitrary file elsewhere on disk and reflect its
+      // exports in the report.
+      const dir = this.tmp('api-escape-types');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      // Outside evil-lib's own package dir (dir/node_modules/evil-lib) —
+      // if this function's name shows up in the report, the escape worked.
+      fs.writeFileSync(
+        path.join(dir, 'secret.d.ts'),
+        'export function superSecretLeakedFunction(): void;\n',
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        {
+          name: 'evil-lib', version: '1.0.0', main: 'index.js',
+          types: '../../secret.d.ts', // node_modules/evil-lib -> node_modules -> dir
+        },
+        { 'index.js': 'module.exports = {};' },
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(
+        json.hasTypes, false,
+        'an escaping "types" path must be treated as unresolvable (as if absent), not followed outside the package dir',
+      );
+      assert.ok(
+        !json.exports.some((e) => e.name === 'superSecretLeakedFunction'),
+        'must never read/report a file outside the installed package directory',
+      );
+    });
+  }
+
+  async testApiIntrospectCannotEscapePackageDirViaMaliciousMainField() {
+    await this.run('api --introspect does not require() outside the package dir when "main" escapes via ../ traversal', async () => {
+      const dir = this.tmp('api-escape-main-introspect');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      const markerPath = path.join(dir, 'evil-ran.marker');
+      // A file OUTSIDE evil-lib's own package dir with a side effect —
+      // if "main" escaping ever gets require()'d, this marker gets written.
+      fs.writeFileSync(
+        path.join(dir, 'secret.js'),
+        `require('fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran');\nmodule.exports = {};\n`,
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        { name: 'evil-lib', version: '1.0.0', main: '../../secret.js' },
+        {}, // no index.js either — the safe fallback target doesn't exist
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--introspect', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      assert.ok(
+        !fs.existsSync(markerPath),
+        'an escaping "main" must never be require()\'d — the marker file outside the package dir must not have been written',
+      );
+    });
+  }
+
+  async testApiTypeScriptResolutionCannotEscapePackageDirThroughAnInPackageReexport() {
+    await this.run('api does not follow a `export * from` inside an otherwise-contained .d.ts file outside the package dir', async () => {
+      // Validating only the manifest's OWN "types" field isn't enough:
+      // TypeScript's module resolution (noResolve: false) follows every
+      // `export ... from "spec"` INSIDE that file too. A package could ship
+      // a "types" pointing safely at its own index.d.ts, which itself
+      // re-exports from a path that escapes the package directory — the
+      // escape lives in file CONTENT, not a manifest field, so the earlier
+      // manifest-field containment check alone can't catch it.
+      const dir = this.tmp('api-escape-reexport-in-dts');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      // Outside evil-lib's own package dir (dir/node_modules/evil-lib) —
+      // if this function's name shows up in the report, the escape worked.
+      fs.writeFileSync(
+        path.join(dir, 'secret.d.ts'),
+        'export function superSecretLeakedFunction(): void;\n',
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        { name: 'evil-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = {};',
+          // node_modules/evil-lib -> node_modules -> dir
+          'index.d.ts': 'export * from "../../secret";\nexport function safeFunction(): void;\n',
+        },
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.ok(
+        json.exports.some((e) => e.name === 'safeFunction'),
+        'a legitimate in-package export must still resolve normally',
+      );
+      assert.ok(
+        !json.exports.some((e) => e.name === 'superSecretLeakedFunction'),
+        'must never follow a re-export outside the package directory, even from otherwise-valid file content',
+      );
+    });
+  }
+
   async testApiResolvesExportEqualsAsDefault() {
     await this.run('api reports a TS "export = X" declaration as the default export', async () => {
       const dir = this.tmp('api-export-equals');
@@ -2970,6 +3082,606 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutDiscoversOneHopWrapperConsumers() {
+    await this.run('compat --fan-out discovers consumers that depend on a wrapper rather than the package directly (one hop, ranked, capped)', async () => {
+      // The wrapper-pattern gap: only "wrapper" declares fake-lib; consumer-a
+      // and consumer-b depend on "wrapper" via workspace:, never on fake-lib
+      // itself. Before the one-hop widening, direct-declarer-only discovery
+      // returned an empty set here.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-one-hop');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(wrapperDir, 'index.js'), 'module.exports = require("fake-lib");\n');
+
+      // consumer-a: imports "createQueue" from wrapper AND passes an object
+      // literal into it — the strongest of the two ranking signals.
+      const consumerADir = path.join(monorepoRoot, 'packages', 'consumer-a');
+      fs.mkdirSync(consumerADir, { recursive: true });
+      writeJson(path.join(consumerADir, 'package.json'), {
+        // Plain "*", not "workspace:*" — proves discovery/linking doesn't
+        // depend on the yarn/pnpm-only protocol string; npm's own workspace
+        // auto-linking (any specifier a locally-present workspace satisfies)
+        // is what actually matters, and it's what lets this fixture install
+        // for real with plain npm.
+        name: 'consumer-a', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(consumerADir, 'main.js'),
+        'const { createQueue } = require("wrapper");\ncreateQueue({ handleMessage: () => {} });\n',
+      );
+
+      // consumer-b: imports the same one symbol, but calls it bare — no
+      // object-literal argument, so it must rank below consumer-a.
+      const consumerBDir = path.join(monorepoRoot, 'packages', 'consumer-b');
+      fs.mkdirSync(consumerBDir, { recursive: true });
+      writeJson(path.join(consumerBDir, 'package.json'), {
+        name: 'consumer-b', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(consumerBDir, 'main.js'),
+        'const { createQueue } = require("wrapper");\ncreateQueue();\n',
+      );
+
+      // unrelated: no dependency on wrapper or fake-lib at all — must never
+      // be discovered, at any --top.
+      const unrelatedDir = path.join(monorepoRoot, 'packages', 'unrelated');
+      fs.mkdirSync(unrelatedDir, { recursive: true });
+      writeJson(path.join(unrelatedDir, 'package.json'), { name: 'unrelated', version: '1.0.0' });
+
+      // consumer-of-consumer: reaches fake-lib only through TWO workspace:
+      // hops (via consumer-a) — the widening is exactly one hop, so this
+      // must never be discovered either, however high --top is set.
+      const grandchildDir = path.join(monorepoRoot, 'packages', 'consumer-of-consumer');
+      fs.mkdirSync(grandchildDir, { recursive: true });
+      writeJson(path.join(grandchildDir, 'package.json'), {
+        name: 'consumer-of-consumer', version: '1.0.0', dependencies: { 'consumer-a': '*' },
+      });
+
+      const baseArgs = [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ];
+
+      const r = await runPackdev(wrapperDir, [...baseArgs, '--top', '10']);
+      const json = parseJson(r.stdout, 'compat');
+      // Ranked consumer-a before consumer-b (tied symbol count, object-arg
+      // tiebreak); unrelated and consumer-of-consumer never appear.
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/consumer-a', 'packages/consumer-b']);
+
+      const capped = await runPackdev(wrapperDir, [...baseArgs, '--top', '1']);
+      const cappedJson = parseJson(capped.stdout, 'compat');
+      assert.deepStrictEqual(cappedJson.fanOutConsumers, ['packages/consumer-a']);
+    });
+  }
+
+  async testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot() {
+    await this.run('compat --fan-out ranks a bare (non-destructured) require() consumer that passes an object above one that does not', async () => {
+      // scanImportedSymbols reports a bare `const wrapper = require(pkg)`
+      // binding as hasDynamicUsage:true with an EMPTY symbol set — it can't
+      // attribute a non-destructured require to specific export names.
+      // scanPassedOptionKeys used to bail out whenever the symbol set was
+      // empty, regardless of hasDynamicUsage, making this consumer's real
+      // object-literal argument invisible to ranking. Both consumers here
+      // have symbolCount 0 (tied), so if the object-arg tiebreak is broken,
+      // the result silently falls back to alphabetical dir order instead —
+      // "no-object" sorts before "passes-object", which is the wrong order
+      // and the exact bug this test catches.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-bare-require-rank');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const objectArgDir = path.join(monorepoRoot, 'packages', 'passes-object');
+      fs.mkdirSync(objectArgDir, { recursive: true });
+      writeJson(path.join(objectArgDir, 'package.json'), {
+        name: 'passes-object', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(objectArgDir, 'main.js'),
+        'const wrapper = require("wrapper");\nwrapper.create({ handleMessage: () => {} });\n',
+      );
+
+      const noObjectArgDir = path.join(monorepoRoot, 'packages', 'no-object');
+      fs.mkdirSync(noObjectArgDir, { recursive: true });
+      writeJson(path.join(noObjectArgDir, 'package.json'), {
+        name: 'no-object', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(noObjectArgDir, 'main.js'),
+        'const wrapper = require("wrapper");\nwrapper.create();\n',
+      );
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/passes-object', 'packages/no-object']);
+    });
+  }
+
+  async testCompatFanOutUnnamedTier0WorkspaceIsNotDuplicatedIntoTier1() {
+    await this.run('compat --fan-out does not duplicate an unnamed tier-0 workspace into tier 1, even if it also depends on a named tier-0 wrapper', async () => {
+      // The "already tier 0" exclusion when building tier-1 candidates used
+      // to be keyed by NAME (tier0Names.has(w.packageJson.name ?? "")).
+      // package.json "name" is optional — for a tier-0 workspace with no
+      // name at all, that check silently degrades to tier0Names.has(""),
+      // which is always false, so it was never excluded. If that same
+      // unnamed workspace ALSO happens to depend on some other NAMED
+      // tier-0 wrapper, it would qualify for tier 1 too: the same
+      // directory listed twice, once per tier.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-unnamed-tier0-dup');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // No "name" field at all — still a valid tier-0 declarer (declares
+      // fake-lib directly) AND also depends on "wrapper".
+      const unnamedDir = path.join(monorepoRoot, 'packages', 'unnamed');
+      fs.mkdirSync(unnamedDir, { recursive: true });
+      writeJson(path.join(unnamedDir, 'package.json'), {
+        version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0', wrapper: '*' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"',
+        '--fan-out', '--top', '10', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      const occurrences = json.fanOutConsumers.filter((d) => d === 'packages/unnamed');
+      assert.strictEqual(
+        occurrences.length, 1,
+        `expected "packages/unnamed" exactly once, got: ${JSON.stringify(json.fanOutConsumers)}`,
+      );
+    });
+  }
+
+  async testCompatFanOutFileSpecifierMustResolveToTheActualWorkspaceNotJustShareItsName() {
+    await this.run('compat --fan-out validates a file:/link: dependency actually resolves to the discovered wrapper, not just shares its name', async () => {
+      // Matching purely on dependency KEY was enough for a "*"/semver
+      // range (those are validated separately, by version compatibility),
+      // but a file:/link: specifier is a literal filesystem path — it can
+      // point ANYWHERE while its key still happens to equal a real tier-0
+      // workspace's name (a vendored copy, a decoy). Only a path that
+      // actually resolves to the discovered workspace's own directory
+      // should count.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-file-spec-validation');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // A decoy directory OUTSIDE the workspaces glob, same name as the
+      // real tier-0 workspace but a different location entirely (e.g. a
+      // vendored copy).
+      const decoyDir = path.join(monorepoRoot, 'vendor', 'wrapper');
+      fs.mkdirSync(decoyDir, { recursive: true });
+      writeJson(path.join(decoyDir, 'package.json'), { name: 'wrapper', version: '9.9.9' });
+
+      const decoyConsumerDir = path.join(monorepoRoot, 'packages', 'decoy-consumer');
+      fs.mkdirSync(decoyConsumerDir, { recursive: true });
+      writeJson(path.join(decoyConsumerDir, 'package.json'), {
+        name: 'decoy-consumer', version: '1.0.0',
+        // Key matches the real tier-0 workspace's name, but the path
+        // resolves to the decoy, not packages/wrapper.
+        dependencies: { wrapper: 'file:../../vendor/wrapper' },
+      });
+
+      // Control: a consumer whose file: path DOES correctly resolve to the
+      // real wrapper workspace — must still be discovered.
+      const realConsumerDir = path.join(monorepoRoot, 'packages', 'real-consumer');
+      fs.mkdirSync(realConsumerDir, { recursive: true });
+      writeJson(path.join(realConsumerDir, 'package.json'), {
+        name: 'real-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'file:../wrapper' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/real-consumer']);
+    });
+  }
+
+  async testCompatFanOutWorkspaceAliasPayloadMustMatchDependencyKeyName() {
+    await this.run('compat --fan-out rejects a workspace:<alias>@<range> specifier whose alias differs from the dependency key, even though the key matches a real tier-0 workspace', async () => {
+      // pnpm's workspace: protocol supports aliasing: "wrapper": "workspace:
+      // other-package@*" means "link the LOCAL WORKSPACE NAMED
+      // other-package under the local name wrapper" — the dependency key
+      // matching a real tier-0 workspace's name is a coincidence, not proof
+      // of linkage, when the payload aliases to a different package.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-workspace-alias');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // Unrelated workspace, NOT a tier-0 declarer of fake-lib — the actual
+      // alias target below.
+      const otherDir = path.join(monorepoRoot, 'packages', 'other-package');
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeJson(path.join(otherDir, 'package.json'), { name: 'other-package', version: '1.0.0' });
+
+      // Key "wrapper" name-matches the real tier-0 workspace, but the alias
+      // payload actually points this dependency at "other-package".
+      const aliasedConsumerDir = path.join(monorepoRoot, 'packages', 'aliased-consumer');
+      fs.mkdirSync(aliasedConsumerDir, { recursive: true });
+      writeJson(path.join(aliasedConsumerDir, 'package.json'), {
+        name: 'aliased-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'workspace:other-package@*' },
+      });
+
+      // Control: a real (non-aliased) workspace: dependency on wrapper.
+      const realConsumerDir = path.join(monorepoRoot, 'packages', 'real-consumer');
+      fs.mkdirSync(realConsumerDir, { recursive: true });
+      writeJson(path.join(realConsumerDir, 'package.json'), {
+        name: 'real-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'workspace:*' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/real-consumer']);
+    });
+  }
+
+  async testCompatFanOutExplicitListAcceptsNonDeclaringConsumer() {
+    await this.run('compat --app wrapper,consumer accepts a consumer that never declares the package itself', async () => {
+      // This is the escape-hatch half of the same gap: before the fix, an
+      // explicit --app list rejected any target that didn't declare the
+      // package in its own package.json, which made the wrapper pattern
+      // untestable even by hand.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-explicit-non-declaring');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node -e "process.exit(0)"' },
+      });
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        // Plain "*" here so this can actually install with npm; the fix is
+        // about the dependency existing at all, not its specifier syntax.
+        name: 'consumer', version: '1.0.0', dependencies: { wrapper: '*' },
+        scripts: { test: 'node -e "process.exit(0)"' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0',
+        '--app', `${wrapperDir},${consumerDir}`,
+        '--registry', registryUrl, '--test-script', 'test', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.error, undefined, `expected success, got error: ${json.error}`);
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/consumer']);
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+    });
+  }
+
+  async testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper() {
+    await this.run('compat errors with the wrapper name (not a bare workspace list) when --app is a consumer that only reaches the package transitively', async () => {
+      const monorepoRoot = this.tmp('compat-fanout-primary-transitive');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0', dependencies: { wrapper: 'workspace:*' },
+      });
+
+      // Primary is the CONSUMER, not the wrapper — consumer.js declares
+      // neither fake-lib nor anything else about it directly.
+      const r = await runPackdev(consumerDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', consumerDir,
+        '--test', 'node -e "process.exit(0)"', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /reaches it through wrapper \(workspace:\*\)/);
+      // cwd for this invocation IS consumerDir (runPackdev's cwd arg), which
+      // is NOT the monorepo root — so the suggested wrapper path must be
+      // re-anchored to cwd ("../wrapper"), not left as the monorepo-root-
+      // relative "packages/wrapper", which would be wrong to paste from here.
+      assert.match(json.error, /--app \.\.\/wrapper,/);
+      assert.match(json.error, /--app \.\.\/wrapper --fan-out/);
+      // Must NOT fall back to the generic "declared in these workspaces"
+      // phrasing, which would point back at the wrapper as if pointing
+      // --app there were the fix (it isn't — that reproduces the false green).
+      assert.doesNotMatch(json.error, /Point --app at one of them instead/);
+    });
+  }
+
+  async testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage() {
+    await this.run('compat still uses the generic "declared in these workspaces" message when the primary has no workspace: path to the package at all', async () => {
+      const monorepoRoot = this.tmp('compat-fanout-primary-no-path');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const declarerDir = path.join(monorepoRoot, 'packages', 'declarer');
+      fs.mkdirSync(declarerDir, { recursive: true });
+      writeJson(path.join(declarerDir, 'package.json'), {
+        name: 'declarer', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // appDir has no relationship to "declarer" at all — no workspace: dep
+      // on it, direct or transitive.
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0' });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--test', 'node -e "process.exit(0)"', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /declared in these workspaces: declarer/);
+      assert.match(json.error, /Point --app at one of them instead/);
+    });
+  }
+
+  async testCompatFanOutCatchesAWrapperOnlyBreakInvisibleToDirectDiscovery() {
+    await this.run('compat --fan-out catches a break that only shows up in a consumer of the wrapper, which direct-declarer discovery could never see', async () => {
+      // Mirrors the real-world sqs-consumer incident: the wrapper's own
+      // build/tests never exercise the changed behavior (it just re-exports),
+      // so testing it alone reports a false PASSED. Only a consumer that
+      // pulls the wrapper's re-export actually observes the regression, and
+      // that consumer declares nothing about fake-lib itself.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: true };',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = { thing: false };',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const monorepoRoot = this.tmp('compat-fanout-wrapper-only-break');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+        scripts: { test: 'node check.js' },
+      });
+      fs.writeFileSync(path.join(wrapperDir, 'index.js'), 'module.exports = require("fake-lib");\n');
+      // The wrapper's own tests never look at .thing — this is why testing
+      // it alone can't catch the regression.
+      fs.writeFileSync(path.join(wrapperDir, 'check.js'), 'process.exit(0);\n');
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        // Plain "*", not "workspace:*" — this fixture needs a real npm
+        // install to actually run both versions' behavior, and npm doesn't
+        // understand the workspace: protocol (see the SKIPPED/INSTALL_FAILED
+        // tests above); its own workspace auto-linking handles "*" fine.
+        name: 'consumer', version: '1.0.0', dependencies: { wrapper: '*' },
+        scripts: { test: 'node check.js' },
+      });
+      fs.writeFileSync(
+        path.join(consumerDir, 'check.js'),
+        'process.exit(require("wrapper").thing ? 0 : 1);\n',
+      );
+
+      // Owner-only run (no fan-out): the false green this whole gap is
+      // about — wrapper PASSES on both versions since it never checks .thing.
+      const ownerOnly = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test-script', 'test', '--json',
+      ]);
+      const ownerOnlyJson = parseJson(ownerOnly.stdout, 'compat');
+      assert.strictEqual(ownerOnlyJson.versions.find((v) => v.version === '2.0.0').status, 'PASSED');
+
+      // --fan-out: consumer is now discoverable (one hop via workspace:) and
+      // must flip the 2.0.0 verdict to FAILED.
+      const fannedOut = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0,2.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test-script', 'test', '--fan-out', '--json',
+      ]);
+      const fannedOutJson = parseJson(fannedOut.stdout, 'compat');
+      assert.deepStrictEqual(fannedOutJson.fanOutConsumers, ['packages/consumer']);
+      const v1Result = fannedOutJson.versions.find((v) => v.version === '1.0.0');
+      const v2Result = fannedOutJson.versions.find((v) => v.version === '2.0.0');
+      assert.strictEqual(v1Result.status, 'PASSED');
+      assert.strictEqual(
+        v2Result.status,
+        'FAILED',
+        'the wrapper itself never exercises fake-lib\'s behavior, but the consumer must still fail the overall version',
+      );
+      const wrapperConsumer = v2Result.consumers.find((c) => c.dir === '.');
+      const siblingConsumer = v2Result.consumers.find((c) => c.dir === 'packages/consumer');
+      assert.strictEqual(wrapperConsumer.status, 'PASSED');
+      assert.strictEqual(siblingConsumer.status, 'FAILED');
+
+      // Same result via the explicit escape hatch (--app wrapper,consumer)
+      // — the non-declaring consumer must be accepted, not rejected.
+      const explicit = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '2.0.0', '--app', `${wrapperDir},${consumerDir}`,
+        '--registry', registryUrl, '--test-script', 'test', '--json',
+      ]);
+      const explicitJson = parseJson(explicit.stdout, 'compat');
+      assert.strictEqual(explicitJson.versions[0].status, 'FAILED');
+    });
+  }
+
+  async testCompatFanOutExcludesConsumerWithIncompatibleSemverRangeOnWrapper() {
+    await this.run('compat --fan-out excludes a workspace whose dependency on the wrapper is a semver range the wrapper\'s own version cannot satisfy', async () => {
+      // A dependency KEY matching a tier-0 workspace's name isn't enough —
+      // if the declared range doesn't actually admit the wrapper's own
+      // version, npm/yarn install a separate registry copy instead of
+      // linking the local workspace, so this "consumer" would never
+      // observe the primary's pinned version at all.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-incompatible-range');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        // Wrapper is at 1.0.0 — a consumer requiring ^2.0.0 of it can never
+        // resolve to this local copy.
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const incompatibleDir = path.join(monorepoRoot, 'packages', 'incompatible-consumer');
+      fs.mkdirSync(incompatibleDir, { recursive: true });
+      writeJson(path.join(incompatibleDir, 'package.json'), {
+        name: 'incompatible-consumer', version: '1.0.0', dependencies: { wrapper: '^2.0.0' },
+      });
+
+      const compatibleDir = path.join(monorepoRoot, 'packages', 'compatible-consumer');
+      fs.mkdirSync(compatibleDir, { recursive: true });
+      writeJson(path.join(compatibleDir, 'package.json'), {
+        name: 'compatible-consumer', version: '1.0.0', dependencies: { wrapper: '^1.0.0' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/compatible-consumer']);
+    });
+  }
+
+  async testCompatFanOutPrimaryReachingMultipleWrappersUsesGenericMessage() {
+    await this.run('compat falls back to the generic "declared in these workspaces" message when the primary reaches the package through more than one wrapper', async () => {
+      // Naming a single wrapper in the error would be an arbitrary (and
+      // possibly wrong) guess when the primary actually has a real local
+      // dependency on TWO different declaring workspaces.
+      const monorepoRoot = this.tmp('compat-fanout-ambiguous-wrapper');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperADir = path.join(monorepoRoot, 'packages', 'wrapper-a');
+      fs.mkdirSync(wrapperADir, { recursive: true });
+      writeJson(path.join(wrapperADir, 'package.json'), {
+        name: 'wrapper-a', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const wrapperBDir = path.join(monorepoRoot, 'packages', 'wrapper-b');
+      fs.mkdirSync(wrapperBDir, { recursive: true });
+      writeJson(path.join(wrapperBDir, 'package.json'), {
+        name: 'wrapper-b', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0',
+        dependencies: { 'wrapper-a': '^1.0.0', 'wrapper-b': '^1.0.0' },
+      });
+
+      const r = await runPackdev(consumerDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', consumerDir,
+        '--test', 'node -e "process.exit(0)"', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /declared in these workspaces: wrapper-a, wrapper-b/);
+      assert.match(json.error, /Point --app at one of them instead/);
+      assert.doesNotMatch(json.error, /reaches it through/);
+    });
+  }
+
   async testCompatNothingTestedExitCodeAndMessage() {
     await this.run('compat exits 6 and says nothing was tested when every version is SKIPPED (not "no version passed")', async () => {
       const v1 = await buildFakeTarball({
@@ -3617,6 +4329,51 @@ class FeatureTests {
       assert.notStrictEqual(r.code, 0, 'expected a non-zero exit for an undeclared group member');
       assert.match(r.stderr, /fake-express/);
       assert.match(r.stderr, /not declared/i);
+    });
+  }
+
+  async testCompatGroupMissingMemberDoesNotTriggerWrapperHint() {
+    await this.run('compat does not apply the wrapper-reachability hint when the UNDECLARED name is a --group member, not the package under test', async () => {
+      // resolvePinTargets throws on the FIRST undeclared name in
+      // [pkgName, ...group], which can be a --group member rather than
+      // pkgName itself. The wrapper-reachability hint is specifically about
+      // reaching pkgName (fake-core here) transitively — a workspace that
+      // wraps the missing GROUP member (fake-express) has no bearing on
+      // that, and both of its suggested --app commands would just fail
+      // again with a different "not declared" error if followed.
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0']);
+
+      const monorepoRoot = this.tmp('compat-group-missing-not-wrapper-hint');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-express': '1.0.0' },
+      });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0', wrapper: '*' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '2.0.0', '--group', 'fake-common,fake-express',
+        '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /fake-express/);
+      assert.match(json.error, /not declared/i);
+      // Must not misattribute the missing GROUP member to a wrapper
+      // reachable for pkgName — wrapper here doesn't declare fake-core
+      // (the package actually under test) at all.
+      assert.doesNotMatch(json.error, /reaches it through/);
+      assert.doesNotMatch(json.error, /--app wrapper/);
     });
   }
 
@@ -5144,6 +5901,9 @@ module.exports = { realEntry };
       await this.testApiHumanOutput();
       await this.testApiJsonShape();
       await this.testApiExportsMapResolution();
+      await this.testApiEntryPointCannotEscapePackageDirViaMaliciousTypesField();
+      await this.testApiIntrospectCannotEscapePackageDirViaMaliciousMainField();
+      await this.testApiTypeScriptResolutionCannotEscapePackageDirThroughAnInPackageReexport();
       await this.testApiResolvesExportEqualsAsDefault();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
@@ -5219,6 +5979,17 @@ module.exports = { realEntry };
       await this.testCompatFanOutRequiresDiscoverableMonorepoRoot();
       await this.testCompatRejectsExplicitAppListCombinedWithFanOut();
       await this.testCompatFanOutRejectsConsumerOutsideMonorepoRoot();
+      await this.testCompatFanOutDiscoversOneHopWrapperConsumers();
+      await this.testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot();
+      await this.testCompatFanOutUnnamedTier0WorkspaceIsNotDuplicatedIntoTier1();
+      await this.testCompatFanOutFileSpecifierMustResolveToTheActualWorkspaceNotJustShareItsName();
+      await this.testCompatFanOutWorkspaceAliasPayloadMustMatchDependencyKeyName();
+      await this.testCompatFanOutExplicitListAcceptsNonDeclaringConsumer();
+      await this.testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper();
+      await this.testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage();
+      await this.testCompatFanOutCatchesAWrapperOnlyBreakInvisibleToDirectDiscovery();
+      await this.testCompatFanOutExcludesConsumerWithIncompatibleSemverRangeOnWrapper();
+      await this.testCompatFanOutPrimaryReachingMultipleWrappersUsesGenericMessage();
       await this.testCompatNothingTestedExitCodeAndMessage();
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
@@ -5237,6 +6008,7 @@ module.exports = { realEntry };
       await this.testCompatGroupWithoutFlagSurfacesMismatch();
       await this.testCompatGroupMovesFamilyTogether();
       await this.testCompatGroupErrorsOnUndeclaredMember();
+      await this.testCompatGroupMissingMemberDoesNotTriggerWrapperHint();
       await this.testCompatUndeclaredPackageNamesSiblingWorkspacesThatDeclareIt();
       await this.testCompatGroupComposesWithBisect();
       await this.testCompatBisectFindsBoundaryInFewerRuns();
