@@ -382,6 +382,30 @@ export interface ConsumerTarget {
  * distinct symbols it actually imports from pkgName (scanImportedSymbols),
  * descending, and capped at `top`.
  */
+// Resolves symlinks on both sides before comparing, so a workspace dir that
+// only *looks* contained (e.g. a symlink pointing outside monorepoRoot)
+// can't slip through — relativeDir is later joined straight into a sandbox
+// path (createSandbox, testOneVersion), so an uncontained target isn't just
+// a bookkeeping error, it's compat rewriting/executing a real external
+// directory while believing it's sandboxed. Falls back to the
+// non-realpath'd absolute dir if either side doesn't exist yet (lets the
+// caller's own "no package.json found" error fire with a clearer message
+// than an ENOENT from realpath would).
+async function assertConsumerWithinMonorepo(monorepoRoot: string, absoluteDir: string): Promise<void> {
+  const [realRoot, realTarget] = await Promise.all([
+    fs.realpath(monorepoRoot).catch(() => path.resolve(monorepoRoot)),
+    fs.realpath(absoluteDir).catch(() => path.resolve(absoluteDir)),
+  ]);
+  const rel = path.relative(realRoot, realTarget);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error(
+      `Fan-out consumer "${absoluteDir}" resolves outside the monorepo root "${monorepoRoot}" ` +
+        `(possibly via a symlink or a "../" path) — refusing to sandbox it. Fan-out consumers must ` +
+        `be real subdirectories of the discovered workspaces root.`,
+    );
+  }
+}
+
 export async function resolveFanOutConsumers(
   pkgName: string,
   monorepoRoot: string,
@@ -820,6 +844,14 @@ async function testOneVersion(
     const testResult = await runTestCommand(testCwd, effectiveTestCommand);
 
     let consumers: ConsumerTestResult[] | undefined;
+    // The exitCode/output a caller sees when `status` is the fan-out
+    // rollup: default to the primary's own result, but if the primary
+    // itself passed and a consumer is what actually failed, surface that
+    // consumer's exitCode/output instead — otherwise a top-level
+    // "FAILED, exitCode 0, no output" would be internally contradictory
+    // for any caller that doesn't also inspect `consumers`.
+    let rolledUpExitCode = testResult.exitCode;
+    let rolledUpOutput = testResult.success ? undefined : testResult.output;
     let overallSuccess = testResult.success;
     if (consumerTargets.length > 0) {
       const primaryPackageJson = await readJsonFile<PackageJson & { name?: string }>(
@@ -847,6 +879,12 @@ async function testOneVersion(
           exitCode: consumerResult.exitCode,
           output: consumerResult.success ? undefined : consumerResult.output,
         });
+        if (overallSuccess && !consumerResult.success) {
+          // First failure seen — the primary passed, so this consumer is
+          // the one actually explaining the rollup.
+          rolledUpExitCode = consumerResult.exitCode;
+          rolledUpOutput = consumerResult.output;
+        }
         overallSuccess = overallSuccess && consumerResult.success;
       }
     }
@@ -854,9 +892,9 @@ async function testOneVersion(
     return {
       version,
       status: overallSuccess ? "PASSED" : "FAILED",
-      exitCode: testResult.exitCode,
+      exitCode: rolledUpExitCode,
       durationMs: Date.now() - startedAt,
-      output: testResult.success ? undefined : testResult.output,
+      output: rolledUpOutput,
       lockfileHash: snapshot.hash,
       lockfileSnapshotPath: snapshot.path,
       dupeCounts,
@@ -903,6 +941,14 @@ async function resolveRunContext(
   sandboxMode: "hermetic" | "workspace";
   consumerTargets: ResolvedConsumerTarget[];
 }> {
+  if (options.consumerApps && options.consumerApps.length > 0 && options.fanOut) {
+    throw new Error(
+      "`consumerApps` (explicit fan-out targets) and `fanOut` (auto-discovery) are mutually " +
+        "exclusive — pick one. Silently preferring the explicit list would make a requested " +
+        "auto-discovery disappear without any indication why.",
+    );
+  }
+
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
   if (!appPackageJson) {
@@ -967,6 +1013,7 @@ async function resolveRunContext(
         : await resolveFanOutConsumers(pkgName, monorepoRoot, options.appDir, options.fanOutTop ?? 5);
 
     for (const consumer of consumers) {
+      await assertConsumerWithinMonorepo(monorepoRoot, consumer.absoluteDir);
       const consumerPackageJson = await readJsonFile<PackageJson>(
         path.join(consumer.absoluteDir, "package.json"),
       );
@@ -1044,6 +1091,58 @@ async function readJestConfigSources(appDir: string): Promise<string[]> {
     sources.push(await fs.readFile(pkgJsonPath, "utf-8"));
   }
   return sources;
+}
+
+// Resolves what "the test command" actually is for harness-analysis
+// purposes at `dir`: with --test-script, that's each target's OWN
+// package.json script body (e.g. "jest --coverage"), not the literal
+// "<manager> run <script>" invocation — the latter never contains the word
+// "jest" even when the script it runs does, which would otherwise make
+// every TRANSPILE_ONLY/TYPE_CHECK_ONLY/PASS_WITH_NO_TESTS/ESM-mismatch
+// check silently no-op for the --test-script path (the recommended way to
+// run fan-out, where this would matter most). Falls back to the literal
+// invocation if the script name isn't found in package.json (e.g. defined
+// some other way) rather than analyzing nothing.
+async function resolveHarnessCommand(
+  dir: string,
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+): Promise<string> {
+  if (!options.testScript) return options.testCommand ?? "";
+  const packageJson = await readJsonFile<PackageJson & { scripts?: Record<string, string> }>(
+    path.join(dir, "package.json"),
+  );
+  return packageJson?.scripts?.[options.testScript] ?? `${packageManagerInfo.manager} run ${options.testScript}`;
+}
+
+/**
+ * analyzeTestHarness against every target's own effective command (primary
+ * --app, plus each fan-out consumer when --test-script is set — each may
+ * define a different script), merged by caveat code so a gap found in any
+ * one target's harness is still surfaced once. Report-level
+ * testCommandCaveats is necessarily a single merged list, not attributed
+ * per-target; consumers[].output on a FAILED run still names which target
+ * actually failed if that's what's needed next.
+ */
+async function analyzeTestHarnessAcrossTargets(
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  consumerTargets: ResolvedConsumerTarget[],
+): Promise<TestHarnessCaveat[]> {
+  const merged = new Map<string, TestHarnessCaveat>();
+  const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
+  for (const caveat of await analyzeTestHarness(options.appDir, primaryCommand)) {
+    merged.set(caveat.code, caveat);
+  }
+  if (options.testScript) {
+    for (const consumer of consumerTargets) {
+      const consumerCommand = await resolveHarnessCommand(consumer.absoluteDir, options, packageManagerInfo);
+      for (const caveat of await analyzeTestHarness(consumer.absoluteDir, consumerCommand)) {
+        if (!merged.has(caveat.code)) merged.set(caveat.code, caveat);
+      }
+    }
+  }
+  return [...merged.values()];
 }
 
 /**
@@ -1204,8 +1303,10 @@ async function resolveControlResult(
 async function resolveEsmCheckContext(
   pkgName: string,
   options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
 ): Promise<EsmCheckContext> {
-  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, options.testCommand ?? "");
+  const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
+  const consumerIsCjsBlind = await isConsumerCjsBlindToEsm(options.appDir, primaryCommand);
   if (!consumerIsCjsBlind) return { consumerIsCjsBlind: false, controlInfo: null };
 
   const controlDir = await resolveInstalledPackage(pkgName, options.appDir);
@@ -1243,8 +1344,31 @@ function applyDupesRegressions(
   }
 }
 
-function computeLockfileSeedNote(options: CompatOptions): string | null {
-  if (options.seedLockfile) {
+// The actual sandbox source root matches testOneVersion's own choice
+// (monorepoRoot when set, appDir otherwise) — --seed-lockfile only does
+// anything if that root really has the detected/overridden manager's
+// lockfile; a manager override naming a manager whose lockfile isn't
+// actually present there means createSandbox silently copies nothing, and
+// the report must say so rather than claiming a seed that didn't happen.
+async function resolveSeededLockfile(
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  monorepoRoot: string | null,
+): Promise<boolean> {
+  if (!options.seedLockfile) return false;
+  const sourceRoot = monorepoRoot ?? options.appDir;
+  return fileExists(path.join(sourceRoot, packageManagerInfo.lockFile));
+}
+
+function computeLockfileSeedNote(options: CompatOptions, seededLockfile: boolean): string | null {
+  if (options.seedLockfile && !seededLockfile) {
+    return (
+      "--seed-lockfile was requested, but no lockfile for the detected/overridden package " +
+      "manager was found at the sandbox source root — nothing was actually seeded, every " +
+      "sandbox got a fresh solve as if the flag were off."
+    );
+  }
+  if (seededLockfile) {
     return (
       "--seed-lockfile is on: every sandbox started from the app's own lockfile, so the " +
       "install is less hermetic than a fresh solve — a resolution a clean install would have " +
@@ -1279,8 +1403,8 @@ export async function runCompat(
   } = await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
-  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand ?? "");
-  const esmCheck = await resolveEsmCheckContext(pkgName, options);
+  const testCommandCaveats = await analyzeTestHarnessAcrossTargets(options, packageManagerInfo, consumerTargets);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options, packageManagerInfo);
 
   const versions = await runWithConcurrencyLimit(
     candidateVersions,
@@ -1321,6 +1445,8 @@ export async function runCompat(
     .filter((v) => v.status === "PASSED")
     .map((v) => v.version);
 
+  const seededLockfile = await resolveSeededLockfile(options, packageManagerInfo, monorepoRoot);
+
   return {
     package: pkgName,
     // A control that can't even confirm the version already running in
@@ -1341,8 +1467,8 @@ export async function runCompat(
     controlFailed,
     sandboxMode,
     packageManager: formatPackageManager(packageManagerInfo),
-    seededLockfile: !!options.seedLockfile,
-    lockfileSeedNote: computeLockfileSeedNote(options),
+    seededLockfile,
+    lockfileSeedNote: computeLockfileSeedNote(options, seededLockfile),
     fanOutConsumers: consumerTargets.map((c) => c.relativePath),
   };
 }
@@ -1428,8 +1554,6 @@ export async function runCompatBisect(
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
-  const testCommandCaveats = await analyzeTestHarness(options.appDir, options.testCommand ?? "");
-  const esmCheck = await resolveEsmCheckContext(pkgName, options);
   const {
     pinTargets,
     packageManagerInfo,
@@ -1439,6 +1563,10 @@ export async function runCompatBisect(
     sandboxMode,
     consumerTargets,
   } = await resolveRunContext(pkgName, options);
+  const testCommandCaveats = await analyzeTestHarnessAcrossTargets(options, packageManagerInfo, consumerTargets);
+  const esmCheck = await resolveEsmCheckContext(pkgName, options, packageManagerInfo);
+
+  const seededLockfile = await resolveSeededLockfile(options, packageManagerInfo, monorepoRoot);
 
   const tested: CompatVersionResult[] = [];
   const finish = async (
@@ -1471,8 +1599,8 @@ export async function runCompatBisect(
       control,
       sandboxMode,
       packageManagerInfo,
-      !!options.seedLockfile,
-      computeLockfileSeedNote(options),
+      seededLockfile,
+      computeLockfileSeedNote(options, seededLockfile),
       consumerTargets.map((c) => c.relativePath),
     );
   };

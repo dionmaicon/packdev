@@ -437,7 +437,7 @@ packdev api <pkg>                            # Show the export map of the instal
 packdev api-diff <pkg> --range <semver>      # Which published versions satisfy what your app imports (static, no install)
 packdev compat <pkg> --test <cmd>            # Does your real test suite pass against a candidate version (sandboxed install)
 packdev dupes <pkg>                          # Find every distinct copy of a package resolved in the tree
-packdev behavior-diff <pkg> --to <ver>       # EXPERIMENTAL: diff shipped code between versions, filtered to what your app reaches
+packdev behavior-diff <pkg> --to <ver> --experimental  # EXPERIMENTAL: diff shipped code between versions, filtered to what your app reaches
 packdev mcp                                  # Run as a local MCP server (stdio) exposing api_diff/compat/dupes/behavior_diff as tools
 
 # Develop against local packages

@@ -52,9 +52,18 @@ export interface BehaviorDiffReport {
   to: string;
   seedSymbols: string[];
   seedOptionKeys: string[];
+  // Non-null when the app also imports the package via a namespace import
+  // (`import * as lib from "pkg"`) or a bare `require("pkg")` somewhere —
+  // neither statically enumerates which symbols actually get used, so the
+  // reachability seed here can be incomplete even when seedSymbols/
+  // seedOptionKeys aren't empty. Independent of `degraded`: this is a
+  // confidence caveat on a real result, not a reason none was produced.
+  dynamicUsageCaveat: string | null;
   // Non-null when a meaningful diff couldn't be produced — minified/bundled
-  // output, native/wasm, or a package that ships no compiled JS at all.
-  // `changes` is always [] when this is set; never silently empty.
+  // output, native/wasm, a package that ships no compiled JS at all, or (see
+  // dynamicUsageCaveat) dynamic-only usage that leaves zero seed names to
+  // even start from. `changes` is always [] when this is set; never
+  // silently empty.
   degraded: string | null;
   changes: BehaviorDiffChange[];
   totalChanges: number;
@@ -67,20 +76,47 @@ const MAX_MENTION_HOPS = 2;
 
 // --- entry resolution -----------------------------------------------------
 
-function resolveJsEntryRelative(packageInfo: PackageInfo): string {
-  if (typeof packageInfo.main === "string" && packageInfo.main.length > 0) {
-    return packageInfo.main;
+// The root (".") entry of a package's "exports" map, or the map itself
+// when it has no subpath keys at all (a package can declare root-level
+// conditions with no explicit "." key — same ambiguity api.ts's own
+// findTypesCondition/rootExportsEntry guard against for the types side).
+function rootExportsEntry(exportsField: unknown): unknown {
+  if (!exportsField || typeof exportsField !== "object" || Array.isArray(exportsField)) {
+    return null;
   }
+  const obj = exportsField as Record<string, unknown>;
+  if ("." in obj) return obj["."];
+  return Object.keys(obj).some((key) => key.startsWith(".")) ? null : obj;
+}
+
+// Walks a conditions object to a concrete file path. Prefers "require"
+// first — this module's own local-require walker (collectRequireSpecifiers)
+// only ever follows CommonJS require() calls, so picking an ESM-only
+// ("import") entry here would make every subsequent hop resolve nothing.
+function resolveConditionalString(node: unknown, depth = 0): string | null {
+  if (typeof node === "string") return node;
+  if (depth > 5 || !node || typeof node !== "object" || Array.isArray(node)) return null;
+  const obj = node as Record<string, unknown>;
+  for (const key of ["require", "node", "default", "import"]) {
+    if (key in obj) {
+      const resolved = resolveConditionalString(obj[key], depth + 1);
+      if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+
+// Node resolves a package root through "exports" before ever consulting
+// "main" — a package can keep "main" pointed at a legacy/compat entry while
+// "exports" routes real consumers elsewhere, so checking main first can
+// diff code the app never actually loads.
+function resolveJsEntryRelative(packageInfo: PackageInfo): string {
   const exportsField = packageInfo.exports;
   if (typeof exportsField === "string") return exportsField;
-  if (exportsField && typeof exportsField === "object" && !Array.isArray(exportsField)) {
-    const root = (exportsField as Record<string, unknown>)["."];
-    if (typeof root === "string") return root;
-    if (root && typeof root === "object") {
-      const conditions = root as Record<string, unknown>;
-      const preferred = conditions["require"] ?? conditions["default"] ?? conditions["node"];
-      if (typeof preferred === "string") return preferred;
-    }
+  const resolved = resolveConditionalString(rootExportsEntry(exportsField));
+  if (resolved) return resolved;
+  if (typeof packageInfo.main === "string" && packageInfo.main.length > 0) {
+    return packageInfo.main;
   }
   return "index.js";
 }
@@ -130,16 +166,33 @@ interface NamedFunction {
   text: string;
 }
 
-function resolveLocalRequireTarget(pkgDir: string, fromFile: string, specifier: string): string | null {
+async function isRealFile(candidate: string): Promise<boolean> {
+  try {
+    return (await fs.stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// `base` itself (the extensionless specifier target) is almost never a real
+// file — require("./helper") resolves to helper.js, require("./dist") to
+// dist/index.js (and "./dist" itself exists too, but as a *directory* —
+// fileExists-style existence alone would wrongly accept it, then a later
+// fs.readFile(directory) fails silently into the walker's own catch) — so
+// each candidate must actually be checked, as a file specifically, in
+// Node's own resolution order; returning the first merely-plausible one
+// silently resolves to nothing for exactly the common cases.
+async function resolveLocalRequireTarget(
+  pkgDir: string,
+  fromFile: string,
+  specifier: string,
+): Promise<string | null> {
   if (!specifier.startsWith(".")) return null;
   const base = path.resolve(path.dirname(fromFile), specifier);
   const candidates = [base, `${base}.js`, `${base}.cjs`, `${base}.mjs`, path.join(base, "index.js")];
   for (const candidate of candidates) {
     if (path.relative(pkgDir, candidate).startsWith("..")) continue;
-    // Existence is checked synchronously by the caller via a pre-pass; here
-    // we just return the first plausible candidate and let the walker's own
-    // fileExists guard skip it if it turns out not to exist.
-    return candidate;
+    if (await isRealFile(candidate)) return candidate;
   }
   return null;
 }
@@ -231,7 +284,7 @@ async function walkPackageFunctions(
 
     if (depth >= maxDepth) continue;
     for (const specifier of collectRequireSpecifiers(sourceFile)) {
-      const target = resolveLocalRequireTarget(pkgDir, file, specifier);
+      const target = await resolveLocalRequireTarget(pkgDir, file, specifier);
       if (target && !visited.has(target)) {
         queue.push({ file: target, depth: depth + 1 });
       }
@@ -265,6 +318,13 @@ function computeReachable(
   seedNames: Set<string>,
 ): Map<string, Set<string>> {
   const reachable = new Map<string, Set<string>>();
+  // First-wins by name, matching how the reachable map itself dedupes —
+  // needed here to look up an already-reachable *caller's* own body text
+  // during the hop rounds below.
+  const byName = new Map<string, NamedFunction>();
+  for (const fn of functions) {
+    if (!byName.has(fn.name)) byName.set(fn.name, fn);
+  }
 
   for (const fn of functions) {
     if (reachable.has(fn.name)) continue;
@@ -280,14 +340,20 @@ function computeReachable(
     }
   }
 
+  // A callee is reachable if an already-reachable *caller's* body mentions
+  // the callee's name (that's the actual call site) — not the other way
+  // around. Checking the candidate's own body for the caller's name would
+  // only catch a callee that happens to reference its caller back, which
+  // is the rare case, not the normal one.
   for (let hop = 0; hop < MAX_MENTION_HOPS; hop++) {
-    const reachableNames = [...reachable.keys()];
+    const callerNames = [...reachable.keys()];
     let grew = false;
     for (const fn of functions) {
       if (reachable.has(fn.name)) continue;
-      for (const caller of reachableNames) {
-        if (mentionsIdentifier(fn.text, caller)) {
-          reachable.set(fn.name, new Set([caller]));
+      for (const callerName of callerNames) {
+        const caller = byName.get(callerName);
+        if (caller && mentionsIdentifier(caller.text, fn.name)) {
+          reachable.set(fn.name, new Set([callerName]));
           grew = true;
           break;
         }
@@ -380,10 +446,15 @@ async function resolveShippedVersion(
   return extractTarball(buffer, `packdev-behavior-diff-${version}-`);
 }
 
-async function resolveFromVersion(pkgName: string, appDir: string): Promise<string | null> {
+async function resolveFromInstalled(
+  pkgName: string,
+  appDir: string,
+): Promise<{ version: string; packageDir: string } | null> {
   const dir = await resolveInstalledPackage(pkgName, appDir);
   if (!dir) return null;
-  return getInstalledVersion(dir);
+  const version = await getInstalledVersion(dir);
+  if (!version) return null;
+  return { version, packageDir: dir };
 }
 
 export async function runBehaviorDiff(
@@ -391,7 +462,13 @@ export async function runBehaviorDiff(
   toVersion: string,
   options: BehaviorDiffOptions,
 ): Promise<BehaviorDiffReport> {
-  const fromVersion = await resolveFromVersion(pkgName, options.appDir);
+  // Read "from" directly out of node_modules rather than re-downloading it
+  // from the registry: a local/git/patched install may not even exist on
+  // the registry under this exact version, or may have diverged from what
+  // was actually published — the whole point of comparing against the
+  // "installed (control)" version is that it's what's ACTUALLY installed.
+  const fromInstalled = await resolveFromInstalled(pkgName, options.appDir);
+  const fromVersion = fromInstalled?.version ?? null;
   if (!fromVersion) {
     throw new Error(
       `"${pkgName}" is not installed under ${options.appDir} — behavior-diff needs an installed ` +
@@ -400,19 +477,43 @@ export async function runBehaviorDiff(
     );
   }
 
-  const { symbols: seedSymbolsSet } = await scanImportedSymbols(options.appDir, pkgName);
+  const { symbols: seedSymbolsSet, hasDynamicUsage } = await scanImportedSymbols(options.appDir, pkgName);
   const seedOptionKeysSet = await scanPassedOptionKeys(options.appDir, pkgName);
   const seedNames = new Set<string>([...seedSymbolsSet, ...seedOptionKeysSet]);
   const seedSymbols = [...seedSymbolsSet].sort();
   const seedOptionKeys = [...seedOptionKeysSet].sort();
+  const dynamicUsageCaveat = hasDynamicUsage ? DYNAMIC_USAGE_CAVEAT : null;
+
+  // A namespace import / bare require() with literally nothing else to
+  // seed from means there is no reachability check to run at all — an
+  // empty seed set otherwise produces changes:[] indistinguishable from
+  // "verified nothing reachable changed," when in fact nothing was
+  // checked. Only degrade outright in that specific empty case; when real
+  // seed names exist alongside dynamic usage, run the diff and just carry
+  // the caveat (dynamicUsageCaveat) instead of discarding a real result.
+  if (hasDynamicUsage && seedNames.size === 0) {
+    return degradedReport(
+      pkgName,
+      fromVersion,
+      toVersion,
+      seedSymbols,
+      seedOptionKeys,
+      "the app only accesses this package via a namespace import (import * as x) or a bare " +
+        "require() with no destructured usage — neither can be statically enumerated, so " +
+        "there are zero seed names to check reachability against",
+      dynamicUsageCaveat,
+    );
+  }
 
   const maxDepth = options.maxDepth ?? 3;
   const maxResults = options.maxResults ?? 20;
 
+  // Only "to" is ever extracted from a downloaded tarball — only it needs
+  // cleanup. "from" is read straight from the real, already-installed
+  // directory (see resolveFromInstalled above).
   const extracted: { packageDir: string; cleanupDir: string }[] = [];
   try {
-    const fromExtracted = await resolveShippedVersion(pkgName, fromVersion, options.registryUrl, options.token);
-    extracted.push(fromExtracted);
+    const fromExtracted = { packageDir: fromInstalled!.packageDir };
     const toExtracted = await resolveShippedVersion(pkgName, toVersion, options.registryUrl, options.token);
     extracted.push(toExtracted);
 
@@ -434,6 +535,7 @@ export async function runBehaviorDiff(
         seedOptionKeys,
         "package ships a native (.node) or WebAssembly (.wasm) binary — shipped JS source can't fully " +
           "account for its behavior, so a source diff here would be misleading",
+        dynamicUsageCaveat,
       );
     }
 
@@ -451,6 +553,7 @@ export async function runBehaviorDiff(
         seedOptionKeys,
         "no resolvable compiled JS entry point found in one or both versions' tarballs — the package " +
           "may ship only TypeScript source with no compiled output",
+        dynamicUsageCaveat,
       );
     }
 
@@ -467,6 +570,7 @@ export async function runBehaviorDiff(
         seedOptionKeys,
         "shipped entry file looks minified/bundled (long, few lines) — a source diff here would be " +
           "line noise, not attributable to anything a human or agent could act on",
+        dynamicUsageCaveat,
       );
     }
 
@@ -513,6 +617,7 @@ export async function runBehaviorDiff(
       to: toVersion,
       seedSymbols,
       seedOptionKeys,
+      dynamicUsageCaveat,
       degraded: null,
       changes: changes.slice(0, maxResults),
       totalChanges: changes.length,
@@ -532,6 +637,7 @@ function degradedReport(
   seedSymbols: string[],
   seedOptionKeys: string[],
   reason: string,
+  dynamicUsageCaveat: string | null = null,
 ): BehaviorDiffReport {
   return {
     package: pkgName,
@@ -539,9 +645,15 @@ function degradedReport(
     to: toVersion,
     seedSymbols,
     seedOptionKeys,
+    dynamicUsageCaveat,
     degraded: reason,
     changes: [],
     totalChanges: 0,
     truncated: false,
   };
 }
+
+const DYNAMIC_USAGE_CAVEAT =
+  "the app also imports this package via a namespace import (import * as x) or a bare " +
+  "require() somewhere — neither statically enumerates which symbols actually get used, so " +
+  "the reachability seed above may be incomplete even though it isn't empty";

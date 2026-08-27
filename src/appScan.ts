@@ -170,6 +170,69 @@ function calleeRootIdentifier(expression: ts.Expression): string | null {
   return null;
 }
 
+// Local binding names (as used at call sites in THIS file) that resolve to
+// pkgName — as opposed to scanImportedSymbols' set, which is keyed by
+// EXPORT name, not local name. Those two diverge exactly for a default
+// import (`import Consumer from "pkg"` — export-name set holds "default",
+// but calls use the local name "Consumer") and an aliased named import
+// (`import { Consumer as C }` — export-name set holds "Consumer", calls use
+// "C"). Matching call-site roots against export names silently misses both.
+function collectLocalImportBindings(sourceFile: ts.SourceFile, pkgName: string): Set<string> {
+  const localNames = new Set<string>();
+
+  function visit(node: ts.Node): void {
+    if (
+      ts.isImportDeclaration(node) &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      matchesModuleSpecifier(node.moduleSpecifier.text, pkgName)
+    ) {
+      const clause = node.importClause;
+      if (clause) {
+        if (clause.name) localNames.add(clause.name.text);
+        if (clause.namedBindings) {
+          if (ts.isNamespaceImport(clause.namedBindings)) {
+            localNames.add(clause.namedBindings.name.text);
+          } else if (ts.isNamedImports(clause.namedBindings)) {
+            for (const element of clause.namedBindings.elements) {
+              localNames.add(element.name.text);
+            }
+          }
+        }
+      }
+    }
+
+    if (
+      ts.isVariableDeclaration(node) &&
+      node.initializer &&
+      ts.isCallExpression(node.initializer) &&
+      ts.isIdentifier(node.initializer.expression) &&
+      node.initializer.expression.text === "require" &&
+      node.initializer.arguments.length === 1
+    ) {
+      const arg = node.initializer.arguments[0];
+      if (arg && ts.isStringLiteral(arg) && matchesModuleSpecifier(arg.text, pkgName)) {
+        if (ts.isIdentifier(node.name)) {
+          // Bare `const lib = require("pkg")` — "lib" itself is the local
+          // binding; a call chain like `lib.Consumer.create(...)` still
+          // starts with this root.
+          localNames.add(node.name.text);
+        } else if (ts.isObjectBindingPattern(node.name)) {
+          for (const element of node.name.elements) {
+            if (!element.dotDotDotToken && ts.isIdentifier(element.name)) {
+              localNames.add(element.name.text);
+            }
+          }
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return localNames;
+}
+
 /**
  * For behavior-diff's reachability seed: option-bag keys the app passes
  * into a call whose callee traces back to a symbol imported from pkgName —
@@ -206,10 +269,12 @@ export async function scanPassedOptionKeys(
         : ts.ScriptKind.TS,
     );
 
+    const localImportBindings = collectLocalImportBindings(sourceFile, pkgName);
+
     function visit(node: ts.Node): void {
       if (ts.isCallExpression(node)) {
         const root = calleeRootIdentifier(node.expression);
-        if (root && importedSymbols.has(root)) {
+        if (root && localImportBindings.has(root)) {
           for (const arg of node.arguments) {
             if (!ts.isObjectLiteralExpression(arg)) continue;
             for (const prop of arg.properties) {

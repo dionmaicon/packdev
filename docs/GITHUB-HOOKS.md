@@ -4,7 +4,7 @@ Prevents accidentally committing `file:`/local-path dependencies (from `packdev 
 
 ## What It Checks
 
-Scans `package.json`'s `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies` for `file:` protocol values or relative paths (`./`, `../`).
+Scans `package.json`'s `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies` for any version value that: starts with `file:` (any local override, since `packdev init` always writes an absolute `file:/…` path — a bare `../relative-path` alone, with no `file:` prefix, is **not** separately checked), starts with `./`, or matches an active `packdev` release-version override recorded in `.packdev.json`.
 
 ## Setup
 
@@ -68,7 +68,7 @@ Your original commit message is preserved exactly; declining falls back to the n
 
 ## CI/CD Guard
 
-A standalone check for pipelines that don't have `packdev` installed:
+A standalone check for pipelines that don't have `packdev` installed — mirrors the `file:`/`./` half of the real hook's check across all four dependency sections. It can't reproduce the release-override half (that needs `.packdev.json`), so it isn't a full substitute for the real hook, only a CI-side backstop:
 
 ```yaml
 # .github/workflows/safety-check.yml
@@ -76,9 +76,10 @@ A standalone check for pipelines that don't have `packdev` installed:
   run: |
     node -e '
       const pkg = require("./package.json");
-      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      const sections = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+      const deps = Object.assign({}, ...sections.map((s) => pkg[s] || {}));
       const local = Object.entries(deps).filter(([, v]) =>
-        typeof v === "string" && (v.startsWith("file:") || v.includes("../")));
+        typeof v === "string" && (v.startsWith("file:") || v.startsWith("./")));
       if (local.length) { console.error("Local deps found:", local.map(([n]) => n)); process.exit(1); }
     '
 ```
@@ -89,7 +90,7 @@ A standalone check for pipelines that don't have `packdev` installed:
 |---|---|
 | Hook not running | `ls -la .git/hooks/pre-commit` — should exist; if not, `packdev setup-hooks` |
 | Not executable (Unix) | `chmod +x .git/hooks/pre-commit`, or `packdev setup-hooks --force` |
-| Unsure if a dep would trip it | `grep -E "(file:\|\.\.\/\|\.\/)" package.json` |
+| Unsure if a dep would trip it | `grep -E "(file:\|\.\/)" package.json` (`../` alone, without `file:`, does not) |
 | Windows | Ensure `node` is on `PATH`; works under Git Bash, PowerShell, or CMD |
 
 ## Notes

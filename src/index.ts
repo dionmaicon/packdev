@@ -649,6 +649,12 @@ program
 async function resolveAppTargets(appOption: string): Promise<string[]> {
   if (appOption.includes("*")) {
     const matches = await expandGlob(process.cwd(), appOption);
+    // readdir order (what expandGlob walks) isn't guaranteed across
+    // platforms/filesystems, and the first match becomes the primary app
+    // used for --range/control resolution — sort so the same invocation
+    // always picks the same primary, not whichever the filesystem happens
+    // to list first.
+    matches.sort();
     return matches.length > 0 ? matches : [appOption];
   }
   return appOption
@@ -1032,6 +1038,7 @@ program
         );
         if (report.seedSymbols.length > 0) console.log(`   symbols: ${report.seedSymbols.join(", ")}`);
         if (report.seedOptionKeys.length > 0) console.log(`   option keys: ${report.seedOptionKeys.join(", ")}`);
+        if (report.dynamicUsageCaveat) console.log(`⚠️  ${report.dynamicUsageCaveat}`);
         console.log("");
         if (report.changes.length === 0) {
           console.log("No changes found in code reachable from your app's usage.");

@@ -76,7 +76,7 @@ packdev status
 
 | File | Role | Committed? |
 |---|---|---|
-| `.packdev.json` | Dependency mappings, original versions, timestamps | ✅ yes (or per-developer, see below) |
+| `.packdev.json` | Dependency mappings, original versions, timestamps | ⚠️ conditional — see [Team Collaboration](#team-collaboration) below |
 | `package.json` | Rewritten by `init`, restored by `finish` | Only ever commit it in its **restored** (`finish`'d) state |
 
 **Backup strategy**: original versions are stored in `.packdev.json` *before* any `package.json` change, local paths are validated before switching, and `finish` always succeeds if the matching `init` succeeded — `packdev restore` recovers from a crash mid-operation.
