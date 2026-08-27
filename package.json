@@ -1,6 +1,6 @@
 {
   "name": "packdev",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Find out which dependency versions actually work before you install them — per-version compatibility matrices, duplicate detection, and JSON verdicts for humans and agents.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
