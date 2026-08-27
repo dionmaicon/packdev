@@ -15,7 +15,7 @@ import {
   resolvePackageExportMap,
   resolveEntryPoint,
   extractRawExportHints,
-  findUnresolvableReexports,
+  findUnresolvableReexportsForPackage,
   resolveInstalledPackage,
   type ExportedSymbolWithSubpath,
   type UnresolvedReexports,
@@ -118,15 +118,6 @@ async function hasUnresolvableBarrelContent(
   return extractRawExportHints(typesPath).length > 0;
 }
 
-async function reexportsForRoot(
-  pkgDir: string,
-  packageInfo: PackageInfo,
-): Promise<UnresolvedReexports> {
-  const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
-  if (!typesPath) return { wildcard: false, namedUnresolved: new Set() };
-  return findUnresolvableReexports(typesPath, pkgDir);
-}
-
 // Bundled types (root export plus any subpath exports, e.g. pkg/testing) win
 // when present. Otherwise, since the tarball was extracted into an isolated
 // temp dir with no node_modules tree, the local @types sibling-lookup
@@ -147,7 +138,7 @@ async function resolveExportsForVersion(
     const unresolved =
       bundled.exports.length === 0 &&
       (await hasUnresolvableBarrelContent(packageDir, packageInfo));
-    const reexports = await reexportsForRoot(packageDir, packageInfo);
+    const reexports = await findUnresolvableReexportsForPackage(packageDir, packageInfo);
     return { exports: bundled.exports, typesSource: "bundled", unresolved, reexports };
   }
 
@@ -182,7 +173,7 @@ async function resolveExportsForVersion(
   const unresolved =
     resolved.exports.length === 0 &&
     (await hasUnresolvableBarrelContent(typesPkgDir, typesPkgInfo));
-  const reexports = await reexportsForRoot(typesPkgDir, typesPkgInfo);
+  const reexports = await findUnresolvableReexportsForPackage(typesPkgDir, typesPkgInfo);
 
   return {
     exports: resolved.exports,
@@ -213,10 +204,52 @@ function consumerAllowsSyntheticDefault(appDir: string): boolean {
   return !!(parsed.options.esModuleInterop || parsed.options.allowSyntheticDefaultImports);
 }
 
+// The root (".") entry of a package's "exports" map, or null if there's no
+// usable object to inspect. Guards against the same ambiguity
+// findTypesCondition's fallback has: with no explicit "." key, sibling
+// "./subpath" keys must not be treated as part of the root's own conditions.
+function rootExportsEntry(exportsField: unknown): unknown {
+  if (!exportsField || typeof exportsField !== "object" || Array.isArray(exportsField)) {
+    return null;
+  }
+  const obj = exportsField as Record<string, unknown>;
+  if ("." in obj) return obj["."];
+  const filtered: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (!key.startsWith(".")) filtered[key] = value;
+  }
+  return filtered;
+}
+
+function hasConditionDeep(node: unknown, condition: string): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (Array.isArray(node)) return node.some((entry) => hasConditionDeep(entry, condition));
+  const obj = node as Record<string, unknown>;
+  if (condition in obj) return true;
+  return Object.values(obj).some((value) => hasConditionDeep(value, condition));
+}
+
+// Whether a package's root entry is reachable via CommonJS require() at all.
+// No "exports" map (plain "main"-based resolution) or a string-shorthand
+// entry both count as reachable — only an object-form exports map that
+// declares conditions but omits "require"/"default" among them actually
+// blocks require() for the root.
+function hasCjsRootEntry(packageInfo: PackageInfo): boolean {
+  const exportsField = packageInfo.exports;
+  if (exportsField === undefined || exportsField === null) return true;
+  if (typeof exportsField === "string") return true;
+  const rootEntry = rootExportsEntry(exportsField);
+  if (typeof rootEntry === "string") return true;
+  return hasConditionDeep(rootEntry, "require") || hasConditionDeep(rootEntry, "default");
+}
+
 // Flags a candidate that looks ESM-only relative to the control (installed)
 // version — the one class of break `compat --test "tsc --noEmit"` (a type
 // checker with no runner) structurally cannot see, since Node's module
-// loader and Jest's CJS transform behave differently from tsc here.
+// loader and Jest's CJS transform behave differently from tsc here. Fires on
+// either of the two ways a package goes ESM-only: adding "type":"module", or
+// — for an already dual-mode package — dropping the CJS "require"/"default"
+// condition from its "exports" map without touching "type" at all.
 function esmOnlyAdvisory(
   controlInfo: PackageInfo | null,
   candidateInfo: PackageInfo,
@@ -229,6 +262,14 @@ function esmOnlyAdvisory(
       'candidate adds "type":"module" (ESM-only) relative to the installed version; ' +
       "a CommonJS test runner (e.g. Jest with default transformIgnorePatterns) may fail " +
       "even though this static check passes — make sure --test runs your test suite, not just a type check"
+    );
+  }
+  if (hasCjsRootEntry(controlInfo) && !hasCjsRootEntry(candidateInfo)) {
+    return (
+      'candidate drops the CJS "require"/"default" export condition (ESM-only via its ' +
+      '"exports" map) relative to the installed version; a CommonJS test runner (e.g. Jest ' +
+      "with default transformIgnorePatterns) may fail even though this static check passes " +
+      "— make sure --test runs your test suite, not just a type check"
     );
   }
   return undefined;

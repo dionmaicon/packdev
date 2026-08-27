@@ -178,18 +178,20 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 
 ## 🧬 `packdev dupes <pkg>`
 
+> **Breaking change:** the `--json` array of resolved copies was renamed from `resolutions` to `copies` — the old name collided with `package.json`'s own `resolutions` field when read alongside it. Update any script/agent parsing this output to read `copies` instead.
+
 Walks the real `node_modules` tree (not the declared dependency graph) for every distinct place `<pkg>` actually resolves — the thing that breaks `instanceof` checks and DI singletons when hoisting goes wrong. **Two copies of the *same* version still count** — Node caches modules by realpath, so a different physical directory is always a different object, even at an identical version string.
 
 ```bash
 packdev dupes commander --json
-# {"command":"dupes","package":"commander","duplicate":false,"resolutions":[{"path":"node_modules/commander","realpath":"/abs/…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[],"resolvedViaParent":null}
+# {"command":"dupes","package":"commander","duplicate":false,"copies":[{"path":"node_modules/commander","realpath":"/abs/…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[],"resolvedViaParent":null}
 ```
 
 **Workspace-aware by default.** In an npm/yarn/pnpm workspaces monorepo, hoisting is partial: a workspace whose range can't be satisfied by the hoisted version gets its own private nested copy — the single most common source of duplicate-copy bugs, and invisible if only the root's own `node_modules` is scanned. `dupes` detects `package.json` `workspaces` (array or `{packages: [...]}` form) and `pnpm-workspace.yaml`, and scans every matched workspace's `node_modules` too, not just the root's:
 
 ```console
 $ packdev dupes @acme/shared-lib --json
-{"duplicate":true,"resolutions":[
+{"duplicate":true,"copies":[
   {"path":"node_modules/@acme/shared-lib","version":"1.0.0","workspace":"."},
   {"path":"apps/checkout/node_modules/@acme/shared-lib","version":"1.0.199-abc123","workspace":"apps/checkout"}
 ], "workspacesDetected":["apps/checkout","apps/api"], "scannedWorkspaces":["apps/checkout","apps/api"]}
@@ -213,7 +215,7 @@ This is the `prereleaseHoistingNote` field in `--json` output (`null` when no pr
 
 Four honest outcomes:
 
-| `resolutions` | `duplicate` | Exit | Meaning |
+| `copies` | `duplicate` | Exit | Meaning |
 |---|---|---|---|
 | One entry | `false` | `0` | Single resolution — nothing to worry about. |
 | 2+ entries (any versions, even identical) | `true` | `5` | Real duplication — `instanceof`/DI singletons may break across the copies. |
@@ -228,7 +230,7 @@ Each resolution includes `realpath` (fully resolved, symlinks followed) alongsid
 
 | Code | Meaning |
 |---|---|
-| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` resolutions). |
+| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` copies). |
 | `1` | Generic error — see the `error` field in `--json` output for the actual message. |
 | `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
 | `5` | `dupes` found `duplicate: true` — usable directly as a CI guard. |

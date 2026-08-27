@@ -1443,6 +1443,149 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffFollowsUnresolvableReexportThroughALocalBarrel() {
+    await this.run('api-diff traverses a resolvable local barrel to find an unresolvable re-export one hop further in', async () => {
+      // Root re-exports from "./inner", which DOES resolve locally — but
+      // ./inner itself re-exports from an unbundled sibling package. The
+      // root-only scan used to stop as soon as "./inner" resolved, treating
+      // the whole chain as fine and reporting "address" as genuinely missing
+      // instead of unresolved.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-kit', version: '1.0.0', types: './dist/types/index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'dist/types/index.d.ts': 'export * from "./inner";\n',
+        'dist/types/inner.d.ts': 'export * from "fx-sub";\n',
+      });
+      const registryUrl = await this.registry('fx-kit', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-barrel-then-unresolvable');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address } from "fx-kit";\naddress("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-kit', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, null, 'must never be false — unverifiable, not incompatible');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, ['address']);
+    });
+  }
+
+  async testApiDiffFollowsUnresolvableReexportInASubpath() {
+    await this.run('api-diff checks a subpath\'s own re-exports for unresolvable targets too, not just the root\'s', async () => {
+      // The root has real, fully-resolvable types — only the "./testing"
+      // subpath's own types file has the unresolvable re-export. Before this
+      // fix, reexports were only ever computed against the root, so a symbol
+      // used from the subpath and not actually present anywhere got reported
+      // as missing instead of unresolved.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-kit-subpath', version: '1.0.0',
+          exports: {
+            '.': { types: './index.d.ts', default: './index.js' },
+            './testing': { types: './testing.d.ts', default: './testing.js' },
+          },
+        }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export declare function formatDate(): void;',
+        'testing.js': 'module.exports = {};',
+        'testing.d.ts': 'export * from "fx-sub";\n',
+      });
+      const registryUrl = await this.registry('fx-kit-subpath', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-subpath-unresolvable');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { mockThing } from "fx-kit-subpath/testing";\nmockThing();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-kit-subpath', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].apiCompatible, null, 'must never be false — unverifiable, not incompatible');
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, ['mockThing']);
+    });
+  }
+
+  async testApiDiffReexportExtensionSubstitutionMatchesTsResolution() {
+    await this.run('api-diff regression guard: "export * from \\"./foo.js\\"" resolves to foo.d.ts (extension substitution), not treated as unresolvable', async () => {
+      // The checker's own Node10-resolution walk (extractExportMap) already
+      // follows this specifier correctly and finds `address` for real. The
+      // re-export scanner has to agree, or it wrongly hedges a genuinely
+      // present symbol as "unresolved" and a genuinely missing one too.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-ext-sub', version: '1.0.0', types: './dist/index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'dist/index.d.ts': 'export * from "./inner.js";\n',
+        'dist/inner.d.ts': 'export declare function address(s: string): string;\n',
+      });
+      const registryUrl = await this.registry('fx-ext-sub', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-ext-substitution');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address, doesNotExist } from "fx-ext-sub";\naddress("x"); doesNotExist();\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-ext-sub', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      // address is genuinely present (via extension-substituted resolution)
+      // and doesNotExist is genuinely absent — neither should be hedged as
+      // "unresolved" just because the re-export target had a .js extension.
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, []);
+      assert.deepStrictEqual(json.versions[0].missingSymbols, ['doesNotExist']);
+    });
+  }
+
+  async testApiDiffBareSpecifierSubpathReexportResolvesAgainstThePackageNotAPath() {
+    await this.run('api-diff regression guard: "export * from \\"dep/subpath\\"" resolves the package first, not "dep/subpath" as a literal package name', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fx-bare-subpath', version: '1.0.0', types: './dist/index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'dist/index.d.ts': 'export * from "fx-sub/helpers";\n',
+        // A real subpath declared via an "exports" map — there is no
+        // node_modules/fx-sub/helpers/package.json, which is exactly what
+        // the old (buggy) resolution incorrectly looked for.
+        'node_modules/fx-sub/package.json': JSON.stringify({
+          name: 'fx-sub', version: '1.0.0',
+          exports: { '.': './index.js', './helpers': './helpers.js' },
+        }),
+        'node_modules/fx-sub/index.js': 'module.exports = {};',
+        'node_modules/fx-sub/helpers.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fx-bare-subpath', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('api-diff-bare-subpath');
+      fs.writeFileSync(
+        path.join(appDir, 'index.ts'),
+        'import { address } from "fx-bare-subpath";\naddress("x");\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-bare-subpath', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      // fx-sub/helpers is a real, resolvable subpath — "address" (which
+      // doesn't actually exist anywhere) must be reported unresolved (the
+      // re-export target is legitimate, we just can't see inside it),
+      // never treated as if the whole specifier were unresolvable.
+      assert.strictEqual(json.versions[0].apiCompatible, null, JSON.stringify(json.versions[0]));
+      assert.deepStrictEqual(json.versions[0].missingSymbols, []);
+      assert.deepStrictEqual(json.versions[0].unresolvedSymbols, ['address']);
+    });
+  }
+
   async testApiDiffExportsConditionMapWithNoDotKey() {
     await this.run('api-diff resolves types from an exports map that has only environment condition keys, no "."', async () => {
       const v1 = await buildFakeTarball({
@@ -1472,6 +1615,68 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'api-diff');
       assert.strictEqual(json.versions[0].apiCompatible, true, JSON.stringify(json.versions[0]));
+    });
+  }
+
+  async testApiSubpathOnlyExportsDoesNotDuplicateAsRootTypes() {
+    await this.run('api regression guard: a subpath-only "exports" entry (no ".") is not also resolved (and duplicated) as the root\'s own types', async () => {
+      // No "." key at all — only "./testing" is exported. resolveEntryPoint's
+      // root resolution and the dedicated subpath loop both run independently;
+      // the bug was the root resolution's condition-key fallback descending
+      // into "./testing" as if it were a condition, so the same symbol got
+      // added twice: once (wrongly) tagged subpath "." and once correctly
+      // tagged "./testing".
+      const dir = this.tmp('api-subpath-only-no-duplicate');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'fx-subpath-only',
+        {
+          name: 'fx-subpath-only', version: '1.0.0',
+          exports: { './testing': { types: './dist/testing.d.ts', default: './dist/testing.js' } },
+        },
+        {
+          'dist/testing.js': 'module.exports = {};',
+          'dist/testing.d.ts': 'export declare function testingHelper(): void;',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'fx-subpath-only', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      const matches = json.exports.filter((e) => e.name === 'testingHelper');
+      assert.strictEqual(matches.length, 1, `expected testingHelper exactly once, got: ${JSON.stringify(matches)}`);
+      assert.strictEqual(matches[0].subpath, './testing');
+      assert.ok(!json.exports.some((e) => e.subpath === '.'), `expected no "." entries at all, got: ${JSON.stringify(json.exports)}`);
+    });
+  }
+
+  async testApiSubpathOnlyExportsIgnoresIncidentalRootIndexDts() {
+    await this.run('api regression guard: an incidental root index.d.ts is not used when "exports" is subpath-only', async () => {
+      // No main/types/typings — the only entry-field information at all is
+      // the subpath-only "exports" map. An index.d.ts still sitting at the
+      // package root (a stale build artifact, common after a package adds an
+      // exports map) must NOT be picked up as the root types entry: the
+      // unconditional ./index.d.ts fallback is only valid when main, types,
+      // typings, AND exports are all absent.
+      const dir = this.tmp('api-subpath-only-stale-index');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      writeNodeModulesPackage(
+        dir,
+        'fx-subpath-only-stale-index',
+        {
+          name: 'fx-subpath-only-stale-index', version: '1.0.0',
+          exports: { './testing': { types: './dist/testing.d.ts', default: './dist/testing.js' } },
+        },
+        {
+          'dist/testing.js': 'module.exports = {};',
+          'dist/testing.d.ts': 'export declare function testingSymbol(): void;',
+          'index.d.ts': 'export declare function rootSymbol(): void;',
+        },
+      );
+      const r = await runPackdev(dir, ['api', 'fx-subpath-only-stale-index', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.ok(!json.exports.some((e) => e.name === 'rootSymbol'), `stale root index.d.ts must not be used: ${JSON.stringify(json.exports)}`);
     });
   }
 
@@ -1607,6 +1812,75 @@ class FeatureTests {
       const json = parseJson(r.stdout, 'api-diff');
       assert.strictEqual(json.versions[0].apiCompatible, true, 'ESM-only is an advisory, not a static incompatibility');
       assert.match(json.versions[0].esmOnlyAdvisory, /ESM-only/);
+    });
+  }
+
+  async testApiDiffEsmOnlyAdvisoryFiresWhenCandidateDropsCjsExportCondition() {
+    await this.run('api-diff emits an ESM-only advisory when a candidate drops the CJS require/default export condition, even without adding "type":"module"', async () => {
+      // Control: dual-mode via an explicit exports map (import + require),
+      // no "type" field at all. Candidate: same shape, but "require" is
+      // gone — genuinely ESM-only via its exports map, without ever setting
+      // "type":"module", which the older type===module-only check couldn't see.
+      const appDir = this.tmp('api-diff-esm-drops-cjs-condition');
+      writeNodeModulesPackage(appDir, 'fx-dual', {
+        name: 'fx-dual', version: '1.0.0',
+        exports: { '.': { types: './index.d.ts', import: './dist/index.mjs', require: './dist/index.js' } },
+      }, {
+        'index.d.ts': 'export declare const x: number;',
+        'dist/index.js': 'exports.x = 1;',
+      });
+
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-dual', version: '2.0.0',
+          exports: { '.': { types: './index.d.ts', import: './dist/index.mjs' } },
+        }),
+        'index.d.ts': 'export declare const x: number;',
+        'dist/index.mjs': 'export const x = 1;',
+      });
+      const registryUrl = await this.registry('fx-dual', { '2.0.0': { tarballBuffer: v2 } });
+
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { x } from "fx-dual";\nx;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-dual', '--range', '>=2.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.match(json.versions[0].esmOnlyAdvisory, /drops the CJS/);
+    });
+  }
+
+  async testApiDiffNoEsmAdvisoryWhenCjsConditionSurvives() {
+    await this.run('api-diff regression guard: no ESM-only advisory when the candidate keeps its CJS require/default condition', async () => {
+      const appDir = this.tmp('api-diff-esm-keeps-cjs-condition');
+      writeNodeModulesPackage(appDir, 'fx-dual-ok', {
+        name: 'fx-dual-ok', version: '1.0.0',
+        exports: { '.': { types: './index.d.ts', import: './dist/index.mjs', require: './dist/index.js' } },
+      }, {
+        'index.d.ts': 'export declare const x: number;',
+        'dist/index.js': 'exports.x = 1;',
+      });
+
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-dual-ok', version: '2.0.0',
+          exports: { '.': { types: './index.d.ts', import: './dist/index.mjs', require: './dist/index.js' } },
+        }),
+        'index.d.ts': 'export declare const x: number;',
+        'dist/index.js': 'exports.x = 1;',
+        'dist/index.mjs': 'export const x = 1;',
+      });
+      const registryUrl = await this.registry('fx-dual-ok', { '2.0.0': { tarballBuffer: v2 } });
+
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { x } from "fx-dual-ok";\nx;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-dual-ok', '--range', '>=2.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].esmOnlyAdvisory, undefined);
     });
   }
 
@@ -1876,6 +2150,58 @@ class FeatureTests {
     });
   }
 
+  async testCompatControlInstallFailedGetsInstallDiagnosticsNotHarnessHint() {
+    await this.run('compat: a control that INSTALL_FAILED gets install diagnostics, not the "test harness is broken" hint', async () => {
+      // The installed (control) version fails to even install (a registry
+      // outage/auth failure/bad postinstall are all indistinguishable from
+      // here) — it never reaches the test command at all, so the harness
+      // guidance ("a dependency may be hoisted but undeclared") is actively
+      // wrong: there's no harness result to blame here, only a failed install.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          scripts: { postinstall: 'node -e "process.exit(1)"' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1, scripts: { postinstall: 'node -e "process.exit(1)"' } },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('compat-control-install-failed');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      // The currently-installed version — this is what gets resolved as control.
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'module.exports = {};',
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 7, `expected exit 7 (COMPAT_FAILED), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.control.status, 'INSTALL_FAILED');
+      assert.strictEqual(json.controlFailed, true);
+      assert.strictEqual(json.recommendedVersion, null);
+
+      const human = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js',
+      ]);
+      assert.match(human.stdout, /INSTALL_FAILED — the sandboxed install itself failed, before any test ran/);
+      assert.match(human.stdout, /registry reachability\/auth/);
+      assert.match(human.stdout, /No recommendation emitted/);
+      assert.doesNotMatch(human.stdout, /the test harness is broken, not the package/);
+    });
+  }
+
   async testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion() {
     await this.run('compat --check-dupes fails a version whose bump nests a second copy of a dependency, even though the test command itself passes', async () => {
       const inner1 = await buildFakeTarball({
@@ -1966,6 +2292,22 @@ class FeatureTests {
     });
   }
 
+  async testCompatRejectsBisectWithCheckDupes() {
+    await this.run('compat rejects --bisect combined with --check-dupes rather than silently ignoring the regression check', async () => {
+      const appDir = this.tmp('compat-bisect-check-dupes-rejected');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', 'http://127.0.0.1:1', '--test', 'node -e "process.exit(0)"',
+        '--bisect', '--check-dupes', '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0, 'expected a non-zero exit');
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /--bisect and --check-dupes cannot be combined/);
+    });
+  }
+
   async testCompatReportsHermeticModeAndDetectedPackageManager() {
     await this.run('compat reports hermetic sandbox mode + the detected package manager by default', async () => {
       const v1 = await buildFakeTarball({
@@ -2028,6 +2370,49 @@ class FeatureTests {
     });
   }
 
+  async testCompatAncestorPackageManagerFieldBeatsACloserLockfile() {
+    await this.run('compat: an ancestor "packageManager" field wins over a closer directory\'s own lockfile', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      // Pinned to the real npm on this machine so the sandbox install still
+      // actually succeeds — the point is that the ROOT's field wins over the
+      // CHILD's own (unrelated-manager) lockfile, not that a different
+      // manager actually runs.
+      const npmVersion = require('child_process')
+        .execFileSync('npm', ['--version'], { encoding: 'utf8' })
+        .trim();
+
+      const root = this.tmp('compat-pm-ancestor-root');
+      writeJson(path.join(root, 'package.json'), {
+        name: 'root', private: true, packageManager: `npm@${npmVersion}`,
+      });
+
+      const appDir = path.join(root, 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      // A stray lockfile for a DIFFERENT manager, closer than the root's
+      // field. Before the ancestor-search-order fix, this would shadow the
+      // root's pin — detectPackageManager checked field-then-lockfile at
+      // each directory instead of exhausting the field search first.
+      fs.writeFileSync(path.join(appDir, 'pnpm-lock.yaml'), 'lockfileVersion: 6.0\n');
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.packageManager, `npm@${npmVersion}`, 'the ancestor field must win over the closer pnpm-lock.yaml');
+    });
+  }
+
   async testCompatPackageManagerCliOverrideWins() {
     await this.run('compat --package-manager overrides both the packageManager field and the lockfile', async () => {
       const v1 = await buildFakeTarball({
@@ -2058,6 +2443,40 @@ class FeatureTests {
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
       assert.strictEqual(json.packageManager, `npm@${npmVersion}`);
+    });
+  }
+
+  async testCompatPackageManagerPinIsWrittenIntoTheSandbox() {
+    await this.run('compat writes the resolved packageManager pin into the sandboxed package.json, not just the report', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-pm-pin-in-sandbox');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      // The test command runs inside the sandbox at the app's own directory,
+      // so reading its own package.json here proves the pin was actually
+      // written where an install-time tool (e.g. Corepack) would read it —
+      // not just echoed back in the JSON report.
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'const pkg = require("./package.json");\n' +
+          'process.exit(pkg.packageManager === "npm@8.19.4" ? 0 : 1);\n',
+      );
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js',
+        '--package-manager', 'npm@8.19.4', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0 (pin was written into the sandbox), got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+      assert.strictEqual(json.packageManager, 'npm@8.19.4');
     });
   }
 
@@ -3578,11 +3997,19 @@ class FeatureTests {
       await this.testApiDiffBarrelPartialFailureOnlyFlagsGenuineMissing();
       await this.testApiDiffCrossPackageReexportUnknownNotMissing();
       await this.testApiDiffCrossPackageReexportResolvesWhenSiblingBundled();
+      await this.testApiDiffFollowsUnresolvableReexportThroughALocalBarrel();
+      await this.testApiDiffFollowsUnresolvableReexportInASubpath();
+      await this.testApiDiffReexportExtensionSubstitutionMatchesTsResolution();
+      await this.testApiDiffBareSpecifierSubpathReexportResolvesAgainstThePackageNotAPath();
       await this.testApiDiffExportsConditionMapWithNoDotKey();
+      await this.testApiSubpathOnlyExportsDoesNotDuplicateAsRootTypes();
+      await this.testApiSubpathOnlyExportsIgnoresIncidentalRootIndexDts();
       await this.testApiDiffDefaultImportSatisfiedByInteropFlags();
       await this.testApiDiffDefaultMissingSurvivesWithoutInteropFlags();
       await this.testApiDiffTypesPackageMajorMismatchDowngradesFalseToUnknown();
       await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateAddsTypeModule();
+      await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateDropsCjsExportCondition();
+      await this.testApiDiffNoEsmAdvisoryWhenCjsConditionSurvives();
       await this.testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault();
       await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
       await this.testApiDiffAuthenticatesWithTokenFlag();
@@ -3591,11 +4018,15 @@ class FeatureTests {
       await this.testCompatPassFailPerVersion();
       await this.testCompatControlGateSuppressesRecommendationWhenInstalledVersionFails();
       await this.testCompatControlGateStaysQuietWhenInstalledVersionPasses();
+      await this.testCompatControlInstallFailedGetsInstallDiagnosticsNotHarnessHint();
       await this.testCompatCheckDupesFlagsARegressionAndFailsAPassingVersion();
+      await this.testCompatRejectsBisectWithCheckDupes();
       await this.testCompatWithoutCheckDupesFlagDoesNotComputeDupeCounts();
       await this.testCompatReportsHermeticModeAndDetectedPackageManager();
       await this.testCompatHonoursPackageManagerFieldPin();
+      await this.testCompatAncestorPackageManagerFieldBeatsACloserLockfile();
       await this.testCompatPackageManagerCliOverrideWins();
+      await this.testCompatPackageManagerPinIsWrittenIntoTheSandbox();
       await this.testCompatModeWorkspaceErrorsWithoutAMonorepoRoot();
       await this.testCompatModeRejectsInvalidValue();
       await this.testCompatDistinguishesInstallFailure();
