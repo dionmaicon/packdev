@@ -1,6 +1,6 @@
 # API Compatibility Guide
 
-Four commands that answer "what's actually there" at increasing levels of confidence and cost — `api`, `api-diff`, `compat`, and `dupes`. They exist because LLMs and humans alike hallucinate methods that don't exist in the version actually resolved in a project (classic multi-package monorepo situation, e.g. NestJS's `@nestjs/*` family pinned to different versions across apps), and that isn't caught until CI or runtime.
+Five commands that answer "what's actually there" at increasing levels of confidence and cost — `api`, `api-diff`, `compat`, `dupes`, and the experimental `behavior-diff`. They exist because LLMs and humans alike hallucinate methods that don't exist in the version actually resolved in a project (classic multi-package monorepo situation, e.g. NestJS's `@nestjs/*` family pinned to different versions across apps), and that isn't caught until CI or runtime.
 
 ## 🧭 Which command do I need?
 
@@ -10,6 +10,7 @@ Four commands that answer "what's actually there" at increasing levels of confid
 | Which published versions have every symbol my app actually imports? (fast, no install) | `packdev api-diff <pkg> --range <semver>` |
 | Does my real test suite actually pass against a candidate version? (slower, real install) | `packdev compat <pkg> --test <cmd>` |
 | Is a weird `instanceof`/DI bug caused by two copies of the same package in the tree? | `packdev dupes <pkg>` |
+| `compat` failed (or I'm suspicious) and I want to know *what actually changed*, not just pass/fail? | `packdev behavior-diff <pkg> --to <version> --experimental` |
 
 **Start with `api-diff` before reaching for `compat`.** `api-diff` never installs anything — it downloads a tarball, reads its `.d.ts`, and diffs it against what your app actually imports — so checking a 10-version range costs about the same as checking one. `compat` does a real install + real test run per version, which is correct but slow. Use `api-diff` to narrow a range down first, then `compat` to actually confirm the survivors.
 
@@ -240,16 +241,54 @@ Exit code **`5`** on `duplicate: true` makes `dupes` usable directly as a CI gua
 
 Each resolution includes `realpath` (fully resolved, symlinks followed) alongside `path`, since realpath is what actually determines Node's module-identity — two `path`s that look different can still be the same realpath (a symlink), and vice versa.
 
-## Exit codes (all four commands)
+## 🔬 `packdev behavior-diff <pkg> --to <version>` (EXPERIMENTAL)
+
+The gap the other three commands can't close: a *semantic* change with a near-identical type surface, invisible to `api-diff` (types didn't move) and unattributed by `compat` (a test either passes or it doesn't — it doesn't say *why*). Example: a callback returning `undefined` changing meaning from "acknowledge" to "leave on the queue." `behavior-diff` diffs the package's actual shipped JS between the installed version and `--to`, filtered down to functions reachable from what your app imports and what option-bag keys it passes into calls on those imports (`Consumer.create({ handleMessage })` seeds `"handleMessage"` even though it's never imported — that key is how the reachable function gets found).
+
+**It reports evidence, never a verdict** — the same discipline `api-diff`'s `apiCompatible: null` uses. Output is "these lines changed and your code reaches them," not "this broke your app." Requires `--experimental`: function-matching (by name, across two versions' shipped code) and reachability (a textual-mention heuristic, not a real call graph) are both best-effort — expect false negatives, and always read the diff yourself before reporting a change as confirmed.
+
+```bash
+packdev behavior-diff sqs-consumer --to 15.0.3 --app . --experimental --json
+```
+```json
+{
+  "command": "behavior-diff", "package": "sqs-consumer", "from": "12.0.0", "to": "15.0.3",
+  "seedSymbols": ["Consumer"], "seedOptionKeys": ["handleMessage"], "degraded": null,
+  "changes": [
+    { "name": "executeHandler", "file": "dist/cjs/consumer.js", "reachableVia": ["handleMessage"],
+      "kind": "changed", "score": 6,
+      "diff": ["  if (result === undefined) {", "-   return message;", "+   return null;", "  }"] }
+  ],
+  "totalChanges": 1, "truncated": false
+}
+```
+
+| Flag | Purpose |
+|---|---|
+| `--to <version>` | **Required.** Version to diff against the installed (control) version, resolved from `--app`'s `node_modules`. |
+| `--app <dir>` | App directory to scan for usage and resolve the installed version from (default `.`). |
+| `--registry <url>`, `--token <token>` | Same meaning as the other commands. |
+| `--max-depth <n>` | Local-`require()` hops walked out from the entry file, per version (default `3`). |
+| `--max-results <n>` | Cap on distinct changed/added/removed functions returned (default `20`) — `totalChanges`/`truncated` report the real count either way. |
+| `--experimental` | **Required.** Explicit acknowledgment of the heuristic nature above. |
+
+- **Reachability seed** = every imported symbol (`api-diff`'s own `usedSymbols` scan) **plus** every object-literal key passed as an argument to a call whose callee traces back to one of those symbols — the option-bag pattern (`Consumer.create({ handleMessage })`) that a plain import scan can't see, since the key itself is never imported.
+- A function is reachable if its name or body textually mentions a seed identifier, or (up to 2 more rounds) mentions the name of an already-reachable function — a cheap stand-in for a real call graph, not one. False negatives (missing a real path) are expected and fine.
+- **`degraded`** (non-null) means no meaningful diff could be produced — `changes` is always `[]` in that case, never silently empty: a native (`.node`) or WebAssembly binary, a minified/bundled entry file, or a package shipping no resolvable compiled JS at all (TypeScript source only). The reason is always named, never a guess.
+- `changes[]` is ranked by a heuristic score (returns/throws/conditionals/`typeof`/equality/defaults count double) so the lines most likely to matter sort first — added/removed reachable functions always rank at the top, since a whole function appearing or disappearing is inherently significant.
+
+## Exit codes (all commands)
 
 | Code | Meaning |
 |---|---|
-| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` copies). |
-| `1` | Generic error — see the `error` field in `--json` output for the actual message. |
+| `0` | Success — including honest "nothing found" outcomes (`hasTypes: false`, empty `dupes` copies, `behavior-diff`'s `degraded`/empty `changes`). |
+| `1` | Generic error — see the `error` field in `--json` output for the actual message. `behavior-diff` without `--experimental` is this code. |
 | `4` | Package not installed anywhere up the `node_modules` tree (`api` only — `api-diff`/`compat` resolve from the registry, not local `node_modules`). |
 | `5` | `dupes` found `duplicate: true` — usable directly as a CI guard. |
 | `6` | `compat` — every version was `SKIPPED`; nothing was actually tested. |
 | `7` | `compat` — at least one version `FAILED`/`INSTALL_FAILED` (linear scan only; `--bisect` never sets this). |
+
+`behavior-diff` has no dedicated non-zero exit for "changes found" — it's evidence to read, not a pass/fail gate; don't wire it into CI as one.
 
 ## 🤖 Agent/scripting notes
 

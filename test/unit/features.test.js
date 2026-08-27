@@ -3621,6 +3621,173 @@ class FeatureTests {
     });
   }
 
+  // --- behavior-diff (experimental) ------------------------------------------
+
+  async testBehaviorDiffRequiresExperimentalFlag() {
+    await this.run('behavior-diff refuses to run without --experimental', async () => {
+      const appDir = this.tmp('behavior-diff-no-flag');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir, '--json',
+      ]);
+      assert.notStrictEqual(r.code, 0);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.match(json.error, /--experimental/);
+    });
+  }
+
+  async testBehaviorDiffFindsTheReachableSemanticChange() {
+    await this.run('behavior-diff surfaces a semantic change reachable via an option key passed to an imported symbol', async () => {
+      // Mirrors the sqs-consumer shape: handleMessage returning undefined
+      // changes meaning between versions, in a function whose parameter is
+      // literally named after the option key the app passes in — nothing
+      // about the app's own import list changes, only shipped behavior.
+      const makeIndexJs = (returnOnUndefined) => `
+function executeHandler(message, handleMessage) {
+  var result = handleMessage(message);
+  if (result === undefined) {
+    return ${returnOnUndefined};
+  }
+  return result;
+}
+class Consumer {
+  static create(options) {
+    return new Consumer(options);
+  }
+  constructor(options) {
+    this.handleMessage = options.handleMessage;
+  }
+}
+module.exports = { Consumer, executeHandler };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('message'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('null'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-reachable');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { Consumer } = require('fake-lib');\nConsumer.create({ handleMessage: (m) => {} });\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      assert.strictEqual(json.from, '1.0.0');
+      assert.strictEqual(json.to, '2.0.0');
+      assert.ok(json.seedSymbols.includes('Consumer'), JSON.stringify(json.seedSymbols));
+      assert.ok(json.seedOptionKeys.includes('handleMessage'), JSON.stringify(json.seedOptionKeys));
+
+      const executeHandlerChange = json.changes.find((c) => c.name === 'executeHandler');
+      assert.ok(executeHandlerChange, `expected executeHandler in changes: ${JSON.stringify(json.changes.map((c) => c.name))}`);
+      assert.strictEqual(executeHandlerChange.kind, 'changed');
+      assert.ok(executeHandlerChange.reachableVia.includes('handleMessage'), JSON.stringify(executeHandlerChange.reachableVia));
+      assert.ok(executeHandlerChange.diff.some((l) => l.startsWith('-') && l.includes('return message')), JSON.stringify(executeHandlerChange.diff));
+      assert.ok(executeHandlerChange.diff.some((l) => l.startsWith('+') && l.includes('return null')), JSON.stringify(executeHandlerChange.diff));
+
+      // Ranked first: it's the only change, but also confirm score > 0 so
+      // the ranking heuristic actually fired on a return-statement change.
+      assert.strictEqual(json.changes[0].name, 'executeHandler');
+      assert.ok(json.changes[0].score > 0);
+
+      const human = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental',
+      ]);
+      assert.match(human.stdout, /EXPERIMENTAL/);
+      assert.match(human.stdout, /executeHandler/);
+      assert.match(human.stdout, /reachable via: handleMessage/);
+    });
+  }
+
+  async testBehaviorDiffIgnoresUnreachableChanges() {
+    await this.run('behavior-diff does not report a changed function the app never reaches', async () => {
+      const makeIndexJs = (internalConstant) => `
+function unrelatedInternal() {
+  return ${internalConstant};
+}
+function publicApi() {
+  return "stable";
+}
+module.exports = { publicApi };
+`;
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('1'),
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': makeIndexJs('2'),
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-unreachable');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      fs.writeFileSync(
+        path.join(appDir, 'app.js'),
+        "const { publicApi } = require('fake-lib');\npublicApi();\n",
+      );
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.strictEqual(json.degraded, null);
+      assert.ok(!json.changes.some((c) => c.name === 'unrelatedInternal'), JSON.stringify(json.changes));
+      assert.ok(!json.changes.some((c) => c.name === 'publicApi'), 'publicApi text is identical across versions, must not be reported as changed');
+    });
+  }
+
+  async testBehaviorDiffReportsNativeBinaryAsDegraded() {
+    await this.run('behavior-diff reports degraded, not a misleading diff, for a package shipping a native binary', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+        'build/Release/native.node': 'not-really-a-binary',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+        'build/Release/native.node': 'not-really-a-binary-v2',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-native');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.match(json.degraded, /native|WebAssembly/);
+      assert.deepStrictEqual(json.changes, []);
+    });
+  }
+
   // --- dupes (duplicate package instances in the tree) ----------------------
 
   async testDupesFindsDuplicate() {
@@ -3878,8 +4045,8 @@ class FeatureTests {
 
   // --- mcp --------------------------------------------------------------
 
-  async testMcpServerListsAllThreeTools() {
-    await this.run('mcp lists api_diff/compat/dupes as MCP tools over stdio', async () => {
+  async testMcpServerListsAllFourTools() {
+    await this.run('mcp lists api_diff/compat/dupes/behavior_diff as MCP tools over stdio', async () => {
       const dir = this.tmp('mcp-list-tools');
       const client = createMcpClient(dir);
       try {
@@ -3887,7 +4054,7 @@ class FeatureTests {
         const listResponse = await client.listTools();
         assert.ok(!client.stderr.trim(), `expected no stderr output, got: ${client.stderr}`);
         const toolNames = listResponse.result.tools.map((t) => t.name).sort();
-        assert.deepStrictEqual(toolNames, ['api_diff', 'compat', 'dupes']);
+        assert.deepStrictEqual(toolNames, ['api_diff', 'behavior_diff', 'compat', 'dupes']);
       } finally {
         await client.close();
       }
@@ -4077,6 +4244,48 @@ class FeatureTests {
       } finally {
         await client.close();
       }
+    });
+  }
+
+  async testMcpBehaviorDiffToolMatchesCliOutput() {
+    await this.run('mcp behavior_diff tool call returns exactly the same JSON as `packdev behavior-diff --experimental --json`', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function greet() { return "hi"; }\nmodule.exports = { greet };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function greet() { return "hello"; }\nmodule.exports = { greet };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('mcp-call-behavior-diff');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' });
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { greet } = require('fake-lib');\ngreet();\n");
+
+      const client = createMcpClient(appDir);
+      let payload;
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('behavior_diff', {
+          package: 'fake-lib', to: '2.0.0', app: appDir, registry: registryUrl,
+        });
+        payload = JSON.parse(callResponse.result.content[0].text);
+      } finally {
+        await client.close();
+      }
+
+      const cli = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(cli.code, 0, `expected exit 0, got ${cli.code}: ${cli.stderr}`);
+      const cliJson = parseJson(cli.stdout, 'behavior-diff');
+      assert.deepStrictEqual(payload, cliJson);
+      assert.ok(payload.changes.some((c) => c.name === 'greet'), JSON.stringify(payload.changes));
     });
   }
 
@@ -4366,6 +4575,10 @@ class FeatureTests {
       await this.testCompatBisectEverythingPasses();
       await this.testCompatBisectNothingPasses();
       await this.testCompatBisectFallsBackOnFlakyBoundary();
+      await this.testBehaviorDiffRequiresExperimentalFlag();
+      await this.testBehaviorDiffFindsTheReachableSemanticChange();
+      await this.testBehaviorDiffIgnoresUnreachableChanges();
+      await this.testBehaviorDiffReportsNativeBinaryAsDegraded();
       await this.testDupesFindsDuplicate();
       await this.testDupesSingleResolution();
       await this.testDupesNotInstalled();
@@ -4378,13 +4591,14 @@ class FeatureTests {
       await this.testDupesNoPrereleaseNoteWhenAllSameVersion();
       await this.testDupesResolvedViaParent();
       await this.testDupesGenuinelyNotADependency();
-      await this.testMcpServerListsAllThreeTools();
+      await this.testMcpServerListsAllFourTools();
       await this.testMcpDupesToolMatchesCliOutput();
       await this.testMcpApiDiffToolMatchesCliOutput();
       await this.testMcpApiDiffToolReturnsIsErrorOnFailure();
       await this.testMcpCompatToolMatchesCliOutput();
       await this.testMcpCompatToolSupportsRangeAndBisect();
       await this.testMcpCompatToolRejectsMissingRangeAndVersions();
+      await this.testMcpBehaviorDiffToolMatchesCliOutput();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

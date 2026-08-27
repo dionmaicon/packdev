@@ -18,6 +18,7 @@ import { version } from "../package.json";
 import { runApiDiff } from "./apiDiff";
 import { runCompat, runCompatBisect, type CompatOptions } from "./compat";
 import { findDuplicateResolutions } from "./dupes";
+import { runBehaviorDiff } from "./behaviorDiff";
 import { loadNpmrcConfig, resolveRegistryForPackage, resolveAuthToken } from "./registry";
 
 // The discipline from the README's "add this to your agent instructions"
@@ -357,6 +358,71 @@ export function createPackdevMcpServer(): McpServer {
           copies: resolutions,
           ...rest,
         });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "behavior_diff",
+    {
+      title: "PackDev behavior-diff (EXPERIMENTAL)",
+      description:
+        "EXPERIMENTAL. Diffs a package's shipped code between the installed version and `to`, " +
+        "filtered to functions reachable from what `app` actually imports/passes as option-bag " +
+        "keys — the one class of break neither api_diff (types only) nor compat (pass/fail, no " +
+        "attribution) can point at directly: a semantic change with a near-identical type surface " +
+        "(e.g. a callback's return value changing from 'acknowledge' to 'requeue' semantics). " +
+        "Reports evidence only — which lines changed and which import/option-key pulled them in " +
+        "— never a verdict; do not report a change here as a confirmed behavior break without " +
+        "reading the diff yourself. Function-matching (by name) and reachability (textual " +
+        "mention, not a real call graph) are both best-effort heuristics: expect false negatives. " +
+        "`degraded` (non-null) means no diff could be produced (native/wasm, minified/bundled " +
+        "output, or no compiled JS found) — `changes` is always [] in that case.",
+      inputSchema: {
+        package: z.string().describe("Package name to check"),
+        to: z.string().describe("Version to diff against the installed (control) version"),
+        app: z
+          .string()
+          .default(".")
+          .describe("App directory to scan for usage, and to resolve the installed (from) version from"),
+        registry: z
+          .string()
+          .optional()
+          .describe("npm registry URL (defaults to .npmrc resolution, then the public registry)"),
+        token: z.string().optional().describe("Bearer token for a private registry"),
+        maxDepth: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Local-require hops to walk out from the entry file, per version. Default 3."),
+        maxResults: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Cap on distinct changed/added/removed functions returned. Default 20."),
+      },
+    },
+    async (args) => {
+      try {
+        const appDir = args.app ?? ".";
+        const { registryUrl, token } = await resolveRegistryAndToken(
+          args.package,
+          appDir,
+          args.registry,
+          args.token,
+        );
+        const report = await runBehaviorDiff(args.package, args.to, {
+          appDir,
+          registryUrl,
+          token,
+          ...(args.maxDepth !== undefined ? { maxDepth: args.maxDepth } : {}),
+          ...(args.maxResults !== undefined ? { maxResults: args.maxResults } : {}),
+        });
+        return jsonResult({ command: "behavior-diff", ...report });
       } catch (error) {
         return errorResult(error);
       }

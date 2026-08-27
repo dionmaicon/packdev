@@ -36,7 +36,7 @@ Seventeen seconds. No install into your repo, no branch, no PR.
 npm install -g packdev
 ```
 
-## The three checks
+## The checks
 
 ```bash
 # 1. Static, no install: which published versions have every symbol my app imports?
@@ -56,6 +56,11 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 #    even when your test command itself passes.
 packdev dupes commander --json
 # {"duplicate":false,"copies":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
+
+# 4. (EXPERIMENTAL) compat says FAILED but you want to know why, not just that:
+#    diffs the package's shipped code between versions, filtered to what your
+#    app actually reaches. Evidence, never a verdict — read the diff yourself.
+packdev behavior-diff sqs-consumer --to 15.0.3 --experimental --json
 ```
 
 Sometimes `api-diff` can't fully verify a package's types — a barrel `.d.ts` that re-exports from
@@ -87,7 +92,8 @@ packdev --json compat <pkg> --versions <list> --app <dir> --test "<your CI comma
 
 ### Install as an MCP server
 
-`packdev mcp` runs the same three checks as MCP tools (`api_diff`, `compat`, `dupes`) over stdio, so
+`packdev mcp` runs the same checks as MCP tools (`api_diff`, `compat`, `dupes`, and the experimental
+`behavior_diff`) over stdio, so
 an agent can call them directly instead of shelling out to the CLI. It runs entirely on your
 machine — your dependency tree is never uploaded anywhere.
 

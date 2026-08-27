@@ -36,6 +36,7 @@ import {
   type CompatBisectReport,
 } from "./compat";
 import { findDuplicateResolutions, expandGlob } from "./dupes";
+import { runBehaviorDiff } from "./behaviorDiff";
 
 const program = new Command();
 
@@ -971,6 +972,96 @@ program
         () => console.error("❌ Error running compat:", error),
       );
       process.exit(exitCodeFor(String(error)));
+    }
+  });
+
+program
+  .command("behavior-diff")
+  .description(
+    "EXPERIMENTAL: diffs a package's shipped code between the installed version and --to, " +
+      "filtered to functions reachable from what --app actually imports/passes. Reports " +
+      "evidence (which lines changed, which import/option-key pulled them in), never a " +
+      "verdict — requires --experimental.",
+  )
+  .argument("<package>", "Package name to check")
+  .requiredOption("--to <version>", "Version to diff against the installed (control) version")
+  .option("--app <dir>", "App directory to scan for usage, and to resolve the installed (--from) version from", ".")
+  .option(
+    "--registry <url>",
+    "npm registry URL (defaults to .npmrc resolution, then the public registry)",
+  )
+  .option("--token <token>", "Bearer token for a private registry")
+  .option("--max-depth <n>", "Local-require hops to walk out from the entry file, per version", "3")
+  .option("--max-results <n>", "Cap on distinct changed/added/removed functions returned", "20")
+  .option(
+    "--experimental",
+    "Required flag acknowledging this command's matching/reachability are both best-effort heuristics, not a sound analysis",
+    false,
+  )
+  .action(async (packageName: string, options) => {
+    try {
+      if (!options.experimental) {
+        throw new Error(
+          "behavior-diff is experimental — pass --experimental to run it. Its function-matching " +
+            "(by name, across two versions' shipped code) and reachability (textual mention, not a " +
+            "real call graph) are both best-effort heuristics: expect false negatives, and read its " +
+            "output as evidence to investigate, never as a verdict.",
+        );
+      }
+      const npmrc = await loadNpmrcConfig(options.app);
+      const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
+      const token = resolveAuthToken(registryUrl, npmrc, options.token);
+
+      const report = await runBehaviorDiff(packageName, options.to, {
+        appDir: options.app,
+        registryUrl,
+        token,
+        maxDepth: Number(options.maxDepth) || 3,
+        maxResults: Number(options.maxResults) || 20,
+      });
+
+      output({ command: "behavior-diff", ...report }, () => {
+        console.log(`🔬 ${report.package} — behavior diff ${report.from} → ${report.to} (EXPERIMENTAL)`);
+        if (report.degraded) {
+          console.log(`⚠️  ${report.degraded}`);
+          console.log("No diff could be produced.");
+          return;
+        }
+        console.log(
+          `🌱 Seed: ${report.seedSymbols.length} imported symbol(s), ${report.seedOptionKeys.length} option key(s)`,
+        );
+        if (report.seedSymbols.length > 0) console.log(`   symbols: ${report.seedSymbols.join(", ")}`);
+        if (report.seedOptionKeys.length > 0) console.log(`   option keys: ${report.seedOptionKeys.join(", ")}`);
+        console.log("");
+        if (report.changes.length === 0) {
+          console.log("No changes found in code reachable from your app's usage.");
+          return;
+        }
+        for (const change of report.changes) {
+          const mark = change.kind === "added" ? "➕" : change.kind === "removed" ? "➖" : "🔀";
+          console.log(
+            `${mark} ${change.name} (${change.file}, ${change.kind}, score ${change.score}) — reachable via: ${change.reachableVia.join(", ")}`,
+          );
+          if (change.diff) {
+            for (const line of change.diff) console.log(`    ${line}`);
+          }
+          console.log("");
+        }
+        if (report.truncated) {
+          console.log(`... ${report.totalChanges - report.changes.length} more changes not shown (--max-results)`);
+        }
+      });
+    } catch (error) {
+      output(
+        {
+          command: "behavior-diff",
+          package: packageName,
+          success: false,
+          error: String(error),
+        },
+        () => console.error("❌ Error running behavior-diff:", error),
+      );
+      process.exit(EXIT_CODE.GENERIC_ERROR);
     }
   });
 
