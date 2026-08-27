@@ -24,7 +24,7 @@ import { loadNpmrcConfig, resolveRegistryForPackage, resolveAuthToken } from "./
 // block, carried by the server itself (as a resource and in every tool's
 // description) so it travels with the tool instead of depending on a human
 // having pasted it into AGENTS.md.
-const GUIDE = `# Verifying a dependency upgrade with packdev
+const GUIDE = `# Verifying a dependency upgrade with PackDev
 
 Before proposing any dependency upgrade, verify it:
 
@@ -79,8 +79,8 @@ export function createPackdevMcpServer(): McpServer {
     "packdev-guide",
     "packdev://guide",
     {
-      title: "How to verify a dependency upgrade with packdev",
-      description: "The control-version discipline every packdev tool call should follow.",
+      title: "How to verify a dependency upgrade with PackDev",
+      description: "The control-version discipline every PackDev tool call should follow.",
       mimeType: "text/markdown",
     },
     () => ({
@@ -91,7 +91,7 @@ export function createPackdevMcpServer(): McpServer {
   server.registerTool(
     "api_diff",
     {
-      title: "packdev api-diff",
+      title: "PackDev api-diff",
       description:
         "Static, no-install check: which published versions of a package satisfy every " +
         "symbol your app actually imports from it. Cheap first screen before compat. " +
@@ -142,7 +142,7 @@ export function createPackdevMcpServer(): McpServer {
   server.registerTool(
     "compat",
     {
-      title: "packdev compat",
+      title: "PackDev compat",
       description:
         "Installs each candidate version of a package in an isolated sandbox and runs your " +
         "real test command against it — the ground-truth check, more expensive than " +
@@ -156,8 +156,17 @@ export function createPackdevMcpServer(): McpServer {
         package: z.string().describe("Package name to check"),
         versions: z
           .array(z.string())
-          .min(1)
-          .describe("Explicit versions to test, e.g. the installed version plus one candidate"),
+          .optional()
+          .describe(
+            "Explicit versions to test, e.g. the installed version plus one candidate — " +
+              "mutually exclusive with `range`, and one of the two is required",
+          ),
+        range: z
+          .string()
+          .optional()
+          .describe(
+            'Version range to resolve candidates from instead of listing them explicitly, e.g. ">=1.0.0 <3.0.0" — mutually exclusive with `versions`',
+          ),
         app: z.string().default(".").describe("App directory to test"),
         test: z
           .string()
@@ -166,8 +175,15 @@ export function createPackdevMcpServer(): McpServer {
               "should include your real test suite, not just a type check, which cannot see " +
               "runtime-only failures",
           ),
-        registry: z.string().optional().describe("npm registry URL"),
-        token: z.string().optional().describe("Bearer token for a private registry"),
+        registry: z.string().optional().describe("npm registry URL, used for the sandboxed install"),
+        token: z
+          .string()
+          .optional()
+          .describe(
+            "Bearer token for a private registry, used only to resolve `range` into concrete " +
+              "versions — the sandboxed install itself authenticates via its own package " +
+              "manager's .npmrc, not this token. Has no effect when `versions` is given directly.",
+          ),
         group: z
           .array(z.string())
           .optional()
@@ -176,6 +192,14 @@ export function createPackdevMcpServer(): McpServer {
           .string()
           .optional()
           .describe("Directory to save a resolved-lockfile snapshot per tested version"),
+        includePrerelease: z
+          .boolean()
+          .optional()
+          .describe("Include prerelease versions when resolving `range`"),
+        includeDeprecated: z
+          .boolean()
+          .optional()
+          .describe("Include deprecated versions when resolving `range`"),
         concurrency: z.number().int().min(1).optional().describe("Versions to test in parallel"),
         preferOffline: z.boolean().optional().describe("Prefer the local package manager cache"),
         checkDupes: z
@@ -201,6 +225,12 @@ export function createPackdevMcpServer(): McpServer {
     },
     async (args) => {
       try {
+        if (!args.range && (!args.versions || args.versions.length === 0)) {
+          throw new Error("Either `range` or `versions` must be provided");
+        }
+        if (args.range && args.versions && args.versions.length > 0) {
+          throw new Error("`range` and `versions` are mutually exclusive");
+        }
         const appDir = args.app ?? ".";
         const { registryUrl, token } = await resolveRegistryAndToken(
           args.package,
@@ -209,11 +239,18 @@ export function createPackdevMcpServer(): McpServer {
           args.token,
         );
         const compatOptions: CompatOptions = {
-          versions: args.versions,
+          ...(args.range !== undefined ? { range: args.range } : {}),
+          ...(args.versions !== undefined ? { versions: args.versions } : {}),
           appDir,
           testCommand: args.test,
           registryUrl,
           token,
+          ...(args.includePrerelease !== undefined
+            ? { includePrerelease: args.includePrerelease }
+            : {}),
+          ...(args.includeDeprecated !== undefined
+            ? { includeDeprecated: args.includeDeprecated }
+            : {}),
           ...(args.group !== undefined ? { group: args.group } : {}),
           ...(args.snapshotDir !== undefined ? { snapshotDir: args.snapshotDir } : {}),
           ...(args.concurrency !== undefined ? { concurrency: args.concurrency } : {}),
@@ -235,7 +272,7 @@ export function createPackdevMcpServer(): McpServer {
   server.registerTool(
     "dupes",
     {
-      title: "packdev dupes",
+      title: "PackDev dupes",
       description:
         "Finds every distinct physical copy of a package resolved in the dependency tree. " +
         "Two copies of the SAME version still break instanceof checks and DI singletons " +

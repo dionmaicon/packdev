@@ -52,6 +52,103 @@ function runPackdev(cwd, args = [], env = {}) {
   });
 }
 
+// A minimal JSON-RPC client for `packdev mcp`: frames stdout by newline,
+// resolves each request by matching its response `id` (never a fixed sleep,
+// so it can't be killed early by a slow CI runner and can't wait longer than
+// necessary either), and tracks stderr for diagnostics on timeout.
+function createMcpClient(cwd) {
+  const child = spawn('node', [BINARY_PATH, 'mcp'], { stdio: 'pipe', cwd });
+  let buffer = '';
+  let stderr = '';
+  const pending = new Map();
+  let nextId = 1;
+
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let newlineIndex;
+    while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      if (!line.trim()) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const waiter = message.id !== undefined ? pending.get(message.id) : undefined;
+      if (waiter) {
+        pending.delete(message.id);
+        waiter.resolve(message);
+      }
+    }
+  });
+  child.stderr.on('data', (d) => (stderr += d.toString()));
+
+  function send(message) {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  function request(method, params, timeoutMs = 15000) {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`MCP request "${method}" (id ${id}) timed out after ${timeoutMs}ms — stderr: ${stderr}`));
+      }, timeoutMs);
+      pending.set(id, {
+        resolve: (message) => {
+          clearTimeout(timer);
+          resolve(message);
+        },
+      });
+      send({ jsonrpc: '2.0', id, method, params });
+    });
+  }
+
+  return {
+    async initialize() {
+      await request('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test', version: '0.0.1' },
+      });
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    },
+    listTools() {
+      return request('tools/list');
+    },
+    callTool(name, args) {
+      return request('tools/call', { name, arguments: args });
+    },
+    get stderr() {
+      return stderr;
+    },
+    async close() {
+      child.kill();
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      await new Promise((resolve) => child.once('close', resolve));
+    },
+  };
+}
+
+// Strips wall-clock-dependent fields (compat's per-version durationMs) before
+// a deep-equal comparison between two independently-run reports — everything
+// else about two runs of the same fixture should be identical, but real
+// elapsed time inherently isn't.
+function stripDurations(value) {
+  if (Array.isArray(value)) return value.map(stripDurations);
+  if (value && typeof value === 'object') {
+    const result = {};
+    for (const [key, v] of Object.entries(value)) {
+      if (key === 'durationMs') continue;
+      result[key] = stripDurations(v);
+    }
+    return result;
+  }
+  return value;
+}
+
 // Parse the single JSON line the CLI emits on stdout in --json mode. Fails the
 // assertion (rather than throwing a raw SyntaxError) when stdout is polluted.
 function parseJson(stdout, context) {
@@ -3058,64 +3155,202 @@ class FeatureTests {
   async testMcpServerListsAllThreeTools() {
     await this.run('mcp lists api_diff/compat/dupes as MCP tools over stdio', async () => {
       const dir = this.tmp('mcp-list-tools');
-      const child = spawn('node', [BINARY_PATH, 'mcp'], { stdio: 'pipe', cwd: dir });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (d) => (stdout += d.toString()));
-      child.stderr.on('data', (d) => (stderr += d.toString()));
-
-      const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
-      send({
-        jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0.0.1' } },
-      });
-      await new Promise((r) => setTimeout(r, 300));
-      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-      send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-      await new Promise((r) => setTimeout(r, 500));
-      child.kill();
-
-      assert.ok(!stderr.trim(), `expected no stderr output, got: ${stderr}`);
-      const lines = stdout.trim().split('\n').filter(Boolean);
-      const responses = lines.map((l) => JSON.parse(l));
-      const listResponse = responses.find((r) => r.id === 2);
-      assert.ok(listResponse, `expected a tools/list response, got: ${stdout}`);
-      const toolNames = listResponse.result.tools.map((t) => t.name).sort();
-      assert.deepStrictEqual(toolNames, ['api_diff', 'compat', 'dupes']);
+      const client = createMcpClient(dir);
+      try {
+        await client.initialize();
+        const listResponse = await client.listTools();
+        assert.ok(!client.stderr.trim(), `expected no stderr output, got: ${client.stderr}`);
+        const toolNames = listResponse.result.tools.map((t) => t.name).sort();
+        assert.deepStrictEqual(toolNames, ['api_diff', 'compat', 'dupes']);
+      } finally {
+        await client.close();
+      }
     });
   }
 
   async testMcpDupesToolMatchesCliOutput() {
-    await this.run('mcp dupes tool call returns the same shape as `packdev dupes --json`', async () => {
+    await this.run('mcp dupes tool call returns exactly the same JSON as `packdev dupes --json`', async () => {
       const dir = this.tmp('mcp-call-dupes');
       writeJson(path.join(dir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: {} });
-
-      const child = spawn('node', [BINARY_PATH, 'mcp'], { stdio: 'pipe', cwd: dir });
-      let stdout = '';
-      child.stdout.on('data', (d) => (stdout += d.toString()));
-      const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
-      send({
-        jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0.0.1' } },
+      writeNodeModulesPackage(dir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'module.exports = {};',
       });
-      await new Promise((r) => setTimeout(r, 300));
-      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-      send({
-        jsonrpc: '2.0', id: 2, method: 'tools/call',
-        params: { name: 'dupes', arguments: { package: 'totally-nonexistent-pkg-xyz', root: dir } },
-      });
-      await new Promise((r) => setTimeout(r, 500));
-      child.kill();
 
-      const lines = stdout.trim().split('\n').filter(Boolean);
-      const responses = lines.map((l) => JSON.parse(l));
-      const callResponse = responses.find((r) => r.id === 2);
-      assert.ok(callResponse, `expected a tools/call response, got: ${stdout}`);
-      const payload = JSON.parse(callResponse.result.content[0].text);
-      assert.strictEqual(payload.command, 'dupes');
-      assert.strictEqual(payload.duplicate, false);
-      assert.deepStrictEqual(payload.copies, []);
-      assert.strictEqual(payload.resolvedViaParent, null);
+      const client = createMcpClient(dir);
+      let payload;
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('dupes', { package: 'fake-lib', root: dir });
+        payload = JSON.parse(callResponse.result.content[0].text);
+      } finally {
+        await client.close();
+      }
+
+      const cli = await runPackdev(dir, ['dupes', 'fake-lib', '--root', dir, '--json']);
+      assert.strictEqual(cli.code, 0, `expected exit 0, got ${cli.code}: ${cli.stderr}`);
+      const cliJson = parseJson(cli.stdout, 'dupes');
+      // Full deep-compare, not a handful of hand-picked fields — any field
+      // the MCP tool's serialization drops or renames relative to the CLI's
+      // own --json output must fail this test, not just the ones we thought
+      // to check by name.
+      assert.deepStrictEqual(payload, cliJson);
+    });
+  }
+
+  async testMcpApiDiffToolMatchesCliOutput() {
+    await this.run('mcp api_diff tool call returns exactly the same JSON as `packdev api-diff --json`', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' }),
+        'index.js': 'module.exports = {};',
+        'index.d.ts': 'export function formatDate(input: string): string;',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('mcp-call-api-diff');
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { formatDate } from "fake-lib";\nformatDate("x");\n');
+
+      const client = createMcpClient(appDir);
+      let payload;
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('api_diff', {
+          package: 'fake-lib', range: '>=1.0.0 <2.0.0', app: appDir, registry: registryUrl,
+        });
+        payload = JSON.parse(callResponse.result.content[0].text);
+      } finally {
+        await client.close();
+      }
+
+      const cli = await runPackdev(appDir, [
+        'api-diff', 'fake-lib', '--range', '>=1.0.0 <2.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(cli.code, 0, `expected exit 0, got ${cli.code}: ${cli.stderr}`);
+      const cliJson = parseJson(cli.stdout, 'api-diff');
+      assert.deepStrictEqual(payload, cliJson);
+      assert.strictEqual(payload.versions[0].apiCompatible, true);
+    });
+  }
+
+  async testMcpApiDiffToolReturnsIsErrorOnFailure() {
+    await this.run('mcp api_diff tool call returns isError:true (not a thrown transport error) on failure', async () => {
+      const appDir = this.tmp('mcp-call-api-diff-error');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: {} });
+
+      const client = createMcpClient(appDir);
+      try {
+        await client.initialize();
+        // No registry reachable at all — fetchPackageMetadata must throw,
+        // which the tool handler should turn into an isError result rather
+        // than letting the JSON-RPC call itself fail.
+        const callResponse = await client.callTool('api_diff', {
+          package: 'fake-lib', range: '>=1.0.0', app: appDir, registry: 'http://127.0.0.1:1',
+        });
+        assert.strictEqual(callResponse.result.isError, true);
+        const payload = JSON.parse(callResponse.result.content[0].text);
+        assert.strictEqual(payload.success, false);
+        assert.ok(payload.error, 'expected an error message');
+      } finally {
+        await client.close();
+      }
+    });
+  }
+
+  async testMcpCompatToolMatchesCliOutput() {
+    await this.run('mcp compat tool call returns exactly the same JSON as `packdev compat --json`, including new options', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('mcp-call-compat');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+      // Shared explicit snapshotDir so both invocations resolve to the same
+      // path — otherwise each independently mkdtemps its own, which would
+      // fail a deep-equal comparison for a reason that has nothing to do
+      // with whether the two tools actually agree.
+      const snapshotDir = path.join(appDir, 'snapshots');
+
+      const client = createMcpClient(appDir);
+      let payload;
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('compat', {
+          package: 'fake-lib', versions: ['1.0.0'], app: appDir, registry: registryUrl,
+          test: 'node check.js', checkDupes: true, snapshotDir,
+        });
+        payload = JSON.parse(callResponse.result.content[0].text);
+      } finally {
+        await client.close();
+      }
+
+      const cli = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node check.js', '--check-dupes', '--snapshot-dir', snapshotDir, '--json',
+      ]);
+      assert.strictEqual(cli.code, 0, `expected exit 0, got ${cli.code}: ${cli.stderr}`);
+      const cliJson = parseJson(cli.stdout, 'compat');
+      // durationMs is real elapsed time from two separate sandboxed runs —
+      // never equal, and not part of the "shape" this test is guarding.
+      assert.deepStrictEqual(stripDurations(payload), stripDurations(cliJson));
+      assert.strictEqual(payload.versions[0].status, 'PASSED');
+      assert.ok(payload.versions[0].dupeCounts, 'expected checkDupes to have been forwarded to compat');
+    });
+  }
+
+  async testMcpCompatToolSupportsRangeAndBisect() {
+    await this.run('mcp compat tool supports `range` (not just explicit `versions`) and `bisect`', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 },
+        '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('mcp-call-compat-range-bisect');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const client = createMcpClient(appDir);
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('compat', {
+          package: 'fake-lib', range: '>=1.0.0 <3.0.0', app: appDir, registry: registryUrl,
+          test: 'node check.js', bisect: true,
+        });
+        const payload = JSON.parse(callResponse.result.content[0].text);
+        assert.strictEqual(payload.bisected, true, 'expected bisect:true to select runCompatBisect');
+        assert.strictEqual(payload.recommendedVersion, '2.0.0');
+      } finally {
+        await client.close();
+      }
+    });
+  }
+
+  async testMcpCompatToolRejectsMissingRangeAndVersions() {
+    await this.run('mcp compat tool errors clearly when neither range nor versions is given', async () => {
+      const appDir = this.tmp('mcp-call-compat-no-range-no-versions');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' } });
+
+      const client = createMcpClient(appDir);
+      try {
+        await client.initialize();
+        const callResponse = await client.callTool('compat', {
+          package: 'fake-lib', app: appDir, registry: 'http://127.0.0.1:1', test: 'node -e "process.exit(0)"',
+        });
+        assert.strictEqual(callResponse.result.isError, true);
+        const payload = JSON.parse(callResponse.result.content[0].text);
+        assert.match(payload.error, /Either `range` or `versions` must be provided/);
+      } finally {
+        await client.close();
+      }
     });
   }
 
@@ -3399,6 +3634,11 @@ class FeatureTests {
       await this.testDupesGenuinelyNotADependency();
       await this.testMcpServerListsAllThreeTools();
       await this.testMcpDupesToolMatchesCliOutput();
+      await this.testMcpApiDiffToolMatchesCliOutput();
+      await this.testMcpApiDiffToolReturnsIsErrorOnFailure();
+      await this.testMcpCompatToolMatchesCliOutput();
+      await this.testMcpCompatToolSupportsRangeAndBisect();
+      await this.testMcpCompatToolRejectsMissingRangeAndVersions();
       await this.testGitFileUrlClassified();
       await this.testRemoveDependency();
       await this.testRemoveNonexistent();

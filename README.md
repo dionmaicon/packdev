@@ -1,4 +1,4 @@
-# packdev
+# PackDev
 
 [![npm version](https://img.shields.io/npm/v/packdev.svg)](https://www.npmjs.com/package/packdev)
 [![npm downloads](https://img.shields.io/npm/dm/packdev.svg)](https://www.npmjs.com/package/packdev)
@@ -11,7 +11,7 @@
 `npm outdated` tells you what's behind. Renovate opens the PR. Neither tells you whether the
 upgrade breaks — you find out from CI, after the merge, or from production.
 
-packdev installs each candidate version in an isolated sandbox, runs *your* build and *your*
+PackDev installs each candidate version in an isolated sandbox, runs *your* build and *your*
 tests against it, and reports a verdict per version.
 
 ```bash
@@ -27,7 +27,7 @@ recommended: 12.0.0    minimum: 12.0.0
 
 Seventeen seconds. No install into your repo, no branch, no PR.
 
-> packdev doesn't decide whether to upgrade. It gives you the evidence to decide — and the
+> PackDev doesn't decide whether to upgrade. It gives you the evidence to decide — and the
 > evidence is only as good as the command you hand `--test`. Point it at your full CI, not `tsc`.
 
 ## 📦 Installation
@@ -69,7 +69,7 @@ downgrade to `null`/unresolved rather than asserting incompatibility it can't ac
 ## For coding agents
 
 An agent asked to "upgrade our dependencies" has two options: guess from changelogs, or open a
-PR and wait for CI. packdev gives it a third — a bounded, falsifiable check it can run itself,
+PR and wait for CI. PackDev gives it a third — a bounded, falsifiable check it can run itself,
 before touching the repo.
 
 ```bash
@@ -135,7 +135,7 @@ package manager resolved it — see `--mode` and `--package-manager` in the
 
 ## Develop against local packages
 
-packdev's other half: a `npm link`/yalc-style workflow for testing an unpublished package (local
+PackDev's other half: a `npm link`/yalc-style workflow for testing an unpublished package (local
 path or git branch) in a consumer app, without global state or a private registry.
 
 **The problem**: you're developing a library and need to test it in your app before publishing.
@@ -149,7 +149,7 @@ packdev init                             # Switch to local
 packdev finish                           # Back to npm version
 ```
 
-![packdev demo](assets/demo.gif)
+![PackDev demo](assets/demo.gif)
 
 ### Quick Start
 
@@ -174,7 +174,7 @@ packdev finish                           # Back to npm version
 
 ### vs alternatives
 
-| Feature | packdev | npm link | Verdaccio | Yalc |
+| Feature | PackDev | npm link | Verdaccio | Yalc |
 |---------|---------|----------|-----------|------|
 | **How it works** | Swaps package.json | Symlinks | Private npm server | Publish to local store |
 | **No global state** | ✅ | ❌ | ✅ | ❌ Global store |
@@ -183,7 +183,7 @@ packdev finish                           # Back to npm version
 | **CI/CD ready** | ✅ | ❌ | ✅ | ⚠️ |
 | **Multi-project safe** | ✅ | ❌ Conflicts | ✅ | ⚠️ Shared store |
 
-**When to use packdev**: Direct package.json manipulation, git URLs, built-in safety
+**When to use PackDev**: Direct package.json manipulation, git URLs, built-in safety
 **When to use npm link**: Quick one-off symlink testing
 **When to use Verdaccio**: Team needs full private npm registry with authentication
 **When to use Yalc**: Prefer publish/push workflow, need package copying over file: links
@@ -355,7 +355,7 @@ This creates a **4-variant test matrix** (stable+v1, stable+v2, experimental+v1,
 <details>
 <summary><strong>Monorepo — auto-link and live rebuild</strong></summary>
 
-Working in a monorepo (npm/pnpm/yarn workspaces)? Let packdev find the package for you and rebuild it as you edit:
+Working in a monorepo (npm/pnpm/yarn workspaces)? Let PackDev find the package for you and rebuild it as you edit:
 
 ```bash
 # In your app package, no path needed — packdev locates the workspace member
@@ -414,7 +414,7 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 - **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, flags, real output, agent notes
 - **[Git Hooks](docs/GITHUB-HOOKS.md)** - Auto-commit protection and safety checks
 - **[Packaging Guide](docs/PACKAGING.md)** - Building, testing, and distributing
-- **[Yarn Support](docs/YARN-SUPPORT.md)** - Using packdev with Yarn
+- **[Yarn Support](docs/YARN-SUPPORT.md)** - Using PackDev with Yarn
 
 ## 🔧 Commands Reference
 
