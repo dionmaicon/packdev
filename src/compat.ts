@@ -1134,12 +1134,17 @@ async function analyzeTestHarnessAcrossTargets(
   for (const caveat of await analyzeTestHarness(options.appDir, primaryCommand)) {
     merged.set(caveat.code, caveat);
   }
-  if (options.testScript) {
-    for (const consumer of consumerTargets) {
-      const consumerCommand = await resolveHarnessCommand(consumer.absoluteDir, options, packageManagerInfo);
-      for (const caveat of await analyzeTestHarness(consumer.absoluteDir, consumerCommand)) {
-        if (!merged.has(caveat.code)) merged.set(caveat.code, caveat);
-      }
+  // Every consumer gets analyzed, --test-script or not: with a shared
+  // --test command (no --test-script), testOneVersion still runs that same
+  // command from each consumer's OWN directory, which reads that
+  // consumer's OWN jest config — a consumer using isolatedModules/
+  // babel-jest/passWithNoTests would otherwise never surface here just
+  // because the command string itself is shared. resolveHarnessCommand
+  // already falls back to the shared testCommand when testScript is unset.
+  for (const consumer of consumerTargets) {
+    const consumerCommand = await resolveHarnessCommand(consumer.absoluteDir, options, packageManagerInfo);
+    for (const caveat of await analyzeTestHarness(consumer.absoluteDir, consumerCommand)) {
+      if (!merged.has(caveat.code)) merged.set(caveat.code, caveat);
     }
   }
   return [...merged.values()];

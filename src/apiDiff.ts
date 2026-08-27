@@ -257,7 +257,17 @@ export function esmOnlyAdvisory(
   if (!controlInfo) return undefined;
   const controlIsModule = controlInfo.type === "module";
   const candidateIsModule = candidateInfo.type === "module";
-  if (!controlIsModule && candidateIsModule) {
+  // A dual-mode package can add "type":"module" while its "exports" map
+  // still declares an explicit "require"/"default" target (e.g.
+  // exports: { import: "./index.js", require: "./index.cjs" }) — CJS
+  // consumers keep working via that condition regardless of "type". Only
+  // suppress the advisory for that specific case — hasCjsRootEntry alone
+  // isn't enough, since it also returns true when there's no "exports"
+  // field at all (a genuinely ESM-only "type":"module" package with no
+  // override, which must still fire).
+  const candidateHasExplicitCjsExport =
+    candidateInfo.exports !== undefined && candidateInfo.exports !== null && hasCjsRootEntry(candidateInfo);
+  if (!controlIsModule && candidateIsModule && !candidateHasExplicitCjsExport) {
     return (
       'candidate adds "type":"module" (ESM-only) relative to the installed version; ' +
       "a CommonJS test runner (e.g. Jest with default transformIgnorePatterns) may fail " +

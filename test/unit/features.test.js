@@ -1884,6 +1884,40 @@ class FeatureTests {
     });
   }
 
+  async testApiDiffNoFalseEsmAdvisoryWhenTypeModuleAddedButExportsKeepsRequireTarget() {
+    await this.run('api-diff regression guard: no false ESM-only advisory when a candidate adds "type":"module" but its exports map still declares an explicit require target', async () => {
+      // Control has no "type" field at all (implicitly CJS) and no
+      // "exports" override. Candidate adds "type":"module" — the naive
+      // check alone would flag this — but also ships an explicit "exports"
+      // map with a "require" condition, so CJS consumers keep working via
+      // that condition regardless of "type". Must NOT advise ESM-only.
+      const appDir = this.tmp('api-diff-esm-type-module-but-dual-exports');
+      writeNodeModulesPackage(appDir, 'fx-dual-type-module', { name: 'fx-dual-type-module', version: '1.0.0', main: 'index.js' }, {
+        'index.js': 'exports.x = 1;',
+      });
+
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fx-dual-type-module', version: '2.0.0', type: 'module',
+          exports: { '.': { types: './index.d.ts', import: './index.mjs', require: './index.cjs' } },
+        }),
+        'index.d.ts': 'export declare const x: number;',
+        'index.cjs': 'exports.x = 1;',
+        'index.mjs': 'export const x = 1;',
+      });
+      const registryUrl = await this.registry('fx-dual-type-module', { '2.0.0': { tarballBuffer: v2 } });
+
+      fs.writeFileSync(path.join(appDir, 'index.ts'), 'import { x } from "fx-dual-type-module";\nx;\n');
+
+      const r = await runPackdev(appDir, [
+        'api-diff', 'fx-dual-type-module', '--range', '>=2.0.0 <3.0.0', '--app', appDir, '--registry', registryUrl, '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api-diff');
+      assert.strictEqual(json.versions[0].esmOnlyAdvisory, undefined, JSON.stringify(json.versions[0]));
+    });
+  }
+
   // --- api-diff: ESM-only dep + CJS interop is safe (issue #9 regression) --
 
   async testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault() {
@@ -3108,6 +3142,53 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand() {
+    await this.run('compat fan-out analyzes every consumer\'s own jest config even with a shared --test command (no --test-script)', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-shared-command-harness');
+      writeJson(path.join(monorepoRoot, 'package.json'), { name: 'root', private: true, workspaces: ['packages/*'] });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      // The primary's own jest config is clean — only the consumer's is
+      // transpile-only. A shared --test command runs the SAME command
+      // string in each target's own directory, so the caveat can only be
+      // found by reading each directory's own jest config, not by
+      // inspecting the (identical) command string once.
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const consumerDir = path.join(monorepoRoot, 'packages', 'consumer');
+      fs.mkdirSync(consumerDir, { recursive: true });
+      writeJson(path.join(consumerDir, 'package.json'), {
+        name: 'consumer', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+        jest: { transform: { '^.+\\.ts$': ['ts-jest', { isolatedModules: true }] } },
+      });
+      fs.writeFileSync(path.join(consumerDir, 'check.js'), 'process.exit(0);\n');
+
+      // Not a real jest invocation — just needs "jest" in the shared
+      // command for the heuristic to fire, while actually running check.js
+      // so both targets still PASS.
+      const jestLikeCommand = 'node check.js # jest --silent';
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', jestLikeCommand, '--fan-out', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('TRANSPILE_ONLY'), `expected TRANSPILE_ONLY (from the consumer's own jest config) in ${JSON.stringify(codes)}`);
+    });
+  }
+
   async testCompatWarnsOnTypeCheckOnlyTestCommand() {
     await this.run('compat surfaces a TYPE_CHECK_ONLY caveat when --test is bare tsc', async () => {
       const v1 = await buildFakeTarball({
@@ -3775,6 +3856,55 @@ class FeatureTests {
     });
   }
 
+  async testBehaviorDiffValidatesMaxDepthAndMaxResults() {
+    await this.run('behavior-diff rejects invalid --max-depth/--max-results and accepts the valid boundary values (0 and 1)', async () => {
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v1"; }\nmodule.exports = { realEntry };\n',
+      });
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '2.0.0', main: 'index.js' }),
+        'index.js': 'function realEntry() { return "v2"; }\nmodule.exports = { realEntry };\n',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1 }, '2.0.0': { tarballBuffer: v2 },
+      });
+
+      const appDir = this.tmp('behavior-diff-max-options-validation');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'function realEntry() { return "v1"; }\nmodule.exports = { realEntry };\n' },
+      );
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { realEntry } = require('fake-lib');\nrealEntry();\n");
+
+      const base = ['behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir, '--registry', registryUrl, '--experimental', '--json'];
+
+      // --max-depth 0 must be honored as-is, not silently coerced to the
+      // default 3 by a `Number(x) || 3` style fallback (0 is falsy).
+      const zeroDepth = await runPackdev(appDir, [...base, '--max-depth', '0']);
+      assert.strictEqual(zeroDepth.code, 0, `expected exit 0, got ${zeroDepth.code}: ${zeroDepth.stderr}`);
+      const zeroDepthJson = parseJson(zeroDepth.stdout, 'behavior-diff');
+      assert.strictEqual(zeroDepthJson.degraded, null);
+
+      // --max-results 1 is the valid minimum.
+      const oneResult = await runPackdev(appDir, [...base, '--max-results', '1']);
+      assert.strictEqual(oneResult.code, 0, `expected exit 0, got ${oneResult.code}: ${oneResult.stderr}`);
+
+      const negativeDepth = await runPackdev(appDir, [...base, '--max-depth', '-1']);
+      assert.notStrictEqual(negativeDepth.code, 0);
+      assert.match(parseJson(negativeDepth.stdout, 'behavior-diff').error, /--max-depth must be an integer/);
+
+      const zeroResults = await runPackdev(appDir, [...base, '--max-results', '0']);
+      assert.notStrictEqual(zeroResults.code, 0);
+      assert.match(parseJson(zeroResults.stdout, 'behavior-diff').error, /--max-results must be an integer/);
+
+      const nonIntegerResults = await runPackdev(appDir, [...base, '--max-results', 'abc']);
+      assert.notStrictEqual(nonIntegerResults.code, 0);
+      assert.match(parseJson(nonIntegerResults.stdout, 'behavior-diff').error, /--max-results must be an integer/);
+    });
+  }
+
   async testBehaviorDiffDegradesOnDynamicOnlyUsageWithNoSeeds() {
     await this.run('behavior-diff reports degraded (not a false-clean empty result) when the app only uses the package dynamically', async () => {
       const v1 = await buildFakeTarball({
@@ -4184,6 +4314,43 @@ module.exports = { ...require('./helper'), ...require('./dist') };
       const change = json.changes.find((c) => c.name === 'realEntry');
       assert.ok(change, JSON.stringify(json.changes));
       assert.ok(change.diff.some((l) => l.startsWith('-') && l.includes('installed-local-patch')), `expected the installed content, not a registry re-download: ${JSON.stringify(change.diff)}`);
+    });
+  }
+
+  async testBehaviorDiffDegradesWhenExportsIsSubpathOnlyRatherThanFallingBackToMain() {
+    await this.run('behavior-diff degrades (does not silently fall back to "main") when "exports" exists but has no resolvable root ("." ) entry', async () => {
+      // "exports" is present but subpath-only (no "." key at all) — Node
+      // blocks root-level `require("fake-lib")` entirely once "exports"
+      // exists, it does NOT fall back to "main". A version in this shape
+      // must degrade, not silently get diffed through "main" as if the
+      // app could actually load it that way.
+      const v2 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '2.0.0', main: 'index.js',
+          exports: { './subpath': './subpath.js' },
+        }),
+        'index.js': 'module.exports = { realEntry: () => "v2" };',
+        'subpath.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '2.0.0': { tarballBuffer: v2 } });
+
+      const appDir = this.tmp('behavior-diff-subpath-only-exports');
+      writeJson(path.join(appDir, 'package.json'), { name: 'app', version: '1.0.0', dependencies: { 'fake-lib': '1.0.0' } });
+      writeNodeModulesPackage(
+        appDir, 'fake-lib', { name: 'fake-lib', version: '1.0.0', main: 'index.js' },
+        { 'index.js': 'module.exports = { realEntry: () => "v1" };' },
+      );
+      fs.writeFileSync(path.join(appDir, 'app.js'), "const { realEntry } = require('fake-lib');\nrealEntry();\n");
+
+      const r = await runPackdev(appDir, [
+        'behavior-diff', 'fake-lib', '--to', '2.0.0', '--app', appDir,
+        '--registry', registryUrl, '--experimental', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'behavior-diff');
+      assert.ok(json.degraded, 'must degrade rather than silently diff through "main"');
+      assert.match(json.degraded, /exports.*no root|root.*resolved/i);
+      assert.deepStrictEqual(json.changes, []);
     });
   }
 
@@ -5020,6 +5187,7 @@ module.exports = { realEntry };
       await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateAddsTypeModule();
       await this.testApiDiffEsmOnlyAdvisoryFiresWhenCandidateDropsCjsExportCondition();
       await this.testApiDiffNoEsmAdvisoryWhenCjsConditionSurvives();
+      await this.testApiDiffNoFalseEsmAdvisoryWhenTypeModuleAddedButExportsKeepsRequireTarget();
       await this.testApiDiffNoFalseAlarmOnEsmOnlyDependencyWithInteropSafeDefault();
       await this.testApiDiffFailsWithHintOnPrivateRegistryWithoutToken();
       await this.testApiDiffAuthenticatesWithTokenFlag();
@@ -5056,6 +5224,7 @@ module.exports = { realEntry };
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatWarnsOnPassWithNoTests();
       await this.testCompatTestScriptOnlyRunsStillGetHarnessAnalysis();
+      await this.testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand();
       await this.testCompatWarnsOnTypeCheckOnlyTestCommand();
       await this.testCompatWarnsOnEsmMismatchAgainstCjsBlindJest();
       await this.testCompatCleansUpSandboxOnSuccess();
@@ -5075,6 +5244,7 @@ module.exports = { realEntry };
       await this.testCompatBisectNothingPasses();
       await this.testCompatBisectFallsBackOnFlakyBoundary();
       await this.testBehaviorDiffRequiresExperimentalFlag();
+      await this.testBehaviorDiffValidatesMaxDepthAndMaxResults();
       await this.testBehaviorDiffDegradesOnDynamicOnlyUsageWithNoSeeds();
       await this.testBehaviorDiffSurfacesDynamicUsageCaveatAlongsideRealResults();
       await this.testBehaviorDiffFindsTheReachableSemanticChange();
@@ -5083,6 +5253,7 @@ module.exports = { realEntry };
       await this.testBehaviorDiffIgnoresUnreachableChanges();
       await this.testBehaviorDiffWalksExtensionlessAndDirectoryRequires();
       await this.testBehaviorDiffReadsFromInstalledDirNotRegistry();
+      await this.testBehaviorDiffDegradesWhenExportsIsSubpathOnlyRatherThanFallingBackToMain();
       await this.testBehaviorDiffPrefersExportsMapOverMainField();
       await this.testBehaviorDiffReportsNativeBinaryAsDegraded();
       await this.testDupesFindsDuplicate();

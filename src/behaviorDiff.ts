@@ -109,12 +109,18 @@ function resolveConditionalString(node: unknown, depth = 0): string | null {
 // Node resolves a package root through "exports" before ever consulting
 // "main" — a package can keep "main" pointed at a legacy/compat entry while
 // "exports" routes real consumers elsewhere, so checking main first can
-// diff code the app never actually loads.
-function resolveJsEntryRelative(packageInfo: PackageInfo): string {
+// diff code the app never actually loads. Once "exports" is present AT
+// ALL, Node also stops consulting "main" as a fallback entirely — a
+// subpath-only map (e.g. only "./foo") or an unsupported root shape (an
+// array) makes the bare package import unresolvable, not silently routed
+// to "main". Returns null in that case so the caller can degrade instead
+// of analyzing code the app could never actually load.
+function resolveJsEntryRelative(packageInfo: PackageInfo): string | null {
   const exportsField = packageInfo.exports;
-  if (typeof exportsField === "string") return exportsField;
-  const resolved = resolveConditionalString(rootExportsEntry(exportsField));
-  if (resolved) return resolved;
+  if (exportsField !== undefined && exportsField !== null) {
+    if (typeof exportsField === "string") return exportsField;
+    return resolveConditionalString(rootExportsEntry(exportsField));
+  }
   if (typeof packageInfo.main === "string" && packageInfo.main.length > 0) {
     return packageInfo.main;
   }
@@ -541,6 +547,20 @@ export async function runBehaviorDiff(
 
     const fromEntryRel = resolveJsEntryRelative(fromPackageInfo);
     const toEntryRel = resolveJsEntryRelative(toPackageInfo);
+    if (fromEntryRel === null || toEntryRel === null) {
+      return degradedReport(
+        pkgName,
+        fromVersion,
+        toVersion,
+        seedSymbols,
+        seedOptionKeys,
+        'package.json declares an "exports" field but no root (".") entry could be resolved ' +
+          "from it (a subpath-only map, or an unsupported root shape) — Node blocks root-level " +
+          'resolution entirely once "exports" is present, it never falls back to "main" in that ' +
+          "case, so there is no reachable compiled entry point to diff",
+        dynamicUsageCaveat,
+      );
+    }
     const fromEntryAbs = path.join(fromExtracted.packageDir, fromEntryRel);
     const toEntryAbs = path.join(toExtracted.packageDir, toEntryRel);
 

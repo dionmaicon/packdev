@@ -638,6 +638,27 @@ program
     }
   });
 
+// `Number(value) || fallback` silently turns a genuinely valid 0 into the
+// fallback (0 is falsy) — the exact bug that let `--max-depth 0` become 3.
+// These parse strictly instead: reject non-integers and out-of-range values
+// outright rather than coercing them into something else, matching the
+// MCP tool schema's own z.number().int().min(...) validation.
+function parseIntOption(value: string, flagName: string, min: number): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    throw new Error(`${flagName} must be an integer >= ${min}, got "${value}"`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeIntOption(value: string, flagName: string): number {
+  return parseIntOption(value, flagName, 0);
+}
+
+function parsePositiveIntOption(value: string, flagName: string): number {
+  return parseIntOption(value, flagName, 1);
+}
+
 // Expands `--app`'s three accepted forms into a list of directories: a
 // single dir (unchanged), a comma-separated list, or a glob (containing
 // "*", expanded from the current directory — the common case is running
@@ -1014,6 +1035,9 @@ program
             "output as evidence to investigate, never as a verdict.",
         );
       }
+      const maxDepth = parseNonNegativeIntOption(options.maxDepth, "--max-depth");
+      const maxResults = parsePositiveIntOption(options.maxResults, "--max-results");
+
       const npmrc = await loadNpmrcConfig(options.app);
       const registryUrl = resolveRegistryForPackage(packageName, npmrc, options.registry);
       const token = resolveAuthToken(registryUrl, npmrc, options.token);
@@ -1022,8 +1046,8 @@ program
         appDir: options.app,
         registryUrl,
         token,
-        maxDepth: Number(options.maxDepth) || 3,
-        maxResults: Number(options.maxResults) || 20,
+        maxDepth,
+        maxResults,
       });
 
       output({ command: "behavior-diff", ...report }, () => {
