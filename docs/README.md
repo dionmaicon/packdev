@@ -16,7 +16,7 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 
 ### 🔬 API Compatibility
 
-- **[API Compatibility Guide](./API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, full flag reference, agent/scripting notes
+- **[API Compatibility Guide](./API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes`/`behavior-diff` — decision table, full flag reference, agent/scripting notes
 
 ### 🛡️ Safety & Security
 
@@ -69,9 +69,9 @@ Welcome to the comprehensive documentation for `packdev` - the TypeScript-based 
 
 ### [API Compatibility Guide](./API-COMPATIBILITY.md) (240+ lines)
 - **Purpose**: Checking API/behavioral compatibility across published versions before upgrading
-- **Contains**: `api`/`api-diff`/`compat`/`dupes` command reference, decision table, real captured output, exit codes
+- **Contains**: `api`/`api-diff`/`compat`/`dupes`/`behavior-diff` command reference, decision table, real captured output, exit codes
 - **Audience**: All users, especially those scripting or using coding agents
-- **Key Topics**: Static vs runtime compatibility checks, lockfile drift auditing, peer-group version pinning, workspace-aware duplicate detection, private-registry auth (.npmrc/token)
+- **Key Topics**: Static vs runtime compatibility checks, lockfile drift auditing, peer-group version pinning, workspace-aware duplicate detection, consumer fan-out testing, private-registry auth (.npmrc/token), experimental reachability-filtered behavior diffing
 
 ### [Packaging Guide](./PACKAGING.md) (316+ lines)
 - **Purpose**: Building and distributing packages
@@ -170,7 +170,7 @@ yarn add file:./package.tgz
 | `packdev remove` | [Main README](../README.md) | [Workflow Guide](./WORKFLOW.md) |
 | `packdev setup-hooks` | [GitHub Hooks](./GITHUB-HOOKS.md) | [Main README](../README.md) |
 | `packdev status` | [Main README](../README.md) | [Workflow Guide](./WORKFLOW.md) |
-| `packdev api` / `api-diff` / `compat` / `dupes` | [API Compatibility Guide](./API-COMPATIBILITY.md) | [Main README](../README.md) |
+| `packdev api` / `api-diff` / `compat` / `dupes` / `behavior-diff` | [API Compatibility Guide](./API-COMPATIBILITY.md) | [Main README](../README.md) |
 
 ### Quick References
 

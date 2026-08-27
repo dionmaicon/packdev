@@ -424,7 +424,7 @@ Exit codes: `0` success, `1` generic error, `2` config not found, `3` package.js
 
 - **[Quick Start Guide](docs/QUICK-START.md)** - Get up and running in 5 minutes
 - **[Workflow & Best Practices](docs/WORKFLOW.md)** - Team collaboration, CI/CD, safety
-- **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes` — decision table, flags, real output, agent notes
+- **[API Compatibility Guide](docs/API-COMPATIBILITY.md)** - `api`/`api-diff`/`compat`/`dupes`/`behavior-diff` — decision table, flags, real output, agent notes
 - **[Git Hooks](docs/GITHUB-HOOKS.md)** - Auto-commit protection and safety checks
 - **[Packaging Guide](docs/PACKAGING.md)** - Building, testing, and distributing
 - **[Yarn Support](docs/YARN-SUPPORT.md)** - Using PackDev with Yarn
@@ -437,7 +437,8 @@ packdev api <pkg>                            # Show the export map of the instal
 packdev api-diff <pkg> --range <semver>      # Which published versions satisfy what your app imports (static, no install)
 packdev compat <pkg> --test <cmd>            # Does your real test suite pass against a candidate version (sandboxed install)
 packdev dupes <pkg>                          # Find every distinct copy of a package resolved in the tree
-packdev mcp                                  # Run as a local MCP server (stdio) exposing api_diff/compat/dupes as tools
+packdev behavior-diff <pkg> --to <ver>       # EXPERIMENTAL: diff shipped code between versions, filtered to what your app reaches
+packdev mcp                                  # Run as a local MCP server (stdio) exposing api_diff/compat/dupes/behavior_diff as tools
 
 # Develop against local packages
 packdev create-config                        # Initialize .packdev.json (optional — add does this automatically)
