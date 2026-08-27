@@ -76,11 +76,28 @@ function findTypesCondition(node: unknown): string | null {
   if (typeof obj["types"] === "string") return obj["types"];
   if (typeof obj["typings"] === "string") return obj["typings"];
 
-  for (const key of ["import", "require", "node", "default"]) {
+  // "node"/"import"/"require"/"default" cover the common case. A package
+  // whose root has ONLY environment condition keys and no "node" among them
+  // (seen in the wild, e.g. @solana/kit 5.x: node/browser/workerd/edge-light/
+  // react-native, no bare "."/no "node") still needs a deterministic pick —
+  // fall back to the first condition key present, in manifest order, rather
+  // than reporting no types at all.
+  const preferredKeys = ["import", "require", "node", "default"];
+  for (const key of preferredKeys) {
     if (key in obj) {
       const found = findTypesCondition(obj[key]);
       if (found) return found;
     }
+  }
+  for (const key of Object.keys(obj)) {
+    if (preferredKeys.includes(key)) continue;
+    // A key starting with "." is a subpath export (e.g. "./testing"), not a
+    // condition — descending into it would let a subpath-only declaration
+    // masquerade as the root's own types entry, even though the exports map
+    // deliberately does not expose "." at all.
+    if (key.startsWith(".")) continue;
+    const found = findTypesCondition(obj[key]);
+    if (found) return found;
   }
   return null;
 }
@@ -112,6 +129,15 @@ export async function resolveEntryPoint(
   if (packageInfo.typings) candidates.push(packageInfo.typings);
   if (packageInfo.main) {
     candidates.push(packageInfo.main.replace(/\.jsx?$/, ".d.ts"));
+  }
+  // No main/types/typings/exports at all in the manifest (seen in the wild,
+  // e.g. @nestjs/axios's published tarball) — fall back to the same
+  // ./index.d.ts default Node/TS use for an untyped ./index.js main. Gated
+  // on all four being absent: an explicit (even subpath-only) "exports" map
+  // deliberately controls what's importable, and an incidental index.d.ts
+  // sitting on disk must not be treated as a public root entry it blocks.
+  if (!packageInfo.main && !packageInfo.types && !packageInfo.typings && !packageInfo.exports) {
+    candidates.push("index.d.ts");
   }
 
   let typesPath: string | null = null;
@@ -256,6 +282,12 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
     module: ts.ModuleKind.ESNext,
     skipLibCheck: true,
     noResolve: false,
+    // Node10 (classic Node resolution: extension-less specifiers, directory
+    // specifiers falling back to <dir>/index.d.ts) is what actually follows
+    // a barrel's local re-exports (`export * from "./dist"`,
+    // `export { X } from "./client/client"`) — the module-kind-inferred
+    // default (Bundler/Classic depending on TS version) does not.
+    moduleResolution: ts.ModuleResolutionKind.Node10,
   });
 
   const sourceFile = program.getSourceFile(typesPath);
@@ -306,6 +338,190 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
   }
 
   return results;
+}
+
+export interface UnresolvedReexports {
+  // An `export * from "spec"` (or `export * as ns from "spec"`) whose target
+  // couldn't be resolved. Since the re-exported names are unknown, ANY used
+  // symbol not otherwise found might have come from it — a genuine "can't
+  // tell", not "absent".
+  wildcard: boolean;
+  // `export { A, B } from "spec"` whose target couldn't be resolved — here
+  // the affected names ARE known statically, so only those specific symbols
+  // are unresolved rather than every unmatched symbol in the file.
+  namedUnresolved: Set<string>;
+}
+
+// TS's own resolver substitutes a runtime extension for its declaration
+// counterpart (a common `export * from "./foo.js"` targets "foo.d.ts", not a
+// literal file named "foo.js.d.ts") — without this, a specifier that
+// genuinely resolves gets treated as unresolvable, which downgrades what
+// should be a real "missing" verdict on its symbols to a falsely-hedged
+// "unresolved" one instead.
+const JS_EXTENSION_TO_DECLARATION: Record<string, string> = {
+  ".js": ".d.ts",
+  ".jsx": ".d.ts",
+  ".mjs": ".d.mts",
+  ".cjs": ".d.cts",
+};
+
+// Resolves a *local* relative re-export specifier to the .d.ts file it
+// actually points at, or null if nothing on disk matches. Shared by
+// specifierResolves (which only needs a yes/no) and findUnresolvableReexports
+// (which needs the path itself, to recurse into it).
+async function resolveLocalReexportPath(
+  specifier: string,
+  fromFileDir: string,
+): Promise<string | null> {
+  const base = path.resolve(fromFileDir, specifier);
+  const ext = path.extname(base);
+  const declarationExt = JS_EXTENSION_TO_DECLARATION[ext];
+  const candidates = declarationExt
+    ? [base.slice(0, -ext.length) + declarationExt, base, `${base}.d.ts`]
+    : [base, `${base}.d.ts`, `${base}.ts`, path.join(base, "index.d.ts")];
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Splits a bare specifier into its package name and subpath, honouring
+// scoped package names ("@scope/pkg/sub" -> "@scope/pkg" + "sub") so the
+// package name handed to resolveInstalledPackage is never itself a path.
+function splitBareSpecifier(specifier: string): { pkgName: string; subpath: string | null } {
+  const scoped = /^(@[^/]+\/[^/]+)(\/.*)?$/.exec(specifier);
+  if (scoped?.[1]) {
+    return { pkgName: scoped[1], subpath: scoped[2] ? scoped[2].slice(1) : null };
+  }
+  const slashIndex = specifier.indexOf("/");
+  if (slashIndex === -1) return { pkgName: specifier, subpath: null };
+  return { pkgName: specifier.slice(0, slashIndex), subpath: specifier.slice(slashIndex + 1) };
+}
+
+// Resolves a bare specifier (a sibling npm package, optionally with a
+// subpath) the way Node/TS actually would: resolve the *package* first, then
+// resolve the subpath against it — never treat "dep/subpath" as itself a
+// package name to look up under node_modules (there is usually no
+// node_modules/dep/subpath/package.json even for a perfectly valid subpath).
+async function bareSpecifierResolves(specifier: string, pkgDir: string): Promise<boolean> {
+  const { pkgName, subpath } = splitBareSpecifier(specifier);
+  const depDir = await resolveInstalledPackage(pkgName, pkgDir);
+  if (!depDir) return false;
+  if (!subpath) return true;
+
+  const depPackageInfo = await readJsonFile<PackageInfo>(path.join(depDir, "package.json"));
+  if (depPackageInfo?.exports && typeof depPackageInfo.exports === "object") {
+    return `./${subpath}` in (depPackageInfo.exports as Record<string, unknown>);
+  }
+
+  // No "exports" map — the subpath is just a normal relative file/dir inside
+  // the package, resolved the same way a local re-export target is.
+  return (
+    (await resolveLocalReexportPath(`./${subpath}`, depDir)) !== null ||
+    (await fileExists(path.join(depDir, subpath)))
+  );
+}
+
+/**
+ * Scan a .d.ts file's top-level `export ... from "spec"` statements for ones
+ * whose target module can't be resolved on disk — the shape behind both a
+ * barrel re-exporting from local files the checker's isolated single-file
+ * program still can't see for some reason, and (more commonly) a re-export
+ * from another npm package that simply isn't installed alongside this one
+ * (e.g. a tarball extracted into an isolated temp dir with no node_modules
+ * tree). Syntax-only, so it can't fail the way the checker-based walk can.
+ */
+export async function findUnresolvableReexports(
+  typesPath: string,
+  pkgDir: string,
+): Promise<UnresolvedReexports> {
+  const result: UnresolvedReexports = { wildcard: false, namedUnresolved: new Set() };
+  const visited = new Set<string>();
+
+  // A local re-export target resolving on disk isn't sufficient — the
+  // checker's own extractExportMap walk (Node10 resolution) actually follows
+  // it, so an unresolvable re-export *inside that local barrel* (typically a
+  // sibling npm package it re-exports that isn't present in this isolated
+  // extraction) is exactly as invisible to the used-symbol check as one at
+  // the root. Recurse into every genuinely-resolvable local file so those
+  // get caught too, instead of stopping one hop early because "this
+  // specifier resolves" was treated as the whole answer.
+  async function scan(filePath: string): Promise<void> {
+    const resolvedPath = path.resolve(filePath);
+    if (visited.has(resolvedPath)) return;
+    visited.add(resolvedPath);
+
+    const sourceText = ts.sys.readFile(resolvedPath);
+    if (!sourceText) return;
+
+    const sourceFile = ts.createSourceFile(resolvedPath, sourceText, ts.ScriptTarget.Latest, true);
+    const fromFileDir = path.dirname(resolvedPath);
+
+    for (const stmt of sourceFile.statements) {
+      if (!ts.isExportDeclaration(stmt)) continue;
+      const moduleSpecifier =
+        stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+          ? stmt.moduleSpecifier.text
+          : null;
+      if (!moduleSpecifier) continue;
+
+      if (moduleSpecifier.startsWith(".") || moduleSpecifier.startsWith("/")) {
+        const localTarget = await resolveLocalReexportPath(moduleSpecifier, fromFileDir);
+        if (localTarget) {
+          await scan(localTarget);
+          continue;
+        }
+      } else if (await bareSpecifierResolves(moduleSpecifier, pkgDir)) {
+        continue;
+      }
+
+      if (!stmt.exportClause || ts.isNamespaceExport(stmt.exportClause)) {
+        result.wildcard = true;
+        continue;
+      }
+      if (ts.isNamedExports(stmt.exportClause)) {
+        for (const element of stmt.exportClause.elements) {
+          result.namedUnresolved.add(element.name.text);
+        }
+      }
+    }
+  }
+
+  await scan(typesPath);
+  return result;
+}
+
+/**
+ * The same unresolvable-re-export scan as findUnresolvableReexports, but for
+ * a whole package: the root "." entry plus every subpath declared in its
+ * "exports" map, merged — matching how resolvePackageExportMap merges its
+ * *resolved* exports across root+subpaths. A used symbol imported from a
+ * subpath whose own types file has an unresolvable re-export needs the same
+ * missing-vs-unresolved distinction the root already gets; without this, only
+ * the root's own re-exports were ever checked.
+ */
+export async function findUnresolvableReexportsForPackage(
+  pkgDir: string,
+  packageInfo: PackageInfo,
+): Promise<UnresolvedReexports> {
+  const result: UnresolvedReexports = { wildcard: false, namedUnresolved: new Set() };
+
+  const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+  if (typesPath) {
+    const rootResult = await findUnresolvableReexports(typesPath, pkgDir);
+    result.wildcard = result.wildcard || rootResult.wildcard;
+    for (const name of rootResult.namedUnresolved) result.namedUnresolved.add(name);
+  }
+
+  for (const subpath of listExportsSubpaths(packageInfo)) {
+    const subpathTypesPath = await resolveSubpathTypesPath(pkgDir, packageInfo, subpath);
+    if (!subpathTypesPath) continue;
+    const subpathResult = await findUnresolvableReexports(subpathTypesPath, pkgDir);
+    result.wildcard = result.wildcard || subpathResult.wildcard;
+    for (const name of subpathResult.namedUnresolved) result.namedUnresolved.add(name);
+  }
+
+  return result;
 }
 
 export interface RawExportHint {

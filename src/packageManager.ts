@@ -107,6 +107,40 @@ interface PackageJsonBackup {
 export interface PackageManagerInfo {
   manager: "npm" | "yarn" | "pnpm";
   lockFile: string;
+  // Present when pinned via a package.json "packageManager" field (corepack)
+  // or a --package-manager override; absent when picked from a bare lockfile.
+  version?: string;
+  // Where this resolution came from — surfaced in `compat` output so a
+  // recommendation can be traced back to what actually ran it.
+  source: "packageManager-field" | "lockfile" | "default" | "cli-override";
+}
+
+export const LOCK_FILE_BY_MANAGER: Record<PackageManagerInfo["manager"], string> = {
+  pnpm: "pnpm-lock.yaml",
+  yarn: "yarn.lock",
+  npm: "package-lock.json",
+};
+
+// Reads the nearest-ancestor package.json's corepack "packageManager" field
+// (e.g. "yarn@1.22.22"), the same pin `corepack` itself honours, so compat's
+// sandbox install uses the manager the project actually declares rather than
+// guessing from whichever lockfile happens to be present.
+async function readPackageManagerField(
+  dir: string,
+): Promise<{ manager: PackageManagerInfo["manager"]; version: string } | null> {
+  const pkgJsonPath = path.join(dir, "package.json");
+  if (!(await fileExists(pkgJsonPath))) return null;
+  try {
+    const raw = JSON.parse(await fs.readFile(pkgJsonPath, "utf-8")) as {
+      packageManager?: string;
+    };
+    if (!raw.packageManager) return null;
+    const match = /^(npm|yarn|pnpm)@([^+]+)/.exec(raw.packageManager);
+    if (!match?.[1] || !match[2]) return null;
+    return { manager: match[1] as PackageManagerInfo["manager"], version: match[2] };
+  } catch {
+    return null;
+  }
 }
 
 interface GitReference {
@@ -125,22 +159,52 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+// Walks every ancestor looking only for a "packageManager" pin, all the way
+// to the filesystem root, before any lockfile is considered. A pin at a
+// monorepo root must win even when a *closer* directory happens to have its
+// own lockfile (e.g. a workspace child with a stray package-lock.json) —
+// interleaving the two searches per-directory would let that closer lockfile
+// shadow the pin an ancestor deliberately set.
+async function findPackageManagerField(
+  startDir: string,
+): Promise<{ manager: PackageManagerInfo["manager"]; version: string } | null> {
+  let dir = startDir;
+  for (;;) {
+    const pinned = await readPackageManagerField(dir);
+    if (pinned) return pinned;
+
+    const parentDir = path.dirname(dir);
+    if (parentDir === dir) return null;
+    dir = parentDir;
+  }
+}
+
 export async function detectPackageManager(
   startDir: string = process.cwd(),
 ): Promise<PackageManagerInfo> {
+  const pinned = await findPackageManagerField(startDir);
+  if (pinned) {
+    return {
+      manager: pinned.manager,
+      lockFile: LOCK_FILE_BY_MANAGER[pinned.manager],
+      version: pinned.version,
+      source: "packageManager-field",
+    };
+  }
+
   // Search upward from startDir so this still resolves correctly when run
   // inside a monorepo workspace child, where the lockfile lives at the repo
   // root rather than next to the child's package.json.
   let dir = startDir;
   for (;;) {
     if (await fileExists(path.join(dir, "pnpm-lock.yaml"))) {
-      return { manager: "pnpm", lockFile: "pnpm-lock.yaml" };
+      return { manager: "pnpm", lockFile: "pnpm-lock.yaml", source: "lockfile" };
     }
     if (await fileExists(path.join(dir, "yarn.lock"))) {
-      return { manager: "yarn", lockFile: "yarn.lock" };
+      return { manager: "yarn", lockFile: "yarn.lock", source: "lockfile" };
     }
     if (await fileExists(path.join(dir, "package-lock.json"))) {
-      return { manager: "npm", lockFile: "package-lock.json" };
+      return { manager: "npm", lockFile: "package-lock.json", source: "lockfile" };
     }
 
     const parentDir = path.dirname(dir);
@@ -149,7 +213,7 @@ export async function detectPackageManager(
   }
 
   // Default to npm if no lockfile was found anywhere up the tree.
-  return { manager: "npm", lockFile: "package-lock.json" };
+  return { manager: "npm", lockFile: "package-lock.json", source: "default" };
 }
 
 async function executeInstall(

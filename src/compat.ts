@@ -19,12 +19,21 @@ import * as semver from "semver";
 import { fileExists, readJsonFile, writeJsonFile } from "./utils";
 import {
   detectPackageManager,
+  LOCK_FILE_BY_MANAGER,
   type PackageJson,
   type PackageManagerInfo,
 } from "./packageManager";
 import { fetchPackageMetadata, listVersionsInRange } from "./registry";
+import { resolveInstalledPackage, getInstalledVersion } from "./api";
+import { findDuplicateResolutions, resolveWorkspaceDirs } from "./dupes";
 
 export type CompatStatus = "PASSED" | "FAILED" | "INSTALL_FAILED" | "SKIPPED";
+
+export interface DupesRegressionEntry {
+  package: string;
+  controlCopies: number;
+  candidateCopies: number;
+}
 
 export interface CompatVersionResult {
   version: string;
@@ -34,6 +43,16 @@ export interface CompatVersionResult {
   output?: string | undefined;
   lockfileHash: string | null;
   lockfileSnapshotPath: string | null;
+  // Set only when --check-dupes is on and the install succeeded: distinct
+  // resolved-copy counts for the package under test plus each of its direct
+  // dependencies, keyed by package name.
+  dupeCounts?: Record<string, number> | undefined;
+  // Set only when --check-dupes is on and this version's copy count for some
+  // package is HIGHER than the control's — the exact shape a dependency-range
+  // gap produces (e.g. a bumped package requiring a newer transitive SDK than
+  // the repo declares, nesting a second copy). Never computed for the control
+  // itself, only for candidates compared against it.
+  dupesRegression?: DupesRegressionEntry[] | undefined;
 }
 
 export interface CompatReport {
@@ -46,6 +65,26 @@ export interface CompatReport {
   snapshotDir: string;
   concurrency: number;
   testCommandCaveat: string | null;
+  // The currently-installed version of the package, tested the same way as
+  // every candidate — null when it isn't resolvable in appDir's node_modules
+  // (e.g. never installed, or a workspace-hoisted layout compat can't see).
+  control: CompatVersionResult | null;
+  // True when `control` ran and didn't PASS: the test harness itself is
+  // broken for this app (a missing devDependency satisfied only by hoisting,
+  // a flaky suite, ...), not evidence any candidate is actually incompatible.
+  // minimumCompatibleVersion/recommendedVersion are forced to null in this
+  // case rather than recommending a version off a harness that can't even
+  // confirm the version already running in production.
+  controlFailed: boolean;
+  // "workspace" when every version was sandboxed as the whole monorepo root
+  // (needed to resolve workspace:-protocol deps); "hermetic" when only
+  // appDir itself was copied. Same for every version in this report — it's
+  // decided once up front, not per candidate.
+  sandboxMode: "hermetic" | "workspace";
+  // The package manager actually used to run every sandboxed install, e.g.
+  // "yarn@1.22.22" or "npm" when no version could be pinned down. Traces a
+  // recommendation back to what actually produced it.
+  packageManager: string;
 }
 
 export interface CompatOptions {
@@ -61,6 +100,17 @@ export interface CompatOptions {
   snapshotDir?: string | undefined;
   concurrency?: number | undefined;
   preferOffline?: boolean | undefined;
+  checkDupes?: boolean | undefined;
+  // Force sandboxing to only appDir ("hermetic") or the whole discovered
+  // monorepo root ("workspace"), overriding the automatic workspace:-protocol
+  // detection. Errors if "workspace" is requested but no root is found.
+  mode?: "hermetic" | "workspace" | undefined;
+  // Override the detected package manager, e.g. "yarn@1.22.22" or "pnpm".
+  packageManager?: string | undefined;
+}
+
+function formatPackageManager(info: PackageManagerInfo): string {
+  return info.version ? `${info.manager}@${info.version}` : info.manager;
 }
 
 export type DependencySection =
@@ -195,6 +245,32 @@ export function resolvePinTargets(
   });
 }
 
+// When --app doesn't declare the package, a monorepo often has some sibling
+// workspace that does — this is usually the actual fix (point --app there),
+// not evidence the package name is wrong. Scans every workspace's own
+// package.json rather than just appDir's, so the error names candidates
+// instead of leaving the caller to `grep` the monorepo by hand.
+async function findWorkspacesDeclaring(
+  pkgName: string,
+  appDir: string,
+): Promise<string[]> {
+  const monorepoRoot = await findMonorepoRoot(appDir);
+  if (!monorepoRoot) return [];
+
+  const workspaceDirs = await resolveWorkspaceDirs(monorepoRoot);
+  const declaring: string[] = [];
+  for (const dir of workspaceDirs) {
+    if (path.resolve(dir) === path.resolve(appDir)) continue;
+    const packageJson = await readJsonFile<PackageJson & { name?: string }>(
+      path.join(dir, "package.json"),
+    );
+    if (packageJson && findDependencySection(packageJson, pkgName)) {
+      declaring.push(packageJson.name ?? path.relative(monorepoRoot, dir));
+    }
+  }
+  return declaring.sort();
+}
+
 const SANDBOX_PREFIX = "packdev-compat-sandbox-";
 const EXCLUDED_COPY_NAMES = new Set([
   "node_modules",
@@ -235,6 +311,13 @@ export async function createSandbox(
   version: string,
   pinTargets: PinTarget[],
   appRelativePath: string = "",
+  // When set (a "packageManager" field pin or a --package-manager override
+  // carries a version), written into the sandboxed package.json(s) so
+  // Corepack's own shims — not our bare `spawn(manager, ...)` call — pick up
+  // and run that exact version. Without this, a pinned/overridden version
+  // was only ever reflected in the JSON report, never in which binary
+  // actually ran the install.
+  packageManagerPin?: { manager: PackageManagerInfo["manager"]; version: string },
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
@@ -258,7 +341,23 @@ export async function createSandbox(
       [name]: version,
     };
   }
+  if (packageManagerPin) {
+    packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+  }
   await writeJsonFile(packageJsonPath, packageJson);
+
+  // Install always runs from sandboxDir's own root (see testOneVersion), not
+  // appRelativePath — in a sandboxed monorepo that's a different package.json
+  // than the one just patched above, and Corepack only reads the pin from
+  // the nearest package.json to its own invocation cwd.
+  if (packageManagerPin && appRelativePath) {
+    const rootPackageJsonPath = path.join(sandboxDir, "package.json");
+    const rootPackageJson = await readJsonFile<PackageJson>(rootPackageJsonPath);
+    if (rootPackageJson) {
+      rootPackageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+      await writeJsonFile(rootPackageJsonPath, rootPackageJson);
+    }
+  }
 
   return sandboxDir;
 }
@@ -407,6 +506,38 @@ function computeNonMonotonic(versions: CompatVersionResult[]): boolean {
   return false;
 }
 
+// Counts distinct resolved copies of the package under test plus each of its
+// own direct dependencies, inside the sandbox that was just installed. This
+// is the walk `dupes` already does, just aimed at a throwaway sandbox instead
+// of the real project — a dependency-range gap (e.g. a bumped package
+// requiring a newer transitive SDK than the repo declares) nests a second
+// copy under the bumped package's own node_modules, and this is what makes
+// that visible without a human reaching for `packdev dupes` by hand.
+async function collectDupeCounts(
+  pkgName: string,
+  sandboxRoot: string,
+  testCwdRelative: string,
+): Promise<Record<string, number>> {
+  const pkgDir = await resolveInstalledPackage(
+    pkgName,
+    path.join(sandboxRoot, testCwdRelative),
+  );
+  const directDeps = pkgDir
+    ? Object.keys(
+        (await readJsonFile<PackageJson>(path.join(pkgDir, "package.json")))
+          ?.dependencies as Record<string, string> | undefined ?? {},
+      )
+    : [];
+
+  const namesToCheck = [...new Set([pkgName, ...directDeps])];
+  const counts: Record<string, number> = {};
+  for (const name of namesToCheck) {
+    const report = await findDuplicateResolutions(name, sandboxRoot);
+    counts[name] = report.resolutions.length;
+  }
+  return counts;
+}
+
 // Sandboxes, installs, and tests exactly one version — the shared execution
 // path for both the full linear scan (runCompat) and --bisect.
 async function testOneVersion(
@@ -447,7 +578,15 @@ async function testOneVersion(
 
   let sandboxDir: string | null = null;
   try {
-    sandboxDir = await createSandbox(sourceDir, version, pinTargets, testCwdRelative);
+    sandboxDir = await createSandbox(
+      sourceDir,
+      version,
+      pinTargets,
+      testCwdRelative,
+      packageManagerInfo.version !== undefined
+        ? { manager: packageManagerInfo.manager, version: packageManagerInfo.version }
+        : undefined,
+    );
 
     const installResult = await runInstall(
       sandboxDir,
@@ -475,6 +614,10 @@ async function testOneVersion(
       version,
     );
 
+    const dupeCounts = options.checkDupes
+      ? await collectDupeCounts(pkgName, sandboxDir, testCwdRelative)
+      : undefined;
+
     const testCwd = path.join(sandboxDir, testCwdRelative);
     const testResult = await runTestCommand(testCwd, options.testCommand);
     return {
@@ -485,10 +628,28 @@ async function testOneVersion(
       output: testResult.success ? undefined : testResult.output,
       lockfileHash: snapshot.hash,
       lockfileSnapshotPath: snapshot.path,
+      dupeCounts,
     };
   } finally {
     if (sandboxDir) await cleanupSandbox(sandboxDir);
   }
+}
+
+// Parses a --package-manager override like "yarn@1.22.22" or bare "pnpm".
+function parsePackageManagerOverride(spec: string): PackageManagerInfo {
+  const match = /^(npm|yarn|pnpm)(?:@(.+))?$/.exec(spec.trim());
+  const manager = match?.[1] as PackageManagerInfo["manager"] | undefined;
+  if (!manager) {
+    throw new Error(
+      `Invalid --package-manager value "${spec}" — expected npm, yarn, pnpm, or <name>@<version>`,
+    );
+  }
+  return {
+    manager,
+    lockFile: LOCK_FILE_BY_MANAGER[manager],
+    ...(match?.[2] !== undefined ? { version: match[2] } : {}),
+    source: "cli-override",
+  };
 }
 
 async function resolveRunContext(
@@ -500,6 +661,7 @@ async function resolveRunContext(
   workspaceProtocolDeps: string[];
   monorepoRoot: string | null;
   appRelativePath: string;
+  sandboxMode: "hermetic" | "workspace";
 }> {
   const appPackageJsonPath = path.join(options.appDir, "package.json");
   const appPackageJson = await readJsonFile<PackageJson>(appPackageJsonPath);
@@ -507,20 +669,45 @@ async function resolveRunContext(
     throw new Error(`No package.json found in app directory: ${options.appDir}`);
   }
 
-  const pinTargets = resolvePinTargets(pkgName, options.group, appPackageJson);
+  let pinTargets: PinTarget[];
+  try {
+    pinTargets = resolvePinTargets(pkgName, options.group, appPackageJson);
+  } catch (error) {
+    const message = (error as Error).message;
+    const missingName = /^"(.+)" is not declared/.exec(message)?.[1] ?? pkgName;
+    const declaringWorkspaces = await findWorkspacesDeclaring(missingName, options.appDir);
+    if (declaringWorkspaces.length > 0) {
+      throw new Error(
+        `${message} — but it is declared in these workspaces: ` +
+          `${declaringWorkspaces.join(", ")}. Point --app at one of them instead.`,
+      );
+    }
+    throw error;
+  }
   const workspaceProtocolDeps = findWorkspaceProtocolDeps(appPackageJson);
 
   let monorepoRoot: string | null = null;
   let appRelativePath = "";
-  if (workspaceProtocolDeps.length > 0) {
+  const wantsWorkspaceRoot =
+    options.mode === "workspace" || (options.mode === undefined && workspaceProtocolDeps.length > 0);
+  if (wantsWorkspaceRoot) {
     monorepoRoot = await findMonorepoRoot(options.appDir);
     if (monorepoRoot) {
       appRelativePath = path.relative(monorepoRoot, path.resolve(options.appDir));
     }
   }
+  if (options.mode === "workspace" && !monorepoRoot) {
+    throw new Error(
+      `--mode workspace requested, but no workspaces root (package.json "workspaces" or ` +
+        `pnpm-workspace.yaml) could be found anywhere above ${options.appDir}.`,
+    );
+  }
+  const sandboxMode: "hermetic" | "workspace" = monorepoRoot ? "workspace" : "hermetic";
 
-  const packageManagerInfo = await detectPackageManager(options.appDir);
-  return { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath };
+  const packageManagerInfo = options.packageManager
+    ? parsePackageManagerOverride(options.packageManager)
+    : await detectPackageManager(options.appDir);
+  return { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode };
 }
 
 /**
@@ -596,6 +783,80 @@ async function detectTranspileOnlyTestSetup(
   return null;
 }
 
+// The version currently resolved in appDir's node_modules — null when it
+// isn't installed there at all (never installed, or hoisted somewhere
+// compat's own node_modules walk-up can't see from this exact directory).
+async function resolveControlVersion(
+  pkgName: string,
+  appDir: string,
+): Promise<string | null> {
+  const dir = await resolveInstalledPackage(pkgName, appDir);
+  if (!dir) return null;
+  return getInstalledVersion(dir);
+}
+
+// Ensures the control (installed) version gets tested exactly once even
+// when it isn't among the requested candidates — reusing an already-tested
+// result when it happens to coincide with one, rather than paying for a
+// redundant sandbox run.
+async function resolveControlResult(
+  pkgName: string,
+  options: CompatOptions,
+  packageManagerInfo: PackageManagerInfo,
+  pinTargets: PinTarget[],
+  snapshotDir: string,
+  workspaceProtocolDeps: string[],
+  monorepoRoot: string | null,
+  appRelativePath: string,
+  alreadyTested: CompatVersionResult[],
+): Promise<CompatVersionResult | null> {
+  const controlVersion = await resolveControlVersion(pkgName, options.appDir);
+  if (!controlVersion) return null;
+
+  const existing = alreadyTested.find((v) => v.version === controlVersion);
+  if (existing) return existing;
+
+  return testOneVersion(
+    pkgName,
+    controlVersion,
+    options,
+    packageManagerInfo,
+    pinTargets,
+    snapshotDir,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+  );
+}
+
+// Mutates `versions` in place: for each one with dupeCounts, compares each
+// package's copy count against the control's count for that same package
+// (only packages the control itself also checked — a package newly declared
+// by a candidate isn't a "regression" of anything). A version whose copy
+// count went up gets dupesRegression populated and, if it otherwise PASSED,
+// is escalated to FAILED — the test suite passing is exactly what makes this
+// class of bug dangerous: it's invisible until it isn't.
+function applyDupesRegressions(
+  versions: CompatVersionResult[],
+  control: CompatVersionResult | null,
+): void {
+  if (!control?.dupeCounts) return;
+  for (const v of versions) {
+    if (v === control || !v.dupeCounts) continue;
+    const regressions: DupesRegressionEntry[] = [];
+    for (const [name, controlCopies] of Object.entries(control.dupeCounts)) {
+      const candidateCopies = v.dupeCounts[name];
+      if (candidateCopies !== undefined && candidateCopies > controlCopies) {
+        regressions.push({ package: name, controlCopies, candidateCopies });
+      }
+    }
+    if (regressions.length > 0) {
+      v.dupesRegression = regressions;
+      if (v.status === "PASSED") v.status = "FAILED";
+    }
+  }
+}
+
 export async function runCompat(
   pkgName: string,
   options: CompatOptions,
@@ -603,7 +864,7 @@ export async function runCompat(
   registerCompatSignalHandling();
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath } =
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
     await resolveRunContext(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const concurrency = options.concurrency ?? 1;
@@ -629,20 +890,43 @@ export async function runCompat(
       ),
   );
 
+  const control = await resolveControlResult(
+    pkgName,
+    options,
+    packageManagerInfo,
+    pinTargets,
+    snapshotDir,
+    workspaceProtocolDeps,
+    monorepoRoot,
+    appRelativePath,
+    versions,
+  );
+  if (options.checkDupes) applyDupesRegressions(versions, control);
+  const controlFailed = control !== null && control.status !== "PASSED";
+
   const passedVersions = versions
     .filter((v) => v.status === "PASSED")
     .map((v) => v.version);
 
   return {
     package: pkgName,
-    minimumCompatibleVersion: passedVersions[0] ?? null,
-    recommendedVersion: passedVersions[passedVersions.length - 1] ?? null,
+    // A control that can't even confirm the version already running in
+    // production means the harness itself is broken — recommending a
+    // candidate off it would be asserting more than the run actually showed.
+    minimumCompatibleVersion: controlFailed ? null : (passedVersions[0] ?? null),
+    recommendedVersion: controlFailed
+      ? null
+      : (passedVersions[passedVersions.length - 1] ?? null),
     nonMonotonic: computeNonMonotonic(versions),
     versions,
     group: options.group,
     snapshotDir,
     concurrency,
     testCommandCaveat,
+    control,
+    controlFailed,
+    sandboxMode,
+    packageManager: formatPackageManager(packageManagerInfo),
   };
 }
 
@@ -662,12 +946,16 @@ function finishBisect(
   fellBackToLinearScan: boolean,
   snapshotDir: string,
   testCommandCaveat: string | null,
-  group?: string[] | undefined,
+  group: string[] | undefined,
+  control: CompatVersionResult | null,
+  sandboxMode: "hermetic" | "workspace",
+  packageManagerInfo: PackageManagerInfo,
 ): CompatBisectReport {
+  const controlFailed = control !== null && control.status !== "PASSED";
   return {
     package: pkgName,
-    minimumCompatibleVersion,
-    recommendedVersion,
+    minimumCompatibleVersion: controlFailed ? null : minimumCompatibleVersion,
+    recommendedVersion: controlFailed ? null : recommendedVersion,
     nonMonotonic: false,
     versions: tested,
     bisected: true,
@@ -678,6 +966,10 @@ function finishBisect(
     snapshotDir,
     concurrency: 1,
     testCommandCaveat,
+    control,
+    controlFailed,
+    sandboxMode,
+    packageManager: formatPackageManager(packageManagerInfo),
   };
 }
 
@@ -694,28 +986,67 @@ export async function runCompatBisect(
 ): Promise<CompatBisectReport> {
   registerCompatSignalHandling();
 
+  if (options.checkDupes) {
+    // Bisect's pass/fail boundary is committed to as soon as a version's
+    // *test command* passes — a dupes-regression escalation discovered only
+    // afterward can't be applied without invalidating the search that
+    // already ran (a version bisect skipped over, on the strength of the
+    // boundary passing, might itself have been the one with the regression).
+    // Reject the combination rather than silently ignore --check-dupes or
+    // report a boundary that was computed without it.
+    throw new Error(
+      "--bisect and --check-dupes cannot be combined: bisect's boundary is decided from the " +
+        "test command's pass/fail alone, before a dupes-regression check on the boundary " +
+        "version could change that verdict. Use a linear scan (drop --bisect) to combine " +
+        "with --check-dupes.",
+    );
+  }
+
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);
   const testCommandCaveat = await detectTranspileOnlyTestSetup(
     options.appDir,
     options.testCommand,
   );
-  if (candidateVersions.length === 0) {
+  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath, sandboxMode } =
+    await resolveRunContext(pkgName, options);
+
+  const tested: CompatVersionResult[] = [];
+  const finish = async (
+    minimumCompatibleVersion: string | null,
+    recommendedVersion: string | null,
+  ): Promise<CompatBisectReport> => {
+    const control = await resolveControlResult(
+      pkgName,
+      options,
+      packageManagerInfo,
+      pinTargets,
+      snapshotDir,
+      workspaceProtocolDeps,
+      monorepoRoot,
+      appRelativePath,
+      tested,
+    );
     return finishBisect(
       pkgName,
       candidateVersions,
-      [],
-      null,
-      null,
+      tested,
+      minimumCompatibleVersion,
+      recommendedVersion,
       false,
       snapshotDir,
       testCommandCaveat,
       options.group,
+      control,
+      sandboxMode,
+      packageManagerInfo,
     );
+  };
+
+  if (candidateVersions.length === 0) {
+    return finish(null, null);
   }
 
-  const { pinTargets, packageManagerInfo, workspaceProtocolDeps, monorepoRoot, appRelativePath } =
-    await resolveRunContext(pkgName, options);
   const testAt = (index: number) =>
     testOneVersion(
       pkgName,
@@ -729,7 +1060,6 @@ export async function runCompatBisect(
       appRelativePath,
     );
 
-  const tested: CompatVersionResult[] = [];
   const topIndex = candidateVersions.length - 1;
   const topVersion = candidateVersions[topIndex]!;
 
@@ -738,47 +1068,17 @@ export async function runCompatBisect(
   if (topResult.status !== "PASSED") {
     // Nothing in range is presumed compatible under the monotonic
     // assumption — bisect makes no claim beyond the top version.
-    return finishBisect(
-      pkgName,
-      candidateVersions,
-      tested,
-      null,
-      null,
-      false,
-      snapshotDir,
-      testCommandCaveat,
-      options.group,
-    );
+    return finish(null, null);
   }
 
   if (candidateVersions.length === 1) {
-    return finishBisect(
-      pkgName,
-      candidateVersions,
-      tested,
-      topVersion,
-      topVersion,
-      false,
-      snapshotDir,
-      testCommandCaveat,
-      options.group,
-    );
+    return finish(topVersion, topVersion);
   }
 
   const bottomResult = await testAt(0);
   tested.push(bottomResult);
   if (bottomResult.status === "PASSED") {
-    return finishBisect(
-      pkgName,
-      candidateVersions,
-      tested,
-      candidateVersions[0]!,
-      topVersion,
-      false,
-      snapshotDir,
-      testCommandCaveat,
-      options.group,
-    );
+    return finish(candidateVersions[0]!, topVersion);
   }
 
   let lo = 0;
@@ -814,15 +1114,5 @@ export async function runCompatBisect(
     };
   }
 
-  return finishBisect(
-    pkgName,
-    candidateVersions,
-    tested,
-    boundaryVersion,
-    topVersion,
-    false,
-    snapshotDir,
-    testCommandCaveat,
-    options.group,
-  );
+  return finish(boundaryVersion, topVersion);
 }

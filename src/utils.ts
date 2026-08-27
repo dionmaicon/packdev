@@ -17,6 +17,7 @@ export interface PackageInfo {
   types?: string;
   typings?: string;
   exports?: unknown;
+  type?: "module" | "commonjs";
 }
 
 export interface DependencyInfo {
