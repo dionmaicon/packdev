@@ -311,6 +311,13 @@ export async function createSandbox(
   version: string,
   pinTargets: PinTarget[],
   appRelativePath: string = "",
+  // When set (a "packageManager" field pin or a --package-manager override
+  // carries a version), written into the sandboxed package.json(s) so
+  // Corepack's own shims — not our bare `spawn(manager, ...)` call — pick up
+  // and run that exact version. Without this, a pinned/overridden version
+  // was only ever reflected in the JSON report, never in which binary
+  // actually ran the install.
+  packageManagerPin?: { manager: PackageManagerInfo["manager"]; version: string },
 ): Promise<string> {
   const sandboxDir = await fs.mkdtemp(path.join(os.tmpdir(), SANDBOX_PREFIX));
   activeSandboxDirs.add(sandboxDir);
@@ -334,7 +341,23 @@ export async function createSandbox(
       [name]: version,
     };
   }
+  if (packageManagerPin) {
+    packageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+  }
   await writeJsonFile(packageJsonPath, packageJson);
+
+  // Install always runs from sandboxDir's own root (see testOneVersion), not
+  // appRelativePath — in a sandboxed monorepo that's a different package.json
+  // than the one just patched above, and Corepack only reads the pin from
+  // the nearest package.json to its own invocation cwd.
+  if (packageManagerPin && appRelativePath) {
+    const rootPackageJsonPath = path.join(sandboxDir, "package.json");
+    const rootPackageJson = await readJsonFile<PackageJson>(rootPackageJsonPath);
+    if (rootPackageJson) {
+      rootPackageJson["packageManager"] = `${packageManagerPin.manager}@${packageManagerPin.version}`;
+      await writeJsonFile(rootPackageJsonPath, rootPackageJson);
+    }
+  }
 
   return sandboxDir;
 }
@@ -555,7 +578,15 @@ async function testOneVersion(
 
   let sandboxDir: string | null = null;
   try {
-    sandboxDir = await createSandbox(sourceDir, version, pinTargets, testCwdRelative);
+    sandboxDir = await createSandbox(
+      sourceDir,
+      version,
+      pinTargets,
+      testCwdRelative,
+      packageManagerInfo.version !== undefined
+        ? { manager: packageManagerInfo.manager, version: packageManagerInfo.version }
+        : undefined,
+    );
 
     const installResult = await runInstall(
       sandboxDir,
@@ -954,6 +985,22 @@ export async function runCompatBisect(
   options: CompatOptions,
 ): Promise<CompatBisectReport> {
   registerCompatSignalHandling();
+
+  if (options.checkDupes) {
+    // Bisect's pass/fail boundary is committed to as soon as a version's
+    // *test command* passes — a dupes-regression escalation discovered only
+    // afterward can't be applied without invalidating the search that
+    // already ran (a version bisect skipped over, on the strength of the
+    // boundary passing, might itself have been the one with the regression).
+    // Reject the combination rather than silently ignore --check-dupes or
+    // report a boundary that was computed without it.
+    throw new Error(
+      "--bisect and --check-dupes cannot be combined: bisect's boundary is decided from the " +
+        "test command's pass/fail alone, before a dupes-regression check on the boundary " +
+        "version could change that verdict. Use a linear scan (drop --bisect) to combine " +
+        "with --check-dupes.",
+    );
+  }
 
   const candidateVersions = await resolveCandidateVersions(pkgName, options);
   const snapshotDir = await resolveSnapshotDir(options.snapshotDir);

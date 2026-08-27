@@ -159,23 +159,44 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+// Walks every ancestor looking only for a "packageManager" pin, all the way
+// to the filesystem root, before any lockfile is considered. A pin at a
+// monorepo root must win even when a *closer* directory happens to have its
+// own lockfile (e.g. a workspace child with a stray package-lock.json) —
+// interleaving the two searches per-directory would let that closer lockfile
+// shadow the pin an ancestor deliberately set.
+async function findPackageManagerField(
+  startDir: string,
+): Promise<{ manager: PackageManagerInfo["manager"]; version: string } | null> {
+  let dir = startDir;
+  for (;;) {
+    const pinned = await readPackageManagerField(dir);
+    if (pinned) return pinned;
+
+    const parentDir = path.dirname(dir);
+    if (parentDir === dir) return null;
+    dir = parentDir;
+  }
+}
+
 export async function detectPackageManager(
   startDir: string = process.cwd(),
 ): Promise<PackageManagerInfo> {
+  const pinned = await findPackageManagerField(startDir);
+  if (pinned) {
+    return {
+      manager: pinned.manager,
+      lockFile: LOCK_FILE_BY_MANAGER[pinned.manager],
+      version: pinned.version,
+      source: "packageManager-field",
+    };
+  }
+
   // Search upward from startDir so this still resolves correctly when run
   // inside a monorepo workspace child, where the lockfile lives at the repo
   // root rather than next to the child's package.json.
   let dir = startDir;
   for (;;) {
-    const pinned = await readPackageManagerField(dir);
-    if (pinned) {
-      return {
-        manager: pinned.manager,
-        lockFile: LOCK_FILE_BY_MANAGER[pinned.manager],
-        version: pinned.version,
-        source: "packageManager-field",
-      };
-    }
     if (await fileExists(path.join(dir, "pnpm-lock.yaml"))) {
       return { manager: "pnpm", lockFile: "pnpm-lock.yaml", source: "lockfile" };
     }

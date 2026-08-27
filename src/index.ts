@@ -818,13 +818,27 @@ program
         console.log("");
         if (report.controlFailed && report.control) {
           const firstLine = (report.control.output ?? "").split("\n").find((l) => l.trim()) ?? "";
-          console.log(
-            `⚠️  control ${report.control.version} (installed) ${report.control.status} — the test harness is broken, not the package.`,
-          );
-          if (firstLine) console.log(`    First error: ${firstLine.trim()}`);
-          console.log(
-            "    Hint: a dependency may be satisfied by hoisting in-repo but undeclared in this app's package.json.",
-          );
+          if (report.control.status === "INSTALL_FAILED") {
+            // A broken install (registry outage, auth failure, a missing
+            // package-manager binary, ...) never even reached the test
+            // command — that's an installation problem, not evidence the
+            // harness itself can't confirm the installed version works.
+            console.log(
+              `⚠️  control ${report.control.version} (installed) INSTALL_FAILED — the sandboxed install itself failed, before any test ran.`,
+            );
+            if (firstLine) console.log(`    First error: ${firstLine.trim()}`);
+            console.log(
+              "    Hint: check registry reachability/auth and that the resolved package manager is available.",
+            );
+          } else {
+            console.log(
+              `⚠️  control ${report.control.version} (installed) ${report.control.status} — the test harness is broken, not the package.`,
+            );
+            if (firstLine) console.log(`    First error: ${firstLine.trim()}`);
+            console.log(
+              "    Hint: a dependency may be satisfied by hoisting in-repo but undeclared in this app's package.json.",
+            );
+          }
           console.log("    No recommendation emitted.");
         }
         if (report.minimumCompatibleVersion) {

@@ -273,7 +273,7 @@ packdev compat is-odd --versions 2.0.0,3.0.1 --test "node check.js" --json
 # 3. Suspect instanceof/DI weirdness from a hoisting mismatch? Workspace-aware by
 #    default, exits 5 on a real duplicate — usable as a CI guard.
 packdev dupes commander --json
-# {"duplicate":false,"resolutions":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
+# {"duplicate":false,"copies":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
 ```
 
 📖 **[Full API Compatibility Guide →](docs/API-COMPATIBILITY.md)** — decision table, every flag, real captured output, exit codes, and agent/scripting notes.
