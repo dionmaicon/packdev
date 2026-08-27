@@ -296,8 +296,21 @@ export async function scanPassedOptionKeys(
   pkgName: string,
   cache?: ScanCache,
 ): Promise<Set<string>> {
-  const { symbols: importedSymbols } = await scanImportedSymbols(appDir, pkgName, cache);
-  if (importedSymbols.size === 0) return new Set();
+  const { symbols: importedSymbols, hasDynamicUsage } = await scanImportedSymbols(
+    appDir,
+    pkgName,
+    cache,
+  );
+  // A namespace import (`import * as wrapper from "pkg"`) or a bare
+  // CommonJS binding (`const wrapper = require("pkg")`, not destructured)
+  // reports hasDynamicUsage:true with an EMPTY symbol set — scanSourceFile
+  // can't attribute either to specific export names. Bailing out on
+  // importedSymbols.size alone would incorrectly treat "wrapper" as
+  // unimported here, missing calls like `wrapper.create({ handleMessage })`
+  // that collectLocalImportBindings below is otherwise fully able to find
+  // (it handles namespace imports and bare require bindings itself). Only
+  // bail out when there's truly no local binding to look for either way.
+  if (importedSymbols.size === 0 && !hasDynamicUsage) return new Set();
 
   const files = await getSourceFiles(appDir, cache);
   const optionKeys = new Set<string>();

@@ -3124,6 +3124,64 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot() {
+    await this.run('compat --fan-out ranks a bare (non-destructured) require() consumer that passes an object above one that does not', async () => {
+      // scanImportedSymbols reports a bare `const wrapper = require(pkg)`
+      // binding as hasDynamicUsage:true with an EMPTY symbol set — it can't
+      // attribute a non-destructured require to specific export names.
+      // scanPassedOptionKeys used to bail out whenever the symbol set was
+      // empty, regardless of hasDynamicUsage, making this consumer's real
+      // object-literal argument invisible to ranking. Both consumers here
+      // have symbolCount 0 (tied), so if the object-arg tiebreak is broken,
+      // the result silently falls back to alphabetical dir order instead —
+      // "no-object" sorts before "passes-object", which is the wrong order
+      // and the exact bug this test catches.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-bare-require-rank');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      const objectArgDir = path.join(monorepoRoot, 'packages', 'passes-object');
+      fs.mkdirSync(objectArgDir, { recursive: true });
+      writeJson(path.join(objectArgDir, 'package.json'), {
+        name: 'passes-object', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(objectArgDir, 'main.js'),
+        'const wrapper = require("wrapper");\nwrapper.create({ handleMessage: () => {} });\n',
+      );
+
+      const noObjectArgDir = path.join(monorepoRoot, 'packages', 'no-object');
+      fs.mkdirSync(noObjectArgDir, { recursive: true });
+      writeJson(path.join(noObjectArgDir, 'package.json'), {
+        name: 'no-object', version: '1.0.0', dependencies: { wrapper: '*' },
+      });
+      fs.writeFileSync(
+        path.join(noObjectArgDir, 'main.js'),
+        'const wrapper = require("wrapper");\nwrapper.create();\n',
+      );
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/passes-object', 'packages/no-object']);
+    });
+  }
+
   async testCompatFanOutExplicitListAcceptsNonDeclaringConsumer() {
     await this.run('compat --app wrapper,consumer accepts a consumer that never declares the package itself', async () => {
       // This is the escape-hatch half of the same gap: before the fix, an
@@ -4063,6 +4121,51 @@ class FeatureTests {
       assert.notStrictEqual(r.code, 0, 'expected a non-zero exit for an undeclared group member');
       assert.match(r.stderr, /fake-express/);
       assert.match(r.stderr, /not declared/i);
+    });
+  }
+
+  async testCompatGroupMissingMemberDoesNotTriggerWrapperHint() {
+    await this.run('compat does not apply the wrapper-reachability hint when the UNDECLARED name is a --group member, not the package under test', async () => {
+      // resolvePinTargets throws on the FIRST undeclared name in
+      // [pkgName, ...group], which can be a --group member rather than
+      // pkgName itself. The wrapper-reachability hint is specifically about
+      // reaching pkgName (fake-core here) transitively — a workspace that
+      // wraps the missing GROUP member (fake-express) has no bearing on
+      // that, and both of its suggested --app commands would just fail
+      // again with a different "not declared" error if followed.
+      const registryUrl = await this.buildFakeFamilyRegistry(['1.0.0', '2.0.0']);
+
+      const monorepoRoot = this.tmp('compat-group-missing-not-wrapper-hint');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-express': '1.0.0' },
+      });
+
+      const appDir = path.join(monorepoRoot, 'packages', 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-core': '1.0.0', 'fake-common': '1.0.0', wrapper: '*' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-core', '--versions', '2.0.0', '--group', 'fake-common,fake-express',
+        '--app', appDir, '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.match(json.error, /fake-express/);
+      assert.match(json.error, /not declared/i);
+      // Must not misattribute the missing GROUP member to a wrapper
+      // reachable for pkgName — wrapper here doesn't declare fake-core
+      // (the package actually under test) at all.
+      assert.doesNotMatch(json.error, /reaches it through/);
+      assert.doesNotMatch(json.error, /--app wrapper/);
     });
   }
 
@@ -5668,6 +5771,7 @@ module.exports = { realEntry };
       await this.testCompatRejectsExplicitAppListCombinedWithFanOut();
       await this.testCompatFanOutRejectsConsumerOutsideMonorepoRoot();
       await this.testCompatFanOutDiscoversOneHopWrapperConsumers();
+      await this.testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot();
       await this.testCompatFanOutExplicitListAcceptsNonDeclaringConsumer();
       await this.testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper();
       await this.testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage();
@@ -5692,6 +5796,7 @@ module.exports = { realEntry };
       await this.testCompatGroupWithoutFlagSurfacesMismatch();
       await this.testCompatGroupMovesFamilyTogether();
       await this.testCompatGroupErrorsOnUndeclaredMember();
+      await this.testCompatGroupMissingMemberDoesNotTriggerWrapperHint();
       await this.testCompatUndeclaredPackageNamesSiblingWorkspacesThatDeclareIt();
       await this.testCompatGroupComposesWithBisect();
       await this.testCompatBisectFindsBoundaryInFewerRuns();

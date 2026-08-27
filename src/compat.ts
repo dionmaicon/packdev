@@ -1192,16 +1192,21 @@ async function resolveRunContext(
     const missingName = /^"(.+)" is not declared/.exec(message)?.[1] ?? pkgName;
     const declaringWorkspaces = await findWorkspacesDeclaring(missingName, options.appDir);
     if (declaringWorkspaces.length > 0) {
-      // The primary must still declare the package directly — it anchors
-      // control resolution — but when it reaches the package transitively
-      // through a dependency on exactly one of these declarers, that
-      // declarer is a wrapper, and naming it beats a generic "declared in
-      // these workspaces" list that would otherwise point the user right
-      // back at the workspace whose build already passes. If the primary
-      // reaches it through MORE than one declarer, naming just the first
-      // one found would be an arbitrary, possibly wrong guess — fall back
-      // to the generic list instead of picking one.
-      const declaringVersions = new Map(declaringWorkspaces.map((w) => [w.name, w.version]));
+      // The wrapper hint below is specifically about REACHING pkgName
+      // (the package under test) transitively — it doesn't apply when the
+      // undeclared name is instead a --group member. resolvePinTargets
+      // throws on the first undeclared name in [pkgName, ...group], so
+      // missingName can be a group member; a workspace that wraps THAT
+      // member wouldn't necessarily declare pkgName at all, so both
+      // suggested --app commands below would just fail again with a
+      // different "not declared" error. Only special-case when pkgName
+      // itself is what's missing — otherwise fall through to the generic
+      // "declared in these workspaces" message, which is still correct
+      // (it just names where the missing group member lives).
+      const declaringVersions =
+        missingName === pkgName
+          ? new Map(declaringWorkspaces.map((w) => [w.name, w.version]))
+          : new Map<string, string | undefined>();
       const reachableWrapperNames = findDependencyNamesAmong(appPackageJson, declaringVersions);
       const wrapperName =
         reachableWrapperNames.length === 1 ? reachableWrapperNames[0] : undefined;
