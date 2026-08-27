@@ -314,30 +314,70 @@ interface LocalLinkTarget {
   dir: string;
 }
 
-// True when `spec` (a dependency's declared specifier, declared in a
-// package.json at `consumerDir`) actually resolves to `target` rather than
-// a same-named registry/alias/git package, or a `file:`/`link:` path that
-// merely happens to share the name. Local-workspace linking isn't gated on
-// the `workspace:` protocol string — npm/yarn classic auto-link a
-// same-named local workspace off a plain "*" or matching semver range too
-// — but a plain semver range only links locally when the local package's
-// own version actually satisfies it; otherwise the package manager
-// installs a separate copy from the registry, and an `npm:`/git/URL
-// specifier never resolves locally at all regardless of name. A
-// `file:`/`link:` specifier is a literal filesystem path — resolving it
-// relative to consumerDir and checking it lands ON target.dir is the only
-// way to tell "linked to the discovered workspace" apart from "linked to
-// some other, unrelated directory that happens to be named the same" (a
-// vendored copy, a decoy). `target.version` undefined (no "version" field
-// on the candidate) falls back to permissive for the plain-semver-range
-// case — this is expected to be rare enough in practice that failing open
-// beats a false negative.
+// True when `spec` (declared under dependency key `dependencyKey`, in a
+// package.json at `consumerDir`) actually resolves to `target` — found by
+// looking `dependencyKey` up in the candidates map, so `target`'s real name
+// IS `dependencyKey` by construction — rather than a same-named registry/
+// alias/git package, a `file:`/`link:` path that merely happens to share
+// the name, or a pnpm `workspace:<alias>@<range>` that aliases the key to a
+// DIFFERENT package entirely. Local-workspace linking isn't gated on the
+// `workspace:` protocol string — npm/yarn classic auto-link a same-named
+// local workspace off a plain "*" or matching semver range too — but a
+// plain semver range only links locally when the local package's own
+// version actually satisfies it; otherwise the package manager installs a
+// separate copy from the registry, and an `npm:`/git/URL specifier never
+// resolves locally at all regardless of name. `target.version` undefined
+// (no "version" field on the candidate) falls back to permissive for the
+// plain-semver-range case — this is expected to be rare enough in practice
+// that failing open beats a false negative.
+//
+// KNOWN LIMITATION, accepted rather than fixed: a satisfying plain semver
+// range is still not a hard guarantee under pnpm specifically — with
+// `linkWorkspacePackages` (pnpm-workspace.yaml or .npmrc) turned off, pnpm
+// installs the REGISTRY copy for a plain-range dependency even when the
+// local version would satisfy it, requiring the `workspace:` protocol to
+// force a local link instead. Detecting that would need reading pnpm's own
+// config (and knowing its version-specific defaults) — real effort for a
+// narrow case (opting out of pnpm's normal auto-link behavior is uncommon),
+// and the failure mode is a wasted --top slot on a consumer that trivially
+// passes against its own already-installed version, not a false negative
+// that hides a real break. The alternative of dropping plain-semver
+// acceptance entirely would fix pnpm's edge case by breaking the far more
+// common one: npm and yarn classic have no `workspace:`-equivalent
+// protocol at all, so plain semver/glob is the ONLY way those managers
+// ever auto-link a local workspace — this is deliberately left as a
+// documented tradeoff, not silently unhandled.
 function specifierLinksToLocalWorkspace(
   spec: string,
+  dependencyKey: string,
   consumerDir: string,
   target: LocalLinkTarget,
 ): boolean {
-  if (spec.startsWith("workspace:")) return true;
+  if (spec.startsWith("workspace:")) {
+    const payload = spec.slice("workspace:".length);
+    // Plain form (workspace:*, workspace:^, workspace:~, a bare semver
+    // range, or no payload at all) — resolves to the workspace matching
+    // the DEPENDENCY KEY's own name, which is exactly `target` here.
+    if (payload === "" || payload === "*" || payload === "^" || payload === "~") {
+      return true;
+    }
+    // A relative/absolute path target (pnpm supports `workspace:../other`)
+    // — a literal filesystem path, validated the same way as file:/link:.
+    if (payload.startsWith(".") || payload.startsWith("/")) {
+      return path.resolve(consumerDir, payload) === path.resolve(target.dir);
+    }
+    // Alias form (pnpm's `workspace:<name>@<range>`, e.g.
+    // `"wrapper": "workspace:other-package@*"`) — the dependency is
+    // actually linked to <name>, NOT to whatever `dependencyKey` happens
+    // to equal. If <name> differs from dependencyKey, this specifier
+    // doesn't link to `target` at all, even though the key matched it.
+    const aliasMatch = /^(@[^@/]+\/[^@]+|[^@]+)@(.+)$/.exec(payload);
+    if (aliasMatch) return aliasMatch[1] === dependencyKey;
+    // A bare semver range as the payload (no "@") also falls under the
+    // plain form above via semver.validRange, for anything not already
+    // handled — e.g. "workspace:1.2.3".
+    return semver.validRange(payload) !== null;
+  }
   if (spec.startsWith("file:") || spec.startsWith("link:")) {
     const targetPath = spec.slice(spec.indexOf(":") + 1);
     return path.resolve(consumerDir, targetPath) === path.resolve(target.dir);
@@ -366,7 +406,7 @@ function findDependencyNamesAmong(
     for (const [name, spec] of Object.entries(entries)) {
       const target = candidates.get(name);
       if (!target) continue;
-      if (specifierLinksToLocalWorkspace(spec, consumerDir, target)) found.add(name);
+      if (specifierLinksToLocalWorkspace(spec, name, consumerDir, target)) found.add(name);
     }
   }
   return [...found];

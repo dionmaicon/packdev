@@ -676,6 +676,49 @@ class FeatureTests {
     });
   }
 
+  async testApiTypeScriptResolutionCannotEscapePackageDirThroughAnInPackageReexport() {
+    await this.run('api does not follow a `export * from` inside an otherwise-contained .d.ts file outside the package dir', async () => {
+      // Validating only the manifest's OWN "types" field isn't enough:
+      // TypeScript's module resolution (noResolve: false) follows every
+      // `export ... from "spec"` INSIDE that file too. A package could ship
+      // a "types" pointing safely at its own index.d.ts, which itself
+      // re-exports from a path that escapes the package directory — the
+      // escape lives in file CONTENT, not a manifest field, so the earlier
+      // manifest-field containment check alone can't catch it.
+      const dir = this.tmp('api-escape-reexport-in-dts');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      // Outside evil-lib's own package dir (dir/node_modules/evil-lib) —
+      // if this function's name shows up in the report, the escape worked.
+      fs.writeFileSync(
+        path.join(dir, 'secret.d.ts'),
+        'export function superSecretLeakedFunction(): void;\n',
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        { name: 'evil-lib', version: '1.0.0', main: 'index.js', types: 'index.d.ts' },
+        {
+          'index.js': 'module.exports = {};',
+          // node_modules/evil-lib -> node_modules -> dir
+          'index.d.ts': 'export * from "../../secret";\nexport function safeFunction(): void;\n',
+        },
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.ok(
+        json.exports.some((e) => e.name === 'safeFunction'),
+        'a legitimate in-package export must still resolve normally',
+      );
+      assert.ok(
+        !json.exports.some((e) => e.name === 'superSecretLeakedFunction'),
+        'must never follow a re-export outside the package directory, even from otherwise-valid file content',
+      );
+    });
+  }
+
   async testApiResolvesExportEqualsAsDefault() {
     await this.run('api reports a TS "export = X" declaration as the default export', async () => {
       const dir = this.tmp('api-export-equals');
@@ -3291,6 +3334,62 @@ class FeatureTests {
     });
   }
 
+  async testCompatFanOutWorkspaceAliasPayloadMustMatchDependencyKeyName() {
+    await this.run('compat --fan-out rejects a workspace:<alias>@<range> specifier whose alias differs from the dependency key, even though the key matches a real tier-0 workspace', async () => {
+      // pnpm's workspace: protocol supports aliasing: "wrapper": "workspace:
+      // other-package@*" means "link the LOCAL WORKSPACE NAMED
+      // other-package under the local name wrapper" — the dependency key
+      // matching a real tier-0 workspace's name is a coincidence, not proof
+      // of linkage, when the payload aliases to a different package.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const monorepoRoot = this.tmp('compat-fanout-workspace-alias');
+      writeJson(path.join(monorepoRoot, 'package.json'), {
+        name: 'root', private: true, workspaces: ['packages/*'],
+      });
+
+      const wrapperDir = path.join(monorepoRoot, 'packages', 'wrapper');
+      fs.mkdirSync(wrapperDir, { recursive: true });
+      writeJson(path.join(wrapperDir, 'package.json'), {
+        name: 'wrapper', version: '1.0.0', dependencies: { 'fake-lib': '^1.0.0' },
+      });
+
+      // Unrelated workspace, NOT a tier-0 declarer of fake-lib — the actual
+      // alias target below.
+      const otherDir = path.join(monorepoRoot, 'packages', 'other-package');
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeJson(path.join(otherDir, 'package.json'), { name: 'other-package', version: '1.0.0' });
+
+      // Key "wrapper" name-matches the real tier-0 workspace, but the alias
+      // payload actually points this dependency at "other-package".
+      const aliasedConsumerDir = path.join(monorepoRoot, 'packages', 'aliased-consumer');
+      fs.mkdirSync(aliasedConsumerDir, { recursive: true });
+      writeJson(path.join(aliasedConsumerDir, 'package.json'), {
+        name: 'aliased-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'workspace:other-package@*' },
+      });
+
+      // Control: a real (non-aliased) workspace: dependency on wrapper.
+      const realConsumerDir = path.join(monorepoRoot, 'packages', 'real-consumer');
+      fs.mkdirSync(realConsumerDir, { recursive: true });
+      writeJson(path.join(realConsumerDir, 'package.json'), {
+        name: 'real-consumer', version: '1.0.0',
+        dependencies: { wrapper: 'workspace:*' },
+      });
+
+      const r = await runPackdev(wrapperDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', wrapperDir,
+        '--registry', registryUrl, '--test', 'node -e "process.exit(0)"', '--fan-out', '--json',
+      ]);
+      const json = parseJson(r.stdout, 'compat');
+      assert.deepStrictEqual(json.fanOutConsumers, ['packages/real-consumer']);
+    });
+  }
+
   async testCompatFanOutExplicitListAcceptsNonDeclaringConsumer() {
     await this.run('compat --app wrapper,consumer accepts a consumer that never declares the package itself', async () => {
       // This is the escape-hatch half of the same gap: before the fix, an
@@ -5804,6 +5903,7 @@ module.exports = { realEntry };
       await this.testApiExportsMapResolution();
       await this.testApiEntryPointCannotEscapePackageDirViaMaliciousTypesField();
       await this.testApiIntrospectCannotEscapePackageDirViaMaliciousMainField();
+      await this.testApiTypeScriptResolutionCannotEscapePackageDirThroughAnInPackageReexport();
       await this.testApiResolvesExportEqualsAsDefault();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();
@@ -5883,6 +5983,7 @@ module.exports = { realEntry };
       await this.testCompatFanOutRanksBareRequireConsumerPassingObjectAboveOneThatDoesNot();
       await this.testCompatFanOutUnnamedTier0WorkspaceIsNotDuplicatedIntoTier1();
       await this.testCompatFanOutFileSpecifierMustResolveToTheActualWorkspaceNotJustShareItsName();
+      await this.testCompatFanOutWorkspaceAliasPayloadMustMatchDependencyKeyName();
       await this.testCompatFanOutExplicitListAcceptsNonDeclaringConsumer();
       await this.testCompatFanOutPrimaryNotReachingPackageNamesTheWrapper();
       await this.testCompatPrimaryNotReachingPackageAtAllUsesGenericMessage();

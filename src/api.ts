@@ -12,6 +12,12 @@ import { fileExists, isDirectory, readJsonFile, resolveContainedPath, type Packa
 export interface ResolvedEntryPoint {
   jsPath: string;
   typesPath: string | null;
+  // The directory typesPath's own local re-exports must stay contained
+  // within — pkgDir for anything found in the package's own tree, or the
+  // @types/<pkg> package's own directory when typesPath came from that
+  // fallback (a legitimately different root than pkgDir). null alongside
+  // a null typesPath.
+  typesBoundaryDir: string | null;
 }
 
 export type ExportKind =
@@ -146,10 +152,12 @@ export async function resolveEntryPoint(
   }
 
   let typesPath: string | null = null;
+  let typesBoundaryDir: string | null = null;
   for (const candidate of candidates) {
     const absolute = await resolveContainedPath(pkgDir, candidate);
     if (absolute && (await fileExists(absolute))) {
       typesPath = absolute;
+      typesBoundaryDir = pkgDir;
       break;
     }
   }
@@ -165,11 +173,17 @@ export async function resolveEntryPoint(
       );
       const entry = typesPkgInfo?.types || typesPkgInfo?.typings || "index.d.ts";
       const absolute = await resolveContainedPath(typesPkgDir, entry);
-      if (absolute && (await fileExists(absolute))) typesPath = absolute;
+      if (absolute && (await fileExists(absolute))) {
+        typesPath = absolute;
+        // A legitimately different root than pkgDir — this file's own
+        // local re-exports must stay contained within the @types package's
+        // own directory, not pkgDir.
+        typesBoundaryDir = typesPkgDir;
+      }
     }
   }
 
-  return { jsPath, typesPath };
+  return { jsPath, typesPath, typesBoundaryDir };
 }
 
 // Every subpath key in a package.json "exports" map besides the root "."
@@ -221,7 +235,7 @@ export async function resolvePackageExportMap(
   const root = await resolveEntryPoint(pkgDir, packageInfo);
   if (root.typesPath) {
     hasTypes = true;
-    for (const symbol of extractExportMap(root.typesPath)) {
+    for (const symbol of extractExportMap(root.typesPath, root.typesBoundaryDir ?? pkgDir)) {
       exports.push({ ...symbol, subpath: "." });
     }
   }
@@ -230,7 +244,7 @@ export async function resolvePackageExportMap(
     const typesPath = await resolveSubpathTypesPath(pkgDir, packageInfo, subpath);
     if (!typesPath) continue;
     hasTypes = true;
-    for (const symbol of extractExportMap(typesPath)) {
+    for (const symbol of extractExportMap(typesPath, pkgDir)) {
       exports.push({ ...symbol, subpath });
     }
   }
@@ -277,13 +291,56 @@ function describeSymbol(
   }
 }
 
+// Validating the INITIAL entry point (resolveEntryPoint's own
+// resolveContainedPath calls) isn't enough on its own: with noResolve:false,
+// TypeScript's own resolver follows every `export ... from "spec"` inside
+// that file too, so a package's manifest could point "types" at a safe
+// in-package barrel that itself contains `export * from "../../secret"` —
+// content from OUTSIDE boundaryDir would still get read and its exports
+// reflected in the report. This CompilerHost constrains every module
+// TypeScript resolves while building the program to stay within
+// boundaryDir; anything outside is treated as unresolved (same as a
+// genuinely-missing file), not silently followed.
+function createContainedCompilerHost(
+  boundaryDir: string,
+  options: ts.CompilerOptions,
+): ts.CompilerHost {
+  const host = ts.createCompilerHost(options);
+  const resolvedBoundary = path.resolve(boundaryDir);
+  const isContained = (resolvedFileName: string): boolean => {
+    const rel = path.relative(resolvedBoundary, path.resolve(resolvedFileName));
+    return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  };
+
+  host.resolveModuleNames = (moduleNames, containingFile, _reusedNames, redirectedReference, opts) =>
+    moduleNames.map((moduleName) => {
+      const { resolvedModule } = ts.resolveModuleName(
+        moduleName,
+        containingFile,
+        opts,
+        host,
+        undefined,
+        redirectedReference,
+      );
+      if (!resolvedModule || !isContained(resolvedModule.resolvedFileName)) {
+        return undefined;
+      }
+      return resolvedModule;
+    });
+
+  return host;
+}
+
 /**
  * Extract the top-level exported functions/classes/interfaces/types from a
  * .d.ts file. Intentionally shallow — no deep member enumeration of class
  * methods — Phase 1 only answers "what's exported", not "what's on it".
+ * `boundaryDir` is the directory this file's own local re-exports must stay
+ * contained within (see createContainedCompilerHost) — pass the same value
+ * resolveEntryPoint reported as typesBoundaryDir alongside this typesPath.
  */
-export function extractExportMap(typesPath: string): ExportedSymbol[] {
-  const program = ts.createProgram([typesPath], {
+export function extractExportMap(typesPath: string, boundaryDir: string): ExportedSymbol[] {
+  const options: ts.CompilerOptions = {
     target: ts.ScriptTarget.Latest,
     module: ts.ModuleKind.ESNext,
     skipLibCheck: true,
@@ -294,7 +351,12 @@ export function extractExportMap(typesPath: string): ExportedSymbol[] {
     // `export { X } from "./client/client"`) — the module-kind-inferred
     // default (Bundler/Classic depending on TS version) does not.
     moduleResolution: ts.ModuleResolutionKind.Node10,
-  });
+  };
+  const program = ts.createProgram(
+    [typesPath],
+    options,
+    createContainedCompilerHost(boundaryDir, options),
+  );
 
   const sourceFile = program.getSourceFile(typesPath);
   if (!sourceFile) return [];
@@ -372,12 +434,17 @@ const JS_EXTENSION_TO_DECLARATION: Record<string, string> = {
 };
 
 // Resolves a *local* relative re-export specifier to the .d.ts file it
-// actually points at, or null if nothing on disk matches. Shared by
-// specifierResolves (which only needs a yes/no) and findUnresolvableReexports
-// (which needs the path itself, to recurse into it).
+// actually points at, or null if nothing on disk matches OR the resolved
+// path escapes `boundaryDir` (the same untrusted-manifest-content concern
+// as resolveContainedPath — an `export * from "../../secret"` inside an
+// otherwise-legitimate local file must not be followed any more than a
+// manifest field pointing there would be). Shared by specifierResolves
+// (which only needs a yes/no) and findUnresolvableReexports (which needs
+// the path itself, to recurse into it).
 async function resolveLocalReexportPath(
   specifier: string,
   fromFileDir: string,
+  boundaryDir: string,
 ): Promise<string | null> {
   const base = path.resolve(fromFileDir, specifier);
   const ext = path.extname(base);
@@ -386,7 +453,12 @@ async function resolveLocalReexportPath(
     ? [base.slice(0, -ext.length) + declarationExt, base, `${base}.d.ts`]
     : [base, `${base}.d.ts`, `${base}.ts`, path.join(base, "index.d.ts")];
   for (const candidate of candidates) {
-    if (await fileExists(candidate)) return candidate;
+    // candidate is already absolute — resolveContainedPath resolves its
+    // second argument against boundaryDir, and an absolute path short-
+    // circuits path.resolve to itself, so this validates containment
+    // exactly as intended without needing a separate absolute-path case.
+    const contained = await resolveContainedPath(boundaryDir, candidate);
+    if (contained && (await fileExists(contained))) return contained;
   }
   return null;
 }
@@ -423,7 +495,7 @@ async function bareSpecifierResolves(specifier: string, pkgDir: string): Promise
   // No "exports" map — the subpath is just a normal relative file/dir inside
   // the package, resolved the same way a local re-export target is.
   return (
-    (await resolveLocalReexportPath(`./${subpath}`, depDir)) !== null ||
+    (await resolveLocalReexportPath(`./${subpath}`, depDir, depDir)) !== null ||
     (await fileExists(path.join(depDir, subpath)))
   );
 }
@@ -472,7 +544,11 @@ export async function findUnresolvableReexports(
       if (!moduleSpecifier) continue;
 
       if (moduleSpecifier.startsWith(".") || moduleSpecifier.startsWith("/")) {
-        const localTarget = await resolveLocalReexportPath(moduleSpecifier, fromFileDir);
+        // Always pkgDir (the boundary this whole scan was called with),
+        // never fromFileDir — the containment boundary doesn't move as the
+        // recursion goes deeper into local files, it's the same package
+        // root throughout.
+        const localTarget = await resolveLocalReexportPath(moduleSpecifier, fromFileDir, pkgDir);
         if (localTarget) {
           await scan(localTarget);
           continue;
@@ -512,9 +588,9 @@ export async function findUnresolvableReexportsForPackage(
 ): Promise<UnresolvedReexports> {
   const result: UnresolvedReexports = { wildcard: false, namedUnresolved: new Set() };
 
-  const { typesPath } = await resolveEntryPoint(pkgDir, packageInfo);
+  const { typesPath, typesBoundaryDir } = await resolveEntryPoint(pkgDir, packageInfo);
   if (typesPath) {
-    const rootResult = await findUnresolvableReexports(typesPath, pkgDir);
+    const rootResult = await findUnresolvableReexports(typesPath, typesBoundaryDir ?? pkgDir);
     result.wildcard = result.wildcard || rootResult.wildcard;
     for (const name of rootResult.namedUnresolved) result.namedUnresolved.add(name);
   }
