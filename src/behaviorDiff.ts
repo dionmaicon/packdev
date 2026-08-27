@@ -18,7 +18,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as ts from "typescript";
-import { readJsonFile, fileExists, type PackageInfo } from "./utils";
+import { readJsonFile, fileExists, resolveContainedPath, type PackageInfo } from "./utils";
 import { downloadTarball, extractTarball, cleanupExtractedTarball, fetchPackageMetadata } from "./registry";
 import { resolveInstalledPackage, getInstalledVersion } from "./api";
 import { scanImportedSymbols, scanPassedOptionKeys } from "./appScan";
@@ -561,10 +561,21 @@ export async function runBehaviorDiff(
         dynamicUsageCaveat,
       );
     }
-    const fromEntryAbs = path.join(fromExtracted.packageDir, fromEntryRel);
-    const toEntryAbs = path.join(toExtracted.packageDir, toEntryRel);
+    // fromEntryRel/toEntryRel come from the tarball's OWN package.json
+    // ("main" or an "exports" condition) — untrusted registry content, not
+    // local input. A malicious/compromised package's manifest pointing at
+    // "../../../../etc/passwd" must not escape the extracted tarball and
+    // get its content read into this diff; resolveContainedPath rejects
+    // that the same way an unresolvable entry already degrades below.
+    const fromEntryAbs = resolveContainedPath(fromExtracted.packageDir, fromEntryRel);
+    const toEntryAbs = resolveContainedPath(toExtracted.packageDir, toEntryRel);
 
-    if (!(await fileExists(fromEntryAbs)) || !(await fileExists(toEntryAbs))) {
+    if (
+      !fromEntryAbs ||
+      !toEntryAbs ||
+      !(await fileExists(fromEntryAbs)) ||
+      !(await fileExists(toEntryAbs))
+    ) {
       return degradedReport(
         pkgName,
         fromVersion,

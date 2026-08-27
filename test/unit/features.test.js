@@ -607,6 +607,75 @@ class FeatureTests {
     });
   }
 
+  async testApiEntryPointCannotEscapePackageDirViaMaliciousTypesField() {
+    await this.run('api does not read outside the package dir when a "types" field escapes via ../ traversal (malicious/compromised package)', async () => {
+      // A package's manifest fields are untrusted content (they come from
+      // whatever was installed/downloaded, not from the local user) — a
+      // malicious or compromised package could declare "types" pointing
+      // outside its own directory. If that escape isn't blocked, `api`
+      // would read an arbitrary file elsewhere on disk and reflect its
+      // exports in the report.
+      const dir = this.tmp('api-escape-types');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      // Outside evil-lib's own package dir (dir/node_modules/evil-lib) —
+      // if this function's name shows up in the report, the escape worked.
+      fs.writeFileSync(
+        path.join(dir, 'secret.d.ts'),
+        'export function superSecretLeakedFunction(): void;\n',
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        {
+          name: 'evil-lib', version: '1.0.0', main: 'index.js',
+          types: '../../secret.d.ts', // node_modules/evil-lib -> node_modules -> dir
+        },
+        { 'index.js': 'module.exports = {};' },
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'api');
+      assert.strictEqual(
+        json.hasTypes, false,
+        'an escaping "types" path must be treated as unresolvable (as if absent), not followed outside the package dir',
+      );
+      assert.ok(
+        !json.exports.some((e) => e.name === 'superSecretLeakedFunction'),
+        'must never read/report a file outside the installed package directory',
+      );
+    });
+  }
+
+  async testApiIntrospectCannotEscapePackageDirViaMaliciousMainField() {
+    await this.run('api --introspect does not require() outside the package dir when "main" escapes via ../ traversal', async () => {
+      const dir = this.tmp('api-escape-main-introspect');
+      writeJson(path.join(dir, 'package.json'), { name: 'h', version: '1.0.0', dependencies: {} });
+      const markerPath = path.join(dir, 'evil-ran.marker');
+      // A file OUTSIDE evil-lib's own package dir with a side effect —
+      // if "main" escaping ever gets require()'d, this marker gets written.
+      fs.writeFileSync(
+        path.join(dir, 'secret.js'),
+        `require('fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran');\nmodule.exports = {};\n`,
+      );
+
+      writeNodeModulesPackage(
+        dir,
+        'evil-lib',
+        { name: 'evil-lib', version: '1.0.0', main: '../../secret.js' },
+        {}, // no index.js either — the safe fallback target doesn't exist
+      );
+
+      const r = await runPackdev(dir, ['api', 'evil-lib', '--introspect', '--json']);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      assert.ok(
+        !fs.existsSync(markerPath),
+        'an escaping "main" must never be require()\'d — the marker file outside the package dir must not have been written',
+      );
+    });
+  }
+
   async testApiResolvesExportEqualsAsDefault() {
     await this.run('api reports a TS "export = X" declaration as the default export', async () => {
       const dir = this.tmp('api-export-equals');
@@ -5521,6 +5590,8 @@ module.exports = { realEntry };
       await this.testApiHumanOutput();
       await this.testApiJsonShape();
       await this.testApiExportsMapResolution();
+      await this.testApiEntryPointCannotEscapePackageDirViaMaliciousTypesField();
+      await this.testApiIntrospectCannotEscapePackageDirViaMaliciousMainField();
       await this.testApiResolvesExportEqualsAsDefault();
       await this.testApiIncludesSubpathExports();
       await this.testApiNoTypesAvailable();

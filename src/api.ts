@@ -7,7 +7,7 @@
 
 import * as path from "path";
 import * as ts from "typescript";
-import { fileExists, isDirectory, readJsonFile, type PackageInfo } from "./utils";
+import { fileExists, isDirectory, readJsonFile, resolveContainedPath, type PackageInfo } from "./utils";
 
 export interface ResolvedEntryPoint {
   jsPath: string;
@@ -120,7 +120,12 @@ export async function resolveEntryPoint(
   pkgDir: string,
   packageInfo: PackageInfo,
 ): Promise<ResolvedEntryPoint> {
-  const jsPath = path.join(pkgDir, packageInfo.main || "index.js");
+  // A "main" that escapes pkgDir is treated the same as no "main" at all —
+  // fall back to the untainted default rather than a path outside the
+  // sandbox.
+  const jsPath =
+    resolveContainedPath(pkgDir, packageInfo.main || "index.js") ??
+    path.join(pkgDir, "index.js");
 
   const candidates: string[] = [];
   const exportsTypes = extractExportsTypes(packageInfo.exports);
@@ -142,8 +147,8 @@ export async function resolveEntryPoint(
 
   let typesPath: string | null = null;
   for (const candidate of candidates) {
-    const absolute = path.join(pkgDir, candidate);
-    if (await fileExists(absolute)) {
+    const absolute = resolveContainedPath(pkgDir, candidate);
+    if (absolute && (await fileExists(absolute))) {
       typesPath = absolute;
       break;
     }
@@ -159,8 +164,8 @@ export async function resolveEntryPoint(
         path.join(typesPkgDir, "package.json"),
       );
       const entry = typesPkgInfo?.types || typesPkgInfo?.typings || "index.d.ts";
-      const absolute = path.join(typesPkgDir, entry);
-      if (await fileExists(absolute)) typesPath = absolute;
+      const absolute = resolveContainedPath(typesPkgDir, entry);
+      if (absolute && (await fileExists(absolute))) typesPath = absolute;
     }
   }
 
@@ -193,7 +198,8 @@ async function resolveSubpathTypesPath(
   const exportsField = packageInfo.exports as Record<string, unknown>;
   const condition = findTypesCondition(exportsField[subpath]);
   if (!condition) return null;
-  const absolute = path.join(pkgDir, condition);
+  const absolute = resolveContainedPath(pkgDir, condition);
+  if (!absolute) return null;
   return (await fileExists(absolute)) ? absolute : null;
 }
 

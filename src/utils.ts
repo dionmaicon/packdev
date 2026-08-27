@@ -106,6 +106,38 @@ export function parseVersionRange(version: string): {
   return { operator: "", version };
 }
 
+/**
+ * Resolve `candidate` (typically a value read from a downloaded package's
+ * own manifest — "main"/"types"/"typings"/an "exports" condition — which is
+ * untrusted content from the registry, not from the local user) against
+ * `baseDir`, but only if the result stays within `baseDir`. Returns null
+ * when it would escape, so callers can treat it exactly as if the field had
+ * been absent instead of joining it into a path and reading/requiring
+ * whatever it points to.
+ *
+ * Without this, a malicious/compromised package's manifest containing e.g.
+ * `"main": "../../../../etc/passwd"` would let api/api-diff/behavior-diff
+ * read (and reflect in their output) or, under `api --introspect`,
+ * require() arbitrary files anywhere on disk — well beyond the
+ * already-accepted risk of running the downloaded package's own code.
+ *
+ * A plain lexical containment check (no realpath/symlink resolution) is
+ * enough here: every caller only ever applies this to paths under a
+ * tarball this process itself just extracted (registry.ts's
+ * extractTarball), and node-tar's default extraction (no preservePaths)
+ * already strips/refuses entries whose own path or symlink target would
+ * land outside the extraction root.
+ */
+export function resolveContainedPath(baseDir: string, candidate: string): string | null {
+  const resolvedBase = path.resolve(baseDir);
+  const resolved = path.resolve(resolvedBase, candidate);
+  const rel = path.relative(resolvedBase, resolved);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return null;
+  }
+  return resolved;
+}
+
 // File utilities
 export async function fileExists(filePath: string): Promise<boolean> {
   try {
