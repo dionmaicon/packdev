@@ -58,9 +58,11 @@ packdev dupes commander --json
 # {"duplicate":false,"copies":[{"path":"node_modules/commander","realpath":"…/node_modules/commander","version":"14.0.1","workspace":"."}], "workspacesDetected":[],"scannedWorkspaces":[]}
 ```
 
-`api-diff` never reports a resolvable-but-unverifiable export surface as a false ❌ — a barrel
-`.d.ts`, a re-export into a sibling package, or types provided by a separate `@types/*` package all
-downgrade to `null`/unresolved rather than asserting incompatibility it can't actually back up.
+Sometimes `api-diff` can't fully verify a package's types — a barrel `.d.ts` that re-exports from
+another file, types re-exported from a sibling package, or types that come from a separate
+`@types/*` package instead of the package itself. In those cases it never guesses ❌. It reports
+`null` (unresolved) instead, so a gap in static analysis is never mistaken for evidence that an
+upgrade breaks.
 
 ![API compatibility demo](assets/api-compat-demo.gif)
 
