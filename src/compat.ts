@@ -923,13 +923,31 @@ function truncate(output: string): string {
   return `...[truncated]...\n${output.slice(-MAX_OUTPUT_CHARS)}`;
 }
 
-function runCommand(
+// Every call site's `cwd` ultimately traces back to CLI-controlled input
+// (--app, or a path built from it) — canonicalize it with realpath before
+// handing it to spawn() as a working directory. realpath both resolves
+// `.`/`..`/symlinks and confirms the path genuinely exists as a real
+// filesystem entry, rather than trusting a syntactically-resolved path that
+// was never verified to be real. A cwd that fails to resolve reports as a
+// normal command failure (not installed/found), the same shape callers
+// already handle for a missing package manager binary.
+async function runCommand(
   command: string,
   args: string[],
   cwd: string,
 ): Promise<RunResult> {
+  let realCwd: string;
+  try {
+    realCwd = await fs.realpath(cwd);
+  } catch (error) {
+    return {
+      success: false,
+      exitCode: null,
+      output: truncate(`Working directory does not exist or is not accessible: ${cwd}\n${(error as Error).message}`),
+    };
+  }
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, shell: true });
+    const child = spawn(command, args, { cwd: realCwd, shell: true });
     let output = "";
     child.stdout?.on("data", (chunk) => (output += chunk.toString()));
     child.stderr?.on("data", (chunk) => (output += chunk.toString()));
@@ -983,19 +1001,9 @@ export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): 
 // itself fails (yarn isn't actually on PATH, corepack misconfigured, etc.):
 // the caller must keep treating that as unknown, not as classic.
 export async function resolveYarnVersionFromBinary(cwd: string): Promise<string | undefined> {
-  // `cwd` traces back to --app, a CLI argument — validate it resolves to a
-  // real, accessible directory before handing it to spawn() as a working
-  // directory, rather than assuming the caller already checked.
-  const resolvedCwd = path.resolve(cwd);
-  let stat;
-  try {
-    stat = await fs.stat(resolvedCwd);
-  } catch {
-    return undefined;
-  }
-  if (!stat.isDirectory()) return undefined;
-
-  const result = await runCommand("yarn", ["--version"], resolvedCwd);
+  // runCommand canonicalizes and validates `cwd` (traces back to --app, a
+  // CLI argument) before it ever reaches spawn().
+  const result = await runCommand("yarn", ["--version"], cwd);
   if (!result.success) return undefined;
   const version = result.output.trim().split("\n").pop()?.trim();
   return version && /^\d+\.\d+\.\d+/.test(version) ? version : undefined;
