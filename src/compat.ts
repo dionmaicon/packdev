@@ -983,7 +983,19 @@ export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): 
 // itself fails (yarn isn't actually on PATH, corepack misconfigured, etc.):
 // the caller must keep treating that as unknown, not as classic.
 export async function resolveYarnVersionFromBinary(cwd: string): Promise<string | undefined> {
-  const result = await runCommand("yarn", ["--version"], cwd);
+  // `cwd` traces back to --app, a CLI argument — validate it resolves to a
+  // real, accessible directory before handing it to spawn() as a working
+  // directory, rather than assuming the caller already checked.
+  const resolvedCwd = path.resolve(cwd);
+  let stat;
+  try {
+    stat = await fs.stat(resolvedCwd);
+  } catch {
+    return undefined;
+  }
+  if (!stat.isDirectory()) return undefined;
+
+  const result = await runCommand("yarn", ["--version"], resolvedCwd);
   if (!result.success) return undefined;
   const version = result.output.trim().split("\n").pop()?.trim();
   return version && /^\d+\.\d+\.\d+/.test(version) ? version : undefined;
@@ -1118,7 +1130,7 @@ export function parseTestRunCounts(output: string): TestRunCounts | undefined {
 // "testsRun: 0" for the whole report — that would raise PASS_WITH_NO_TESTS
 // even though the unparseable target may well have run real tests.
 function combineTestCounts(counts: (TestRunCounts | undefined)[]): TestRunCounts | undefined {
-  if (counts.length === 0 || counts.some((c) => c === undefined)) return undefined;
+  if (counts.length === 0 || counts.includes(undefined)) return undefined;
   const known = counts as TestRunCounts[];
   const sources = new Set(known.map((c) => c.source));
   // testsFailed itself must stay null unless EVERY target's failure count is
