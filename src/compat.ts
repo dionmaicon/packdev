@@ -947,7 +947,13 @@ async function runCommand(
     };
   }
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd: realCwd, shell: true });
+    // realCwd is canonicalized and confirmed to exist above (fs.realpath).
+    // A further containment check against a fixed "safe root" doesn't apply
+    // here by design — `compat --app <dir>` exists specifically to
+    // sandbox-test whatever directory its operator names, the same trust
+    // boundary as `cd <dir> && npm test` run by hand; there is no narrower
+    // root to validate against without breaking the command's own purpose.
+    const child = spawn(command, args, { cwd: realCwd, shell: true }); // NOSONAR(typescript:S8707)
     let output = "";
     child.stdout?.on("data", (chunk) => (output += chunk.toString()));
     child.stderr?.on("data", (chunk) => (output += chunk.toString()));
