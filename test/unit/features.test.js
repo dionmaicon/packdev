@@ -3906,15 +3906,43 @@ class FeatureTests {
   }
 
   async testCompatIgnoreScriptsSupportedHelper() {
-    await this.run('ignoreScriptsSupported: true for npm/pnpm and Yarn Classic, false for Yarn Berry', async () => {
+    await this.run('ignoreScriptsSupported: true for npm/pnpm and Yarn Classic, false for Yarn Berry and for an unresolved yarn version', async () => {
       const compat = require('../../dist/compat.js');
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), true);
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), true);
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), true);
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), false);
-      // Unknown version resolves to classic-compatible behavior rather than
-      // silently claiming unsupported for a manager we can't identify.
-      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), true);
+      // A bare yarn.lock with no packageManager field gives no version at
+      // all, and a Berry project can be set up exactly that way (.yarnrc.yml/
+      // yarnPath alone, no field) — so unknown must resolve to "unsupported"
+      // (safe: worst case is a real Classic project not getting the flag),
+      // never "assume classic" (unsafe: would pass Berry an option it
+      // rejects). See resolveYarnVersionFromBinary for how compat resolves
+      // this for real before calling ignoreScriptsSupported.
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), false);
+    });
+  }
+
+  async testCompatResolveYarnVersionFromBinaryHelper() {
+    await this.run('resolveYarnVersionFromBinary reads the real yarn binary version, undefined when the binary is unusable', async () => {
+      const compat = require('../../dist/compat.js');
+      const cwd = this.tmp('resolve-yarn-version-from-binary');
+      fs.mkdirSync(cwd, { recursive: true });
+
+      const realVersion = await compat.resolveYarnVersionFromBinary(cwd);
+      assert.match(realVersion, /^\d+\.\d+\.\d+/, `expected a real semver-like yarn version, got ${JSON.stringify(realVersion)}`);
+
+      // A directory where "yarn" can't be resolved as an executable at all
+      // (PATH stripped) must report unknown, not silently default to any
+      // particular generation.
+      const originalPath = process.env.PATH;
+      process.env.PATH = '';
+      try {
+        const unresolved = await compat.resolveYarnVersionFromBinary(cwd);
+        assert.strictEqual(unresolved, undefined);
+      } finally {
+        process.env.PATH = originalPath;
+      }
     });
   }
 
@@ -6122,6 +6150,7 @@ module.exports = { realEntry };
       await this.testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput();
       await this.testCompatIgnoreInstallScriptsBlocksCandidatePostinstall();
       await this.testCompatIgnoreScriptsSupportedHelper();
+      await this.testCompatResolveYarnVersionFromBinaryHelper();
       await this.testCompatParseTestRunCountsHelper();
       await this.testCompatTestScriptOnlyRunsStillGetHarnessAnalysis();
       await this.testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand();

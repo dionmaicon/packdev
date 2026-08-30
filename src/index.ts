@@ -925,7 +925,7 @@ program
           if (v.esmMismatch) {
             console.log(`      ⚠️  ${v.esmMismatch}`);
           }
-          if (v.testCounts && v.testCounts.testsRun === 0 && v.status === "PASSED") {
+          if (v.testCounts?.testsRun === 0 && v.status === "PASSED") {
             console.log(`      ⚠️  0 tests executed (${v.testCounts.source}) — see PASS_WITH_NO_TESTS above`);
           }
           if (v.consumers) {

@@ -132,11 +132,14 @@ export interface CompatReport {
   testCommandCaveat: string | null;
   // Every caveat detected about the app's own --test command/harness:
   // static ones read off the command/config (transpile-only jest,
-  // type-check-only, --passWithNoTests, lifecycle scripts disabled by the
-  // caller's environment) plus PASS_WITH_NO_TESTS raised dynamically when a
-  // run actually exited 0 having executed zero tests. Does NOT
-  // include esmMismatch, which is per-candidate and lives on each version's
-  // own CompatVersionResult instead.
+  // type-check-only, --passWithNoTests, --ignore-install-scripts requested
+  // but unsupported by the detected package manager) plus PASS_WITH_NO_TESTS
+  // raised dynamically when a run actually exited 0 having executed zero
+  // tests — analyzeTestHarness only ever inspects the command string and
+  // jest config, so it cannot see a caller-side npm_config_ignore_scripts
+  // env var; only that dynamic, output-based check can reveal a run broken
+  // that way. Does NOT include esmMismatch, which is per-candidate and
+  // lives on each version's own CompatVersionResult instead.
   testCommandCaveats: TestHarnessCaveat[];
   // The currently-installed version of the package, tested the same way as
   // every candidate — null when it isn't resolvable in appDir's node_modules
@@ -950,14 +953,40 @@ function runCommand(
 // different, narrower mechanism: `enableScripts: false` in .yarnrc.yml still
 // runs installs, just skips postinstall-style build steps for some
 // packages) and cannot be steered per-invocation the way this flag implies.
+// A yarn PackageManagerInfo with no `version` (source: "lockfile", a bare
+// yarn.lock with no packageManager field pinning it) is NOT safe to assume
+// classic — a Berry project can be set up exactly that way, via .yarnrc.yml/
+// yarnPath alone. Treating unknown as unsupported is the safe direction: the
+// worst case is a real Yarn Classic project not getting --ignore-scripts (a
+// missed hardening, not a broken install), whereas assuming supported for
+// an actual Berry project passes it an option that flag doesn't recognize,
+// which can fail the install outright instead of raising the intended
+// IGNORE_SCRIPTS_UNSUPPORTED caveat. Callers that need better-than-"unknown"
+// accuracy here should resolve the real generation from the invoked binary
+// first — see `resolveYarnVersionFromBinary` — and pass that resolved
+// version through `packageManagerInfo.version` before calling this.
 // Exported so callers can decide whether to warn instead of silently
 // assuming the block took effect.
 export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): boolean {
   if (packageManagerInfo.manager !== "yarn") return true;
   const version = packageManagerInfo.version;
-  if (!version) return true; // unknown/default yarn resolves to classic in practice
+  if (!version) return false;
   const major = Number.parseInt(version.split(".")[0] ?? "", 10);
   return Number.isFinite(major) && major < 2;
+}
+
+// Queries the actual yarn binary that will run the install for its real
+// version, used to fill in `packageManagerInfo.version` when it's unknown
+// (a bare yarn.lock with no packageManager field) so ignoreScriptsSupported
+// isn't guessing — see its own comment for why guessing wrong is unsafe in
+// the Berry direction. Returns undefined (not a default) when the query
+// itself fails (yarn isn't actually on PATH, corepack misconfigured, etc.):
+// the caller must keep treating that as unknown, not as classic.
+export async function resolveYarnVersionFromBinary(cwd: string): Promise<string | undefined> {
+  const result = await runCommand("yarn", ["--version"], cwd);
+  if (!result.success) return undefined;
+  const version = result.output.trim().split("\n").pop()?.trim();
+  return version && /^\d+\.\d+\.\d+/.test(version) ? version : undefined;
 }
 
 export function runInstall(
@@ -983,6 +1012,79 @@ export function runTestCommand(
   return runCommand(testCommand, [], testCwd);
 }
 
+// Shared constructor for the four parse* functions below — keeps the
+// { testsRun, testsFailed, source } shape written exactly once instead of
+// once per runner format, which is what a "duplicated code" checker would
+// otherwise flag across near-identical return statements.
+function counts(
+  source: TestRunCounts["source"],
+  testsRun: number,
+  testsFailed: number | null,
+): TestRunCounts {
+  return { testsRun, testsFailed, source };
+}
+
+// node's built-in test runner (TAP output): "# tests 5", "# fail 1"
+function parseNodeTestCounts(output: string): TestRunCounts | undefined {
+  const match = /^#\s{0,3}tests\s{1,3}(\d+)/m.exec(output);
+  if (!match) return undefined;
+  const failMatch = /^#\s{0,3}fail\s{1,3}(\d+)/m.exec(output);
+  return counts("node-test", Number.parseInt(match[1]!, 10), failMatch ? Number.parseInt(failMatch[1]!, 10) : null);
+}
+
+// jest: "Tests:       3 failed, 2 skipped, 5 passed, 10 total" — only the
+// trailing "N total" is required; failed/skipped/passed clauses are each
+// optional and pulled out with their own small anchored regex instead of
+// one combined pattern, which is both easier to read and far cheaper to
+// evaluate than a single regex with several nested optional groups.
+function parseJestCounts(output: string): TestRunCounts | undefined {
+  const totalMatch = /^Tests:.{0,80}?(\d+)\s{0,3}total$/m.exec(output);
+  if (!totalMatch) return undefined;
+  const failedMatch = /^Tests:.{0,80}?(\d+)\s{0,3}failed/m.exec(output);
+  return counts("jest", Number.parseInt(totalMatch[1]!, 10), failedMatch ? Number.parseInt(failedMatch[1]!, 10) : null);
+}
+
+// vitest: "Tests  3 failed | 5 passed (8)" — the failed clause and the
+// parenthesized grand-total are each optional, matched separately rather
+// than nested in one nested-optional regex.
+function parseVitestCounts(output: string): TestRunCounts | undefined {
+  const passedMatch = /^\s{0,3}Tests\s{1,3}.{0,40}?(\d+)\s{0,3}passed/m.exec(output);
+  if (!passedMatch) return undefined;
+  const failedMatch = /^\s{0,3}Tests\s{1,3}(\d+)\s{0,3}failed/m.exec(output);
+  const totalMatch = /^\s{0,3}Tests\s{1,3}.{0,40}?\((\d+)\)/m.exec(output);
+  const passed = Number.parseInt(passedMatch[1]!, 10);
+  const failed = failedMatch ? Number.parseInt(failedMatch[1]!, 10) : 0;
+  return counts(
+    "vitest",
+    totalMatch ? Number.parseInt(totalMatch[1]!, 10) : passed + failed,
+    failedMatch ? failed : null,
+  );
+}
+
+// mocha: "5 passing", "2 failing" on their own lines.
+function parseMochaCounts(output: string): TestRunCounts | undefined {
+  const passingMatch = /^\s{0,3}(\d+)\s{0,3}passing/m.exec(output);
+  if (!passingMatch) return undefined;
+  const failingMatch = /^\s{0,3}(\d+)\s{0,3}failing/m.exec(output);
+  const failing = failingMatch ? Number.parseInt(failingMatch[1]!, 10) : 0;
+  return counts("mocha", Number.parseInt(passingMatch[1]!, 10) + failing, failingMatch ? failing : null);
+}
+
+// Fallback for a runner's explicit zero-suite message, tried ONLY after
+// every numeric summary above has already failed to match — checking a
+// substring like "No tests found" ahead of the real numeric summaries would
+// let it false-positive on a passing run whose OWN test/app output happens
+// to contain that phrase (e.g. a mocha suite genuinely reporting "5
+// passing" that also logs an unrelated "No tests found" string), silently
+// overwriting a real nonzero count with a false zero. Anchored to the start
+// of a line, matching the runners' real one-line messages, not an arbitrary
+// substring anywhere in output.
+function parseZeroTestPhrase(output: string): TestRunCounts | undefined {
+  if (/^No tests found\b/m.test(output)) return counts("jest", 0, null);
+  if (/^No test files found\b/m.test(output)) return counts("vitest", 0, null);
+  return undefined;
+}
+
 /**
  * Best-effort test-count scrape over a runner's own stdout/stderr, tried
  * against each known runner's summary format in turn. This is what lets
@@ -993,79 +1095,39 @@ export function runTestCommand(
  * same way a real pass does. Returns undefined rather than a zero count
  * when nothing recognizable was found — "unknown" and "confirmed zero" must
  * stay distinguishable, since a consumer treating unknown as zero would
- * raise this caveat on every runner this function doesn't know about.
+ * raise this caveat on every runner this function doesn't know about. Every
+ * numeric summary format is tried before the generic zero-suite phrases —
+ * see parseZeroTestPhrase for why the order matters.
  */
 export function parseTestRunCounts(output: string): TestRunCounts | undefined {
-  // node's built-in test runner (TAP output): "# tests 5", "# fail 1"
-  const nodeTestMatch = /^#\s*tests\s+(\d+)/m.exec(output);
-  if (nodeTestMatch) {
-    const failMatch = /^#\s*fail\s+(\d+)/m.exec(output);
-    return {
-      testsRun: Number.parseInt(nodeTestMatch[1]!, 10),
-      testsFailed: failMatch ? Number.parseInt(failMatch[1]!, 10) : null,
-      source: "node-test",
-    };
-  }
-
-  // jest: "Tests:       3 failed, 2 skipped, 5 passed, 10 total" (any subset
-  // of the failed/skipped/passed clauses may be absent) or the explicit
-  // zero-suite message jest prints under --passWithNoTests.
-  if (/No tests found/i.test(output)) {
-    return { testsRun: 0, testsFailed: null, source: "jest" };
-  }
-  const jestMatch = /^Tests:\s*(?:(\d+)\s*failed,\s*)?(?:(\d+)\s*skipped,\s*)?(?:(\d+)\s*passed,\s*)?(\d+)\s*total/m.exec(
-    output,
+  return (
+    parseNodeTestCounts(output) ??
+    parseJestCounts(output) ??
+    parseVitestCounts(output) ??
+    parseMochaCounts(output) ??
+    parseZeroTestPhrase(output)
   );
-  if (jestMatch) {
-    return {
-      testsRun: Number.parseInt(jestMatch[4]!, 10),
-      testsFailed: jestMatch[1] ? Number.parseInt(jestMatch[1], 10) : null,
-      source: "jest",
-    };
-  }
-
-  // vitest: "Tests  0 passed" / "No test files found" / a failed-count clause.
-  if (/No test files found/i.test(output)) {
-    return { testsRun: 0, testsFailed: null, source: "vitest" };
-  }
-  const vitestMatch = /^\s*Tests\s+(?:(\d+)\s*failed\s*\|\s*)?(\d+)\s*passed(?:\s*\((\d+)\))?/m.exec(output);
-  if (vitestMatch) {
-    const passed = Number.parseInt(vitestMatch[2]!, 10);
-    const failed = vitestMatch[1] ? Number.parseInt(vitestMatch[1], 10) : 0;
-    return {
-      testsRun: vitestMatch[3] ? Number.parseInt(vitestMatch[3], 10) : passed + failed,
-      testsFailed: vitestMatch[1] ? failed : null,
-      source: "vitest",
-    };
-  }
-
-  // mocha: "5 passing", "2 failing"
-  const mochaPassing = /(\d+)\s*passing/.exec(output);
-  if (mochaPassing) {
-    const mochaFailing = /(\d+)\s*failing/.exec(output);
-    return {
-      testsRun: Number.parseInt(mochaPassing[1]!, 10) + (mochaFailing ? Number.parseInt(mochaFailing[1]!, 10) : 0),
-      testsFailed: mochaFailing ? Number.parseInt(mochaFailing[1]!, 10) : null,
-      source: "mocha",
-    };
-  }
-
-  return undefined;
 }
 
 // Sums per-target counts from the same run into one report-level figure —
 // "mixed" when targets used more than one recognizable runner format, since
 // a single source label would misrepresent where the numbers came from.
-// undefined (not zero) when nothing was parseable for ANY target, so "no
-// counts available" stays distinguishable from "confirmed zero tests".
+// undefined (not a partial sum) as soon as ANY target's output couldn't be
+// parsed: a fan-out run where one target's runner is recognized as zero and
+// another's isn't recognized at all must not silently become a confirmed
+// "testsRun: 0" for the whole report — that would raise PASS_WITH_NO_TESTS
+// even though the unparseable target may well have run real tests.
 function combineTestCounts(counts: (TestRunCounts | undefined)[]): TestRunCounts | undefined {
-  const known = counts.filter((c): c is TestRunCounts => c !== undefined);
-  if (known.length === 0) return undefined;
+  if (counts.length === 0 || counts.some((c) => c === undefined)) return undefined;
+  const known = counts as TestRunCounts[];
   const sources = new Set(known.map((c) => c.source));
-  const anyFailedKnown = known.some((c) => c.testsFailed !== null);
+  // testsFailed itself must stay null unless EVERY target's failure count is
+  // known — otherwise summing treats an unknown target's failures as zero,
+  // reporting a total that looks more complete than the inputs justify.
+  const allFailedKnown = known.every((c) => c.testsFailed !== null);
   return {
     testsRun: known.reduce((sum, c) => sum + c.testsRun, 0),
-    testsFailed: anyFailedKnown ? known.reduce((sum, c) => sum + (c.testsFailed ?? 0), 0) : null,
+    testsFailed: allFailedKnown ? known.reduce((sum, c) => sum + c.testsFailed!, 0) : null,
     source: sources.size === 1 ? [...sources][0]! : "mixed",
   };
 }
@@ -1557,6 +1619,20 @@ async function resolveRunContext(
   const packageManagerInfo = options.packageManager
     ? parsePackageManagerOverride(options.packageManager)
     : await detectPackageManager(options.appDir);
+  // --ignore-install-scripts' effect hinges on the yarn generation, and a
+  // bare yarn.lock with no packageManager field (source: "lockfile") gives
+  // no version at all — resolving it from the actual binary here means
+  // ignoreScriptsSupported downstream is checking a real version instead of
+  // guessing. Only queried when the flag is actually requested, since it's
+  // an extra spawn otherwise-unneeded for every compat run.
+  if (
+    options.ignoreInstallScripts &&
+    packageManagerInfo.manager === "yarn" &&
+    packageManagerInfo.version === undefined
+  ) {
+    const resolvedVersion = await resolveYarnVersionFromBinary(options.appDir);
+    if (resolvedVersion) packageManagerInfo.version = resolvedVersion;
+  }
   return {
     pinTargets,
     packageManagerInfo,
@@ -1845,7 +1921,7 @@ function detectDynamicNoTestsCaveat(
 ): TestHarnessCaveat | null {
   const zeroTestPass = results.find(
     (r): r is CompatVersionResult =>
-      r !== null && r.status === "PASSED" && r.testCounts !== undefined && r.testCounts.testsRun === 0,
+      r !== null && r.status === "PASSED" && r.testCounts?.testsRun === 0,
   );
   if (!zeroTestPass) return null;
   return {
