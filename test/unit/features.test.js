@@ -202,6 +202,28 @@ async function buildFakeTarball(files) {
   return buffer;
 }
 
+// A minimal fake-lib@1.0.0 registry + app declaring it as a dependency —
+// the common starting point for a single-version compat run. Optionally
+// gives fake-lib a postinstall script (both in its own package.json and in
+// the registry's packument, since npm decides whether to run lifecycle
+// scripts from the fetched packument, not the extracted tarball).
+async function setupSingleVersionFakeLibApp(suite, tmpName, { postinstallScript } = {}) {
+  const scripts = postinstallScript ? { postinstall: postinstallScript } : undefined;
+  const v1 = await buildFakeTarball({
+    'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', ...(scripts ? { scripts } : {}) }),
+    'index.js': 'module.exports = {};',
+  });
+  const registryUrl = await suite.registry('fake-lib', {
+    '1.0.0': { tarballBuffer: v1, ...(scripts ? { scripts } : {}) },
+  });
+  const appDir = suite.tmp(tmpName);
+  writeJson(path.join(appDir, 'package.json'), {
+    name: 'app', version: '1.0.0',
+    dependencies: { 'fake-lib': '^1.0.0' },
+  });
+  return { appDir, registryUrl };
+}
+
 // Fake npm registry serving package docs + tarballs for `packages`
 // ({ [pkgName]: { [version]: { tarballBuffer, deprecated? } } }), so a single
 // server can serve both a package and its @types/<pkg> counterpart. No real
@@ -3834,17 +3856,7 @@ class FeatureTests {
       // the command string itself is jest-shaped, so the EXISTING static
       // analyzeTestHarness heuristics have nothing to pattern-match; only
       // parsing the real "# tests 0" TAP output can catch this.
-      const v1 = await buildFakeTarball({
-        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
-        'index.js': 'module.exports = {};',
-      });
-      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
-
-      const appDir = this.tmp('compat-dynamic-pass-with-no-tests');
-      writeJson(path.join(appDir, 'package.json'), {
-        name: 'app', version: '1.0.0',
-        dependencies: { 'fake-lib': '^1.0.0' },
-      });
+      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-dynamic-pass-with-no-tests');
       // No *.test.js file exists anywhere — node's own test runner finds
       // nothing to run and exits 0.
 
@@ -3866,21 +3878,8 @@ class FeatureTests {
       // A postinstall that fails is directly observable as INSTALL_FAILED
       // vs PASSED — proof the script did or didn't run, without needing to
       // inspect the sandbox's filesystem after cleanup.
-      const v1 = await buildFakeTarball({
-        'package.json': JSON.stringify({
-          name: 'fake-lib', version: '1.0.0', main: 'index.js',
-          scripts: { postinstall: 'node -e "process.exit(1)"' },
-        }),
-        'index.js': 'module.exports = {};',
-      });
-      const registryUrl = await this.registry('fake-lib', {
-        '1.0.0': { tarballBuffer: v1, scripts: { postinstall: 'node -e "process.exit(1)"' } },
-      });
-
-      const appDir = this.tmp('compat-ignore-install-scripts');
-      writeJson(path.join(appDir, 'package.json'), {
-        name: 'app', version: '1.0.0',
-        dependencies: { 'fake-lib': '^1.0.0' },
+      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-ignore-install-scripts', {
+        postinstallScript: 'node -e "process.exit(1)"',
       });
       fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
 
