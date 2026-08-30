@@ -775,6 +775,11 @@ program
     false,
   )
   .option(
+    "--ignore-install-scripts",
+    "Block lifecycle scripts (preinstall/install/postinstall) during compat's own sandbox install — the candidate version is arbitrary registry code, so a triage bot testing a proposed bump may want it inert. Scoped to the install step only: the --test phase still runs with normal npm lifecycle behavior, so the app's own pretest/prebuild hooks fire and the verdict stays meaningful (unlike setting npm_config_ignore_scripts in the caller's own environment, which would suppress those hooks too). Off by default — install scripts are load-bearing for native packages (esbuild, sharp, better-sqlite3), so blocking them can turn a healthy version into a false FAILED. Has no effect under Yarn Berry, which has no such install flag; see testCommandCaveats' IGNORE_SCRIPTS_UNSUPPORTED.",
+    false,
+  )
+  .option(
     "--seed-lockfile",
     "Copy the app's own lockfile into every sandbox before install, reproducing real resolution stickiness instead of a fresh solve — recommended with --check-dupes, which otherwise under-reports nested-fork duplicates a fresh solve re-flattens away. Less hermetic: a stale lockfile can mask a resolution a clean install would surface.",
     false,
@@ -834,6 +839,7 @@ program
         concurrency: Number(options.concurrency) || 1,
         preferOffline: !!options.preferOffline,
         checkDupes: !!options.checkDupes,
+        ignoreInstallScripts: !!options.ignoreInstallScripts,
         seedLockfile: !!options.seedLockfile,
         consumerApps: consumerApps.length > 0 ? consumerApps : undefined,
         fanOut: !!options.fanOut,
@@ -918,6 +924,9 @@ program
           }
           if (v.esmMismatch) {
             console.log(`      ⚠️  ${v.esmMismatch}`);
+          }
+          if (v.testCounts && v.testCounts.testsRun === 0 && v.status === "PASSED") {
+            console.log(`      ⚠️  0 tests executed (${v.testCounts.source}) — see PASS_WITH_NO_TESTS above`);
           }
           if (v.consumers) {
             for (const c of v.consumers) {

@@ -43,6 +43,22 @@ export interface DupesRegressionEntry {
   candidateCopies: number;
 }
 
+/**
+ * Best-effort test counts scraped from the runner's own output. Present
+ * ONLY when a known runner's summary was confidently parsed — absent is
+ * "we could not tell", never "zero". A consumer gating an auto-merge on
+ * `testsRun > 0` must therefore treat `undefined` as unknown and fall back
+ * to its own policy, not read it as a pass.
+ */
+export interface TestRunCounts {
+  testsRun: number;
+  // null when the runner reports a total but not a failure count.
+  testsFailed: number | null;
+  // Which runner's summary format produced these numbers; "mixed" when
+  // fan-out targets used more than one runner and the numbers are a sum.
+  source: "node-test" | "jest" | "vitest" | "mocha" | "mixed";
+}
+
 export interface CompatVersionResult {
   version: string;
   status: CompatStatus;
@@ -67,6 +83,10 @@ export interface CompatVersionResult {
   // necessarily per-version: a package can go ESM-only in exactly one
   // candidate, not the whole range.
   esmMismatch?: string | undefined;
+  // Best-effort count of tests the harness actually executed for this
+  // version, summed across every fan-out target — see TestRunCounts.
+  // Absent when no known runner summary could be parsed.
+  testCounts?: TestRunCounts | undefined;
   // Set only when fan-out (--app with multiple targets, or --fan-out) is
   // active: one entry per tested consumer, including the primary --app
   // itself (dir "."), each run against this same already-installed
@@ -89,7 +109,8 @@ export interface ConsumerTestResult {
 export type TestHarnessCaveatCode =
   | "TRANSPILE_ONLY"
   | "TYPE_CHECK_ONLY"
-  | "PASS_WITH_NO_TESTS";
+  | "PASS_WITH_NO_TESTS"
+  | "IGNORE_SCRIPTS_UNSUPPORTED";
 
 export interface TestHarnessCaveat {
   code: TestHarnessCaveatCode;
@@ -109,8 +130,11 @@ export interface CompatReport {
   // The first entry of testCommandCaveats' message, or null — kept for
   // back-compat with agents/scripts already reading this scalar field.
   testCommandCaveat: string | null;
-  // Every static caveat detected about the app's own --test command/harness
-  // (transpile-only jest, type-check-only, --passWithNoTests). Does NOT
+  // Every caveat detected about the app's own --test command/harness:
+  // static ones read off the command/config (transpile-only jest,
+  // type-check-only, --passWithNoTests, lifecycle scripts disabled by the
+  // caller's environment) plus PASS_WITH_NO_TESTS raised dynamically when a
+  // run actually exited 0 having executed zero tests. Does NOT
   // include esmMismatch, which is per-candidate and lives on each version's
   // own CompatVersionResult instead.
   testCommandCaveats: TestHarnessCaveat[];
@@ -170,6 +194,17 @@ export interface CompatOptions {
   snapshotDir?: string | undefined;
   concurrency?: number | undefined;
   preferOffline?: boolean | undefined;
+  // Block lifecycle scripts (preinstall/install/postinstall) of the
+  // packages being installed into the sandbox — the candidate version under
+  // test is arbitrary registry code, so a triage bot testing a proposed bump
+  // wants it inert. Scoped to compat's OWN install step only: the --test
+  // phase still runs with normal npm lifecycle behavior, so the app's own
+  // pretest/prebuild hooks fire and the verdict stays meaningful. Off by
+  // default because install scripts are load-bearing for native packages
+  // (esbuild, sharp, better-sqlite3) where blocking them turns a healthy
+  // version into a false FAILED, which is exactly as misleading as the
+  // false PASSED this flag exists to prevent.
+  ignoreInstallScripts?: boolean | undefined;
   checkDupes?: boolean | undefined;
   // Copy the source app's own lockfile into every sandbox before install,
   // reproducing real resolution stickiness instead of a fresh solve. Off by
@@ -908,18 +943,37 @@ function runCommand(
   });
 }
 
+// Whether `runInstall`'s ignoreScripts request could actually be honored for
+// this manager/version: npm and pnpm both support --ignore-scripts on every
+// version we support. Yarn Classic (1.x) supports --ignore-scripts too, but
+// Yarn Berry (2+) has no such flag — it disables *build* scripts (a
+// different, narrower mechanism: `enableScripts: false` in .yarnrc.yml still
+// runs installs, just skips postinstall-style build steps for some
+// packages) and cannot be steered per-invocation the way this flag implies.
+// Exported so callers can decide whether to warn instead of silently
+// assuming the block took effect.
+export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): boolean {
+  if (packageManagerInfo.manager !== "yarn") return true;
+  const version = packageManagerInfo.version;
+  if (!version) return true; // unknown/default yarn resolves to classic in practice
+  const major = Number.parseInt(version.split(".")[0] ?? "", 10);
+  return Number.isFinite(major) && major < 2;
+}
+
 export function runInstall(
   sandboxDir: string,
-  manager: PackageManagerInfo["manager"],
+  packageManagerInfo: PackageManagerInfo,
   registryUrl?: string,
   preferOffline?: boolean,
+  ignoreScripts?: boolean,
 ): Promise<RunResult> {
   const args = [
     "install",
     ...(registryUrl ? ["--registry", registryUrl] : []),
     ...(preferOffline ? ["--prefer-offline"] : []),
+    ...(ignoreScripts && ignoreScriptsSupported(packageManagerInfo) ? ["--ignore-scripts"] : []),
   ];
-  return runCommand(manager, args, sandboxDir);
+  return runCommand(packageManagerInfo.manager, args, sandboxDir);
 }
 
 export function runTestCommand(
@@ -927,6 +981,93 @@ export function runTestCommand(
   testCommand: string,
 ): Promise<RunResult> {
   return runCommand(testCommand, [], testCwd);
+}
+
+/**
+ * Best-effort test-count scrape over a runner's own stdout/stderr, tried
+ * against each known runner's summary format in turn. This is what lets
+ * PASS_WITH_NO_TESTS fire dynamically (a run that exits 0 having executed
+ * zero tests) instead of only pattern-matching the --test/--test-script
+ * string beforehand — a build step that silently feeds an empty suite to
+ * the runner is otherwise invisible until this point, since it exits 0 the
+ * same way a real pass does. Returns undefined rather than a zero count
+ * when nothing recognizable was found — "unknown" and "confirmed zero" must
+ * stay distinguishable, since a consumer treating unknown as zero would
+ * raise this caveat on every runner this function doesn't know about.
+ */
+export function parseTestRunCounts(output: string): TestRunCounts | undefined {
+  // node's built-in test runner (TAP output): "# tests 5", "# fail 1"
+  const nodeTestMatch = /^#\s*tests\s+(\d+)/m.exec(output);
+  if (nodeTestMatch) {
+    const failMatch = /^#\s*fail\s+(\d+)/m.exec(output);
+    return {
+      testsRun: Number.parseInt(nodeTestMatch[1]!, 10),
+      testsFailed: failMatch ? Number.parseInt(failMatch[1]!, 10) : null,
+      source: "node-test",
+    };
+  }
+
+  // jest: "Tests:       3 failed, 2 skipped, 5 passed, 10 total" (any subset
+  // of the failed/skipped/passed clauses may be absent) or the explicit
+  // zero-suite message jest prints under --passWithNoTests.
+  if (/No tests found/i.test(output)) {
+    return { testsRun: 0, testsFailed: null, source: "jest" };
+  }
+  const jestMatch = /^Tests:\s*(?:(\d+)\s*failed,\s*)?(?:(\d+)\s*skipped,\s*)?(?:(\d+)\s*passed,\s*)?(\d+)\s*total/m.exec(
+    output,
+  );
+  if (jestMatch) {
+    return {
+      testsRun: Number.parseInt(jestMatch[4]!, 10),
+      testsFailed: jestMatch[1] ? Number.parseInt(jestMatch[1], 10) : null,
+      source: "jest",
+    };
+  }
+
+  // vitest: "Tests  0 passed" / "No test files found" / a failed-count clause.
+  if (/No test files found/i.test(output)) {
+    return { testsRun: 0, testsFailed: null, source: "vitest" };
+  }
+  const vitestMatch = /^\s*Tests\s+(?:(\d+)\s*failed\s*\|\s*)?(\d+)\s*passed(?:\s*\((\d+)\))?/m.exec(output);
+  if (vitestMatch) {
+    const passed = Number.parseInt(vitestMatch[2]!, 10);
+    const failed = vitestMatch[1] ? Number.parseInt(vitestMatch[1], 10) : 0;
+    return {
+      testsRun: vitestMatch[3] ? Number.parseInt(vitestMatch[3], 10) : passed + failed,
+      testsFailed: vitestMatch[1] ? failed : null,
+      source: "vitest",
+    };
+  }
+
+  // mocha: "5 passing", "2 failing"
+  const mochaPassing = /(\d+)\s*passing/.exec(output);
+  if (mochaPassing) {
+    const mochaFailing = /(\d+)\s*failing/.exec(output);
+    return {
+      testsRun: Number.parseInt(mochaPassing[1]!, 10) + (mochaFailing ? Number.parseInt(mochaFailing[1]!, 10) : 0),
+      testsFailed: mochaFailing ? Number.parseInt(mochaFailing[1]!, 10) : null,
+      source: "mocha",
+    };
+  }
+
+  return undefined;
+}
+
+// Sums per-target counts from the same run into one report-level figure —
+// "mixed" when targets used more than one recognizable runner format, since
+// a single source label would misrepresent where the numbers came from.
+// undefined (not zero) when nothing was parseable for ANY target, so "no
+// counts available" stays distinguishable from "confirmed zero tests".
+function combineTestCounts(counts: (TestRunCounts | undefined)[]): TestRunCounts | undefined {
+  const known = counts.filter((c): c is TestRunCounts => c !== undefined);
+  if (known.length === 0) return undefined;
+  const sources = new Set(known.map((c) => c.source));
+  const anyFailedKnown = known.some((c) => c.testsFailed !== null);
+  return {
+    testsRun: known.reduce((sum, c) => sum + c.testsRun, 0),
+    testsFailed: anyFailedKnown ? known.reduce((sum, c) => sum + (c.testsFailed ?? 0), 0) : null,
+    source: sources.size === 1 ? [...sources][0]! : "mixed",
+  };
 }
 
 /**
@@ -1092,9 +1233,10 @@ async function testOneVersion(
 
     const installResult = await runInstall(
       sandboxDir,
-      packageManagerInfo.manager,
+      packageManagerInfo,
       options.registryUrl,
       options.preferOffline,
+      options.ignoreInstallScripts,
     );
     if (!installResult.success) {
       return {
@@ -1139,6 +1281,7 @@ async function testOneVersion(
 
     const testCwd = path.join(sandboxDir, testCwdRelative);
     const testResult = await runTestCommand(testCwd, effectiveTestCommand);
+    const testCountsByTarget: (TestRunCounts | undefined)[] = [parseTestRunCounts(testResult.output)];
 
     let consumers: ConsumerTestResult[] | undefined;
     // The exitCode/output a caller sees when `status` is the fan-out
@@ -1177,6 +1320,7 @@ async function testOneVersion(
       for (const consumer of consumerTargets) {
         const consumerCwd = path.join(sandboxDir, consumer.relativePath);
         const consumerResult = await runTestCommand(consumerCwd, effectiveTestCommand);
+        testCountsByTarget.push(parseTestRunCounts(consumerResult.output));
         const consumerPackageJson = await readJsonFile<PackageJson & { name?: string }>(
           path.join(consumerCwd, "package.json"),
         );
@@ -1207,6 +1351,7 @@ async function testOneVersion(
       lockfileSnapshotPath: snapshot.path,
       dupeCounts,
       esmMismatch,
+      testCounts: combineTestCounts(testCountsByTarget),
       consumers,
     };
   } finally {
@@ -1483,6 +1628,16 @@ async function analyzeTestHarnessAcrossTargets(
   consumerTargets: ResolvedConsumerTarget[],
 ): Promise<TestHarnessCaveat[]> {
   const merged = new Map<string, TestHarnessCaveat>();
+  if (options.ignoreInstallScripts && !ignoreScriptsSupported(packageManagerInfo)) {
+    merged.set("IGNORE_SCRIPTS_UNSUPPORTED", {
+      code: "IGNORE_SCRIPTS_UNSUPPORTED",
+      severity: "warning",
+      message:
+        `--ignore-install-scripts has no effect for ${formatPackageManager(packageManagerInfo)} — ` +
+        "Yarn Berry has no --ignore-scripts install flag, so the candidate's own install scripts " +
+        "still ran unblocked in the sandbox",
+    });
+  }
   const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
   for (const caveat of await analyzeTestHarness(options.appDir, primaryCommand)) {
     merged.set(caveat.code, caveat);
@@ -1674,6 +1829,43 @@ async function resolveEsmCheckContext(
   return { consumerIsCjsBlind: true, controlInfo };
 }
 
+/**
+ * PASS_WITH_NO_TESTS raised dynamically from what a run actually did,
+ * complementing analyzeTestHarness's static pattern-match over the command
+ * string — a build step that silently feeds an empty suite to the runner
+ * (e.g. --ignore-scripts skipping the `pretest` compile a suite depends on)
+ * is invisible to the static check, but exits 0 having run zero tests just
+ * like the static case does. Checks control + every candidate; the caveat
+ * names whichever version tripped it first since testCommandCaveats is a
+ * report-level merged list, not attributed per-version (per-version detail
+ * remains available via each result's own `testCounts`).
+ */
+function detectDynamicNoTestsCaveat(
+  results: (CompatVersionResult | null)[],
+): TestHarnessCaveat | null {
+  const zeroTestPass = results.find(
+    (r): r is CompatVersionResult =>
+      r !== null && r.status === "PASSED" && r.testCounts !== undefined && r.testCounts.testsRun === 0,
+  );
+  if (!zeroTestPass) return null;
+  return {
+    code: "PASS_WITH_NO_TESTS",
+    severity: "warning",
+    message:
+      `PASSED (version ${zeroTestPass.version}) but the test run reported zero tests executed — ` +
+      "the harness exited 0 having tested nothing, so this verdict doesn't confirm compatibility",
+  };
+}
+
+function mergeDynamicNoTestsCaveat(
+  testCommandCaveats: TestHarnessCaveat[],
+  results: (CompatVersionResult | null)[],
+): TestHarnessCaveat[] {
+  if (testCommandCaveats.some((c) => c.code === "PASS_WITH_NO_TESTS")) return testCommandCaveats;
+  const dynamic = detectDynamicNoTestsCaveat(results);
+  return dynamic ? [...testCommandCaveats, dynamic] : testCommandCaveats;
+}
+
 // Mutates `versions` in place: for each one with dupeCounts, compares each
 // package's copy count against the control's count for that same package
 // (only packages the control itself also checked — a package newly declared
@@ -1798,6 +1990,7 @@ export async function runCompat(
   );
   if (options.checkDupes) applyDupesRegressions(versions, control);
   const controlFailed = control !== null && control.status !== "PASSED";
+  const mergedTestCommandCaveats = mergeDynamicNoTestsCaveat(testCommandCaveats, [control, ...versions]);
 
   const passedVersions = versions
     .filter((v) => v.status === "PASSED")
@@ -1819,8 +2012,8 @@ export async function runCompat(
     group: options.group,
     snapshotDir,
     concurrency,
-    testCommandCaveat: testCommandCaveats[0]?.message ?? null,
-    testCommandCaveats,
+    testCommandCaveat: mergedTestCommandCaveats[0]?.message ?? null,
+    testCommandCaveats: mergedTestCommandCaveats,
     control,
     controlFailed,
     sandboxMode,
@@ -1944,6 +2137,7 @@ export async function runCompatBisect(
       esmCheck,
       consumerTargets,
     );
+    const mergedTestCommandCaveats = mergeDynamicNoTestsCaveat(testCommandCaveats, [control, ...tested]);
     return finishBisect(
       pkgName,
       candidateVersions,
@@ -1952,7 +2146,7 @@ export async function runCompatBisect(
       recommendedVersion,
       false,
       snapshotDir,
-      testCommandCaveats,
+      mergedTestCommandCaveats,
       options.group,
       control,
       sandboxMode,

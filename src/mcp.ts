@@ -256,6 +256,19 @@ export function createPackdevMcpServer(): McpServer {
               "can mask a resolution a clean install would surface), but the condition " +
               "checkDupes needs to see a nested-fork regression.",
           ),
+        ignoreInstallScripts: z
+          .boolean()
+          .optional()
+          .describe(
+            "Block lifecycle scripts (preinstall/install/postinstall) during compat's own " +
+              "sandbox install of the candidate version — scoped to that install step only, " +
+              "so the app's own pretest/prebuild hooks still run normally and the verdict stays " +
+              "meaningful. Off by default: install scripts are load-bearing for native packages " +
+              "(esbuild, sharp, better-sqlite3), so blocking them can turn a healthy version " +
+              "into a false FAILED. Has no effect under Yarn Berry (no such install flag exists " +
+              "there) — see testCommandCaveats for an IGNORE_SCRIPTS_UNSUPPORTED warning when " +
+              "that happens.",
+          ),
         mode: z
           .enum(["hermetic", "workspace"])
           .optional()
@@ -307,6 +320,9 @@ export function createPackdevMcpServer(): McpServer {
           ...(args.preferOffline !== undefined ? { preferOffline: args.preferOffline } : {}),
           ...(args.checkDupes !== undefined ? { checkDupes: args.checkDupes } : {}),
           ...(args.seedLockfile !== undefined ? { seedLockfile: args.seedLockfile } : {}),
+          ...(args.ignoreInstallScripts !== undefined
+            ? { ignoreInstallScripts: args.ignoreInstallScripts }
+            : {}),
           ...(args.consumerApps !== undefined ? { consumerApps: args.consumerApps } : {}),
           ...(args.fanOut !== undefined ? { fanOut: args.fanOut } : {}),
           ...(args.fanOutTop !== undefined ? { fanOutTop: args.fanOutTop } : {}),

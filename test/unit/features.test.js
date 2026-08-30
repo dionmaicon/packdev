@@ -3824,6 +3824,131 @@ class FeatureTests {
     });
   }
 
+  async testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput() {
+    await this.run('compat surfaces PASS_WITH_NO_TESTS dynamically when a real run exits 0 having executed zero tests, even with no static pattern to match', async () => {
+      // Issue #6: --ignore-scripts (or any other cause) can skip a build
+      // step a test suite depends on, leaving the runner's glob matching
+      // zero files. It exits 0 and looks identical to a real pass unless
+      // something actually inspects what the run reported. The --test
+      // command here is a bare `node --test` over an empty dir — nothing in
+      // the command string itself is jest-shaped, so the EXISTING static
+      // analyzeTestHarness heuristics have nothing to pattern-match; only
+      // parsing the real "# tests 0" TAP output can catch this.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js' }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', { '1.0.0': { tarballBuffer: v1 } });
+
+      const appDir = this.tmp('compat-dynamic-pass-with-no-tests');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      // No *.test.js file exists anywhere — node's own test runner finds
+      // nothing to run and exits 0.
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node --test', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+      assert.strictEqual(json.versions[0].testCounts.testsRun, 0, `expected testsRun 0, got ${JSON.stringify(json.versions[0].testCounts)}`);
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected dynamically-detected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+    });
+  }
+
+  async testCompatIgnoreInstallScriptsBlocksCandidatePostinstall() {
+    await this.run('compat --ignore-install-scripts blocks the sandboxed candidate\'s own postinstall without touching the app\'s test phase', async () => {
+      // A postinstall that fails is directly observable as INSTALL_FAILED
+      // vs PASSED — proof the script did or didn't run, without needing to
+      // inspect the sandbox's filesystem after cleanup.
+      const v1 = await buildFakeTarball({
+        'package.json': JSON.stringify({
+          name: 'fake-lib', version: '1.0.0', main: 'index.js',
+          scripts: { postinstall: 'node -e "process.exit(1)"' },
+        }),
+        'index.js': 'module.exports = {};',
+      });
+      const registryUrl = await this.registry('fake-lib', {
+        '1.0.0': { tarballBuffer: v1, scripts: { postinstall: 'node -e "process.exit(1)"' } },
+      });
+
+      const appDir = this.tmp('compat-ignore-install-scripts');
+      writeJson(path.join(appDir, 'package.json'), {
+        name: 'app', version: '1.0.0',
+        dependencies: { 'fake-lib': '^1.0.0' },
+      });
+      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+
+      // Baseline: without the flag, the candidate's own postinstall runs
+      // and fails the install.
+      const baseline = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--json',
+      ]);
+      const baselineJson = parseJson(baseline.stdout, 'compat');
+      assert.strictEqual(baselineJson.versions[0].status, 'INSTALL_FAILED', `expected the unblocked postinstall to fail the install, got ${JSON.stringify(baselineJson.versions[0])}`);
+
+      // With --ignore-install-scripts, the postinstall never runs, so the
+      // install (and therefore the whole run) succeeds.
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'node check.js', '--ignore-install-scripts', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED', `expected --ignore-install-scripts to suppress the postinstall failure, got ${JSON.stringify(json.versions[0])}`);
+    });
+  }
+
+  async testCompatIgnoreScriptsSupportedHelper() {
+    await this.run('ignoreScriptsSupported: true for npm/pnpm and Yarn Classic, false for Yarn Berry', async () => {
+      const compat = require('../../dist/compat.js');
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), true);
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), true);
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), true);
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), false);
+      // Unknown version resolves to classic-compatible behavior rather than
+      // silently claiming unsupported for a manager we can't identify.
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), true);
+    });
+  }
+
+  async testCompatParseTestRunCountsHelper() {
+    await this.run('parseTestRunCounts recognizes node:test/jest/vitest/mocha summaries and returns undefined for unrecognized output', async () => {
+      const compat = require('../../dist/compat.js');
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('TAP version 13\n# tests 5\n# pass 4\n# fail 1\n'),
+        { testsRun: 5, testsFailed: 1, source: 'node-test' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('# tests 0\n# pass 0\n# fail 0\n'),
+        { testsRun: 0, testsFailed: 0, source: 'node-test' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('Tests:       1 failed, 2 skipped, 3 passed, 6 total\n'),
+        { testsRun: 6, testsFailed: 1, source: 'jest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('No tests found, exiting with code 0\n'),
+        { testsRun: 0, testsFailed: null, source: 'jest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts(' Tests  2 passed (2)\n'),
+        { testsRun: 2, testsFailed: null, source: 'vitest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('  3 passing\n  1 failing\n'),
+        { testsRun: 4, testsFailed: 1, source: 'mocha' },
+      );
+      assert.strictEqual(compat.parseTestRunCounts('some unrelated build output\n'), undefined);
+    });
+  }
+
   async testCompatTestScriptOnlyRunsStillGetHarnessAnalysis() {
     await this.run('compat --test-script (no --test) still analyzes the actual script body for harness caveats, not the empty invocation string', async () => {
       const v1 = await buildFakeTarball({
@@ -5994,6 +6119,10 @@ module.exports = { realEntry };
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatWarnsOnPassWithNoTests();
+      await this.testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput();
+      await this.testCompatIgnoreInstallScriptsBlocksCandidatePostinstall();
+      await this.testCompatIgnoreScriptsSupportedHelper();
+      await this.testCompatParseTestRunCountsHelper();
       await this.testCompatTestScriptOnlyRunsStillGetHarnessAnalysis();
       await this.testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand();
       await this.testCompatWarnsOnTypeCheckOnlyTestCommand();
