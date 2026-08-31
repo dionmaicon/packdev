@@ -202,6 +202,28 @@ async function buildFakeTarball(files) {
   return buffer;
 }
 
+// A minimal fake-lib@1.0.0 registry + app declaring it as a dependency —
+// the common starting point for a single-version compat run. Optionally
+// gives fake-lib a postinstall script (both in its own package.json and in
+// the registry's packument, since npm decides whether to run lifecycle
+// scripts from the fetched packument, not the extracted tarball).
+async function setupSingleVersionFakeLibApp(suite, tmpName, { postinstallScript } = {}) {
+  const scripts = postinstallScript ? { postinstall: postinstallScript } : undefined;
+  const v1 = await buildFakeTarball({
+    'package.json': JSON.stringify({ name: 'fake-lib', version: '1.0.0', main: 'index.js', ...(scripts ? { scripts } : {}) }),
+    'index.js': 'module.exports = {};',
+  });
+  const registryUrl = await suite.registry('fake-lib', {
+    '1.0.0': { tarballBuffer: v1, ...(scripts ? { scripts } : {}) },
+  });
+  const appDir = suite.tmp(tmpName);
+  writeJson(path.join(appDir, 'package.json'), {
+    name: 'app', version: '1.0.0',
+    dependencies: { 'fake-lib': '^1.0.0' },
+  });
+  return { appDir, registryUrl };
+}
+
 // Fake npm registry serving package docs + tarballs for `packages`
 // ({ [pkgName]: { [version]: { tarballBuffer, deprecated? } } }), so a single
 // server can serve both a package and its @types/<pkg> counterpart. No real
@@ -3824,6 +3846,177 @@ class FeatureTests {
     });
   }
 
+  async testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput() {
+    await this.run('compat surfaces PASS_WITH_NO_TESTS dynamically when a real run exits 0 having executed zero tests, even with no static pattern to match', async () => {
+      // Issue #6: --ignore-scripts (or any other cause) can skip a build
+      // step a test suite depends on, leaving the runner's glob matching
+      // zero files. It exits 0 and looks identical to a real pass unless
+      // something actually inspects what the run reported. The --test
+      // command here is a bare `node --test` over an empty dir — nothing in
+      // the command string itself is jest-shaped, so the EXISTING static
+      // analyzeTestHarness heuristics have nothing to pattern-match; only
+      // parsing the real "# tests 0" TAP output can catch this.
+      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-dynamic-pass-with-no-tests');
+      // No *.test.js file exists anywhere — node's own test runner finds
+      // nothing to run and exits 0.
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node --test', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+      assert.strictEqual(json.versions[0].testCounts.testsRun, 0, `expected testsRun 0, got ${JSON.stringify(json.versions[0].testCounts)}`);
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected dynamically-detected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+    });
+  }
+
+  async testCompatIgnoreInstallScriptsBlocksCandidatePostinstall() {
+    await this.run('compat --ignore-install-scripts blocks the sandboxed candidate\'s own postinstall without touching the app\'s test phase', async () => {
+      // A postinstall that fails is directly observable as INSTALL_FAILED
+      // vs PASSED — proof the script did or didn't run, without needing to
+      // inspect the sandbox's filesystem after cleanup.
+      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-ignore-install-scripts', {
+        postinstallScript: 'node -e "process.exit(1)"',
+      });
+      // The app's OWN pretest hook must still fire during the test phase —
+      // using `--test "npm test"` (not a bare `node check.js`) exercises
+      // npm's real pretest/test lifecycle, so an implementation that
+      // accidentally scoped --ignore-install-scripts too broadly (e.g. by
+      // setting npm_config_ignore_scripts for the whole child process
+      // rather than just its own sandbox install) would suppress this
+      // pretest hook too and fail check.js's assertion below, instead of
+      // silently passing regardless of scoping.
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'if (!require("fs").existsSync(require("path").join(__dirname, "built.marker"))) process.exit(1);\n',
+      );
+      const appPackageJson = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf-8'));
+      writeJson(path.join(appDir, 'package.json'), {
+        ...appPackageJson,
+        scripts: {
+          pretest: 'node -e "require(\'fs\').writeFileSync(\'built.marker\', \'ok\')"',
+          test: 'node check.js',
+        },
+      });
+
+      // Baseline: without the flag, the candidate's own postinstall runs
+      // and fails the install.
+      const baseline = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'npm test', '--json',
+      ]);
+      const baselineJson = parseJson(baseline.stdout, 'compat');
+      assert.strictEqual(baselineJson.versions[0].status, 'INSTALL_FAILED', `expected the unblocked postinstall to fail the install, got ${JSON.stringify(baselineJson.versions[0])}`);
+
+      // With --ignore-install-scripts, the postinstall never runs, so the
+      // install succeeds — AND the app's own pretest hook still runs during
+      // the test phase (proving the scripts block is scoped to the sandbox
+      // install only), producing built.marker before check.js checks for it.
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
+        '--registry', registryUrl, '--test', 'npm test', '--ignore-install-scripts', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED', `expected --ignore-install-scripts to suppress the postinstall failure while still running the app's own pretest hook, got ${JSON.stringify(json.versions[0])}`);
+    });
+  }
+
+  async testCompatIgnoreScriptsSupportedHelper() {
+    await this.run('ignoreScriptsSupported/resolveIgnoreScriptsInstallArgs: true+--ignore-scripts for npm/pnpm/Yarn Classic, true+--mode=skip-build for Yarn Berry, false only for an unresolved yarn version', async () => {
+      const compat = require('../../dist/compat.js');
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), ['--ignore-scripts']);
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), ['--ignore-scripts']);
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), ['--ignore-scripts']);
+      // Yarn Berry has no --ignore-scripts flag, but --mode=skip-build is
+      // its own install-scoped equivalent (skips build/lifecycle scripts
+      // for that install without touching enableScripts globally) — this
+      // IS supported, just via a different argument than the other managers.
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), ['--mode=skip-build']);
+      // A bare yarn.lock with no packageManager field gives no version at
+      // all, and a Berry project can be set up exactly that way (.yarnrc.yml/
+      // yarnPath alone, no field) — since classic and Berry need DIFFERENT
+      // arguments, an unresolved version must report unsupported rather
+      // than guessing either one and risking passing the wrong manager an
+      // option it rejects. See resolveYarnVersionFromBinary for how compat
+      // resolves this for real before calling ignoreScriptsSupported.
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), false);
+      assert.strictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), undefined);
+    });
+  }
+
+  async testCompatResolveYarnVersionFromBinaryHelper() {
+    await this.run('resolveYarnVersionFromBinary reads whatever "yarn" resolves to on PATH, undefined when the binary is unusable', async () => {
+      const compat = require('../../dist/compat.js');
+      const cwd = this.tmp('resolve-yarn-version-from-binary');
+      fs.mkdirSync(cwd, { recursive: true });
+
+      // A fake "yarn" on a controlled PATH, not the host's real yarn — this
+      // must pass on any machine, including CI runners and dev boxes with
+      // no yarn installed at all, and it lets the assertion check an exact,
+      // known version instead of "looks vaguely semver-shaped".
+      const fakeBinDir = this.tmp('resolve-yarn-version-fake-bin');
+      fs.mkdirSync(fakeBinDir, { recursive: true });
+      const fakeYarnPath = path.join(fakeBinDir, 'yarn');
+      fs.writeFileSync(fakeYarnPath, '#!/bin/sh\necho "3.6.1"\n');
+      fs.chmodSync(fakeYarnPath, 0o755);
+
+      const originalPath = process.env.PATH;
+      try {
+        process.env.PATH = `${fakeBinDir}:${originalPath}`;
+        const version = await compat.resolveYarnVersionFromBinary(cwd);
+        assert.strictEqual(version, '3.6.1', `expected the fake yarn's own version, got ${JSON.stringify(version)}`);
+
+        // A directory where "yarn" can't be resolved as an executable at
+        // all (PATH stripped) must report unknown, not silently default to
+        // any particular generation.
+        process.env.PATH = '';
+        const unresolved = await compat.resolveYarnVersionFromBinary(cwd);
+        assert.strictEqual(unresolved, undefined);
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    });
+  }
+
+  async testCompatParseTestRunCountsHelper() {
+    await this.run('parseTestRunCounts recognizes node:test/jest/vitest/mocha summaries and returns undefined for unrecognized output', async () => {
+      const compat = require('../../dist/compat.js');
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('TAP version 13\n# tests 5\n# pass 4\n# fail 1\n'),
+        { testsRun: 5, testsFailed: 1, source: 'node-test' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('# tests 0\n# pass 0\n# fail 0\n'),
+        { testsRun: 0, testsFailed: 0, source: 'node-test' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('Tests:       1 failed, 2 skipped, 3 passed, 6 total\n'),
+        { testsRun: 6, testsFailed: 1, source: 'jest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('No tests found, exiting with code 0\n'),
+        { testsRun: 0, testsFailed: null, source: 'jest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts(' Tests  2 passed (2)\n'),
+        { testsRun: 2, testsFailed: null, source: 'vitest' },
+      );
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('  3 passing\n  1 failing\n'),
+        { testsRun: 4, testsFailed: 1, source: 'mocha' },
+      );
+      assert.strictEqual(compat.parseTestRunCounts('some unrelated build output\n'), undefined);
+    });
+  }
+
   async testCompatTestScriptOnlyRunsStillGetHarnessAnalysis() {
     await this.run('compat --test-script (no --test) still analyzes the actual script body for harness caveats, not the empty invocation string', async () => {
       const v1 = await buildFakeTarball({
@@ -5994,6 +6187,11 @@ module.exports = { realEntry };
       await this.testCompatExitsNonZeroOnFailure();
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatWarnsOnPassWithNoTests();
+      await this.testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput();
+      await this.testCompatIgnoreInstallScriptsBlocksCandidatePostinstall();
+      await this.testCompatIgnoreScriptsSupportedHelper();
+      await this.testCompatResolveYarnVersionFromBinaryHelper();
+      await this.testCompatParseTestRunCountsHelper();
       await this.testCompatTestScriptOnlyRunsStillGetHarnessAnalysis();
       await this.testCompatFanOutAnalyzesEveryConsumerEvenWithASharedTestCommand();
       await this.testCompatWarnsOnTypeCheckOnlyTestCommand();
