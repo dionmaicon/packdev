@@ -1056,11 +1056,17 @@ function counts(
   return { testsRun, testsFailed, source };
 }
 
-// node's built-in test runner (TAP output): "# tests 5", "# fail 1"
+// node's built-in test runner: "# tests 5", "# fail 1" under the `tap`
+// reporter (Node <24's non-TTY default), or "ℹ tests 5", "ℹ fail 1" under
+// `spec` (Node 24+'s non-TTY default) — same summary line, different prefix
+// character depending on which Node version produced it. Matching only "#"
+// left this parser (and therefore PASS_WITH_NO_TESTS) silently inert on
+// Node 24: a zero-test run reported testCounts undefined instead of 0,
+// exactly the packdev#6 failure mode returning under a different trigger.
 function parseNodeTestCounts(output: string): TestRunCounts | undefined {
-  const match = /^#\s{0,3}tests\s{1,3}(\d+)/m.exec(output);
+  const match = /^[#ℹ]\s{0,3}tests\s{1,3}(\d+)/m.exec(output);
   if (!match) return undefined;
-  const failMatch = /^#\s{0,3}fail\s{1,3}(\d+)/m.exec(output);
+  const failMatch = /^[#ℹ]\s{0,3}fail\s{1,3}(\d+)/m.exec(output);
   return counts("node-test", Number.parseInt(match[1]!, 10), failMatch ? Number.parseInt(failMatch[1]!, 10) : null);
 }
 

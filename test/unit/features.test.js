@@ -3846,6 +3846,28 @@ class FeatureTests {
     });
   }
 
+  // Shared body for "a real zero-test node --test run must raise
+  // PASS_WITH_NO_TESTS", parametrized by the exact --test command — the two
+  // callers below only differ in which reporter format node --test emits
+  // (tap's default "#" prefix vs spec's "ℹ" prefix, see packdev#8), so
+  // asserting the same three things twice would be pure duplication.
+  async assertPassWithNoTestsDetected(tmpName, testCommand) {
+    const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, tmpName);
+    // No *.test.js file exists anywhere — node's own test runner finds
+    // nothing to run and exits 0.
+
+    const r = await runPackdev(appDir, [
+      'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+      '--test', testCommand, '--json',
+    ]);
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+    const json = parseJson(r.stdout, 'compat');
+    assert.strictEqual(json.versions[0].status, 'PASSED');
+    assert.strictEqual(json.versions[0].testCounts.testsRun, 0, `expected testsRun 0, got ${JSON.stringify(json.versions[0].testCounts)}`);
+    const codes = json.testCommandCaveats.map((c) => c.code);
+    assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected dynamically-detected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+  }
+
   async testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput() {
     await this.run('compat surfaces PASS_WITH_NO_TESTS dynamically when a real run exits 0 having executed zero tests, even with no static pattern to match', async () => {
       // Issue #6: --ignore-scripts (or any other cause) can skip a build
@@ -3855,21 +3877,24 @@ class FeatureTests {
       // command here is a bare `node --test` over an empty dir — nothing in
       // the command string itself is jest-shaped, so the EXISTING static
       // analyzeTestHarness heuristics have nothing to pattern-match; only
-      // parsing the real "# tests 0" TAP output can catch this.
-      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-dynamic-pass-with-no-tests');
-      // No *.test.js file exists anywhere — node's own test runner finds
-      // nothing to run and exits 0.
+      // parsing the real "# tests 0" TAP (tap reporter) output can catch this.
+      await this.assertPassWithNoTestsDetected('compat-dynamic-pass-with-no-tests', 'node --test');
+    });
+  }
 
-      const r = await runPackdev(appDir, [
-        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
-        '--test', 'node --test', '--json',
-      ]);
-      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
-      const json = parseJson(r.stdout, 'compat');
-      assert.strictEqual(json.versions[0].status, 'PASSED');
-      assert.strictEqual(json.versions[0].testCounts.testsRun, 0, `expected testsRun 0, got ${JSON.stringify(json.versions[0].testCounts)}`);
-      const codes = json.testCommandCaveats.map((c) => c.code);
-      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected dynamically-detected PASS_WITH_NO_TESTS in ${JSON.stringify(codes)}`);
+  async testCompatDetectsPassWithNoTestsFromSpecReporterOutput() {
+    await this.run('compat surfaces PASS_WITH_NO_TESTS from node --test\'s spec reporter ("ℹ" prefix), not just its tap reporter ("#" prefix)', async () => {
+      // packdev#8: Node 24 changed `node --test`'s default non-TTY reporter
+      // from tap ("# tests 0") to spec ("ℹ tests 0") — a parser anchored
+      // only on "#" left PASS_WITH_NO_TESTS silently inert on Node 24,
+      // reviving the exact packdev#6 failure mode. Forcing --test-reporter=
+      // spec explicitly here makes this test deterministic across every
+      // Node version this suite runs on, rather than depending on which
+      // reporter happens to be that Node version's current default.
+      await this.assertPassWithNoTestsDetected(
+        'compat-pass-with-no-tests-spec-reporter',
+        'node --test --test-reporter=spec --test-reporter-destination=stdout',
+      );
     });
   }
 
@@ -3995,6 +4020,15 @@ class FeatureTests {
       );
       assert.deepStrictEqual(
         compat.parseTestRunCounts('# tests 0\n# pass 0\n# fail 0\n'),
+        { testsRun: 0, testsFailed: 0, source: 'node-test' },
+      );
+      // packdev#8: Node 24 changed --test's non-TTY default reporter from
+      // tap to spec, which prefixes the same summary line with "ℹ" instead
+      // of "#" — a TAP-only regex left this silently unable to see a
+      // zero-test run under Node 24, exactly the packdev#6 failure mode
+      // returning under a different trigger.
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('ℹ tests 0\nℹ pass 0\nℹ fail 0\n'),
         { testsRun: 0, testsFailed: 0, source: 'node-test' },
       );
       assert.deepStrictEqual(
@@ -6188,6 +6222,7 @@ module.exports = { realEntry };
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatWarnsOnPassWithNoTests();
       await this.testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput();
+      await this.testCompatDetectsPassWithNoTestsFromSpecReporterOutput();
       await this.testCompatIgnoreInstallScriptsBlocksCandidatePostinstall();
       await this.testCompatIgnoreScriptsSupportedHelper();
       await this.testCompatResolveYarnVersionFromBinaryHelper();
