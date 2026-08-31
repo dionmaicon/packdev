@@ -3873,6 +3873,30 @@ class FeatureTests {
     });
   }
 
+  async testCompatDetectsPassWithNoTestsFromSpecReporterOutput() {
+    await this.run('compat surfaces PASS_WITH_NO_TESTS from node --test\'s spec reporter ("ℹ" prefix), not just its tap reporter ("#" prefix)', async () => {
+      // packdev#8: Node 24 changed `node --test`'s default non-TTY reporter
+      // from tap ("# tests 0") to spec ("ℹ tests 0") — a parser anchored
+      // only on "#" left PASS_WITH_NO_TESTS silently inert on Node 24,
+      // reviving the exact packdev#6 failure mode. Forcing --test-reporter=
+      // spec explicitly here makes this test deterministic across every
+      // Node version this suite runs on, rather than depending on which
+      // reporter happens to be that Node version's current default.
+      const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-pass-with-no-tests-spec-reporter');
+
+      const r = await runPackdev(appDir, [
+        'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir, '--registry', registryUrl,
+        '--test', 'node --test --test-reporter=spec --test-reporter-destination=stdout', '--json',
+      ]);
+      assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+      const json = parseJson(r.stdout, 'compat');
+      assert.strictEqual(json.versions[0].status, 'PASSED');
+      assert.strictEqual(json.versions[0].testCounts.testsRun, 0, `expected testsRun 0 from the spec reporter's own output, got ${JSON.stringify(json.versions[0].testCounts)}`);
+      const codes = json.testCommandCaveats.map((c) => c.code);
+      assert.ok(codes.includes('PASS_WITH_NO_TESTS'), `expected PASS_WITH_NO_TESTS detected from spec-reporter output in ${JSON.stringify(codes)}`);
+    });
+  }
+
   async testCompatIgnoreInstallScriptsBlocksCandidatePostinstall() {
     await this.run('compat --ignore-install-scripts blocks the sandboxed candidate\'s own postinstall without touching the app\'s test phase', async () => {
       // A postinstall that fails is directly observable as INSTALL_FAILED
@@ -3995,6 +4019,15 @@ class FeatureTests {
       );
       assert.deepStrictEqual(
         compat.parseTestRunCounts('# tests 0\n# pass 0\n# fail 0\n'),
+        { testsRun: 0, testsFailed: 0, source: 'node-test' },
+      );
+      // packdev#8: Node 24 changed --test's non-TTY default reporter from
+      // tap to spec, which prefixes the same summary line with "ℹ" instead
+      // of "#" — a TAP-only regex left this silently unable to see a
+      // zero-test run under Node 24, exactly the packdev#6 failure mode
+      // returning under a different trigger.
+      assert.deepStrictEqual(
+        compat.parseTestRunCounts('ℹ tests 0\nℹ pass 0\nℹ fail 0\n'),
         { testsRun: 0, testsFailed: 0, source: 'node-test' },
       );
       assert.deepStrictEqual(
@@ -6188,6 +6221,7 @@ module.exports = { realEntry };
       await this.testCompatWarnsOnTranspileOnlyTestSetup();
       await this.testCompatWarnsOnPassWithNoTests();
       await this.testCompatDetectsPassWithNoTestsDynamicallyFromRealNodeTestOutput();
+      await this.testCompatDetectsPassWithNoTestsFromSpecReporterOutput();
       await this.testCompatIgnoreInstallScriptsBlocksCandidatePostinstall();
       await this.testCompatIgnoreScriptsSupportedHelper();
       await this.testCompatResolveYarnVersionFromBinaryHelper();
