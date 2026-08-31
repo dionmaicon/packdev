@@ -3881,62 +3881,103 @@ class FeatureTests {
       const { appDir, registryUrl } = await setupSingleVersionFakeLibApp(this, 'compat-ignore-install-scripts', {
         postinstallScript: 'node -e "process.exit(1)"',
       });
-      fs.writeFileSync(path.join(appDir, 'check.js'), 'process.exit(0);\n');
+      // The app's OWN pretest hook must still fire during the test phase —
+      // using `--test "npm test"` (not a bare `node check.js`) exercises
+      // npm's real pretest/test lifecycle, so an implementation that
+      // accidentally scoped --ignore-install-scripts too broadly (e.g. by
+      // setting npm_config_ignore_scripts for the whole child process
+      // rather than just its own sandbox install) would suppress this
+      // pretest hook too and fail check.js's assertion below, instead of
+      // silently passing regardless of scoping.
+      fs.writeFileSync(
+        path.join(appDir, 'check.js'),
+        'if (!require("fs").existsSync(require("path").join(__dirname, "built.marker"))) process.exit(1);\n',
+      );
+      const appPackageJson = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf-8'));
+      writeJson(path.join(appDir, 'package.json'), {
+        ...appPackageJson,
+        scripts: {
+          pretest: 'node -e "require(\'fs\').writeFileSync(\'built.marker\', \'ok\')"',
+          test: 'node check.js',
+        },
+      });
 
       // Baseline: without the flag, the candidate's own postinstall runs
       // and fails the install.
       const baseline = await runPackdev(appDir, [
         'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
-        '--registry', registryUrl, '--test', 'node check.js', '--json',
+        '--registry', registryUrl, '--test', 'npm test', '--json',
       ]);
       const baselineJson = parseJson(baseline.stdout, 'compat');
       assert.strictEqual(baselineJson.versions[0].status, 'INSTALL_FAILED', `expected the unblocked postinstall to fail the install, got ${JSON.stringify(baselineJson.versions[0])}`);
 
       // With --ignore-install-scripts, the postinstall never runs, so the
-      // install (and therefore the whole run) succeeds.
+      // install succeeds — AND the app's own pretest hook still runs during
+      // the test phase (proving the scripts block is scoped to the sandbox
+      // install only), producing built.marker before check.js checks for it.
       const r = await runPackdev(appDir, [
         'compat', 'fake-lib', '--versions', '1.0.0', '--app', appDir,
-        '--registry', registryUrl, '--test', 'node check.js', '--ignore-install-scripts', '--json',
+        '--registry', registryUrl, '--test', 'npm test', '--ignore-install-scripts', '--json',
       ]);
       assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
       const json = parseJson(r.stdout, 'compat');
-      assert.strictEqual(json.versions[0].status, 'PASSED', `expected --ignore-install-scripts to suppress the postinstall failure, got ${JSON.stringify(json.versions[0])}`);
+      assert.strictEqual(json.versions[0].status, 'PASSED', `expected --ignore-install-scripts to suppress the postinstall failure while still running the app's own pretest hook, got ${JSON.stringify(json.versions[0])}`);
     });
   }
 
   async testCompatIgnoreScriptsSupportedHelper() {
-    await this.run('ignoreScriptsSupported: true for npm/pnpm and Yarn Classic, false for Yarn Berry and for an unresolved yarn version', async () => {
+    await this.run('ignoreScriptsSupported/resolveIgnoreScriptsInstallArgs: true+--ignore-scripts for npm/pnpm/Yarn Classic, true+--mode=skip-build for Yarn Berry, false only for an unresolved yarn version', async () => {
       const compat = require('../../dist/compat.js');
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'npm', lockFile: 'package-lock.json', source: 'default' }), ['--ignore-scripts']);
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'pnpm', lockFile: 'pnpm-lock.yaml', source: 'default' }), ['--ignore-scripts']);
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), true);
-      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), false);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', version: '1.22.22', source: 'lockfile' }), ['--ignore-scripts']);
+      // Yarn Berry has no --ignore-scripts flag, but --mode=skip-build is
+      // its own install-scoped equivalent (skips build/lifecycle scripts
+      // for that install without touching enableScripts globally) — this
+      // IS supported, just via a different argument than the other managers.
+      assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), true);
+      assert.deepStrictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', version: '4.14.1', source: 'lockfile' }), ['--mode=skip-build']);
       // A bare yarn.lock with no packageManager field gives no version at
       // all, and a Berry project can be set up exactly that way (.yarnrc.yml/
-      // yarnPath alone, no field) — so unknown must resolve to "unsupported"
-      // (safe: worst case is a real Classic project not getting the flag),
-      // never "assume classic" (unsafe: would pass Berry an option it
-      // rejects). See resolveYarnVersionFromBinary for how compat resolves
-      // this for real before calling ignoreScriptsSupported.
+      // yarnPath alone, no field) — since classic and Berry need DIFFERENT
+      // arguments, an unresolved version must report unsupported rather
+      // than guessing either one and risking passing the wrong manager an
+      // option it rejects. See resolveYarnVersionFromBinary for how compat
+      // resolves this for real before calling ignoreScriptsSupported.
       assert.strictEqual(compat.ignoreScriptsSupported({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), false);
+      assert.strictEqual(compat.resolveIgnoreScriptsInstallArgs({ manager: 'yarn', lockFile: 'yarn.lock', source: 'default' }), undefined);
     });
   }
 
   async testCompatResolveYarnVersionFromBinaryHelper() {
-    await this.run('resolveYarnVersionFromBinary reads the real yarn binary version, undefined when the binary is unusable', async () => {
+    await this.run('resolveYarnVersionFromBinary reads whatever "yarn" resolves to on PATH, undefined when the binary is unusable', async () => {
       const compat = require('../../dist/compat.js');
       const cwd = this.tmp('resolve-yarn-version-from-binary');
       fs.mkdirSync(cwd, { recursive: true });
 
-      const realVersion = await compat.resolveYarnVersionFromBinary(cwd);
-      assert.match(realVersion, /^\d+\.\d+\.\d+/, `expected a real semver-like yarn version, got ${JSON.stringify(realVersion)}`);
+      // A fake "yarn" on a controlled PATH, not the host's real yarn — this
+      // must pass on any machine, including CI runners and dev boxes with
+      // no yarn installed at all, and it lets the assertion check an exact,
+      // known version instead of "looks vaguely semver-shaped".
+      const fakeBinDir = this.tmp('resolve-yarn-version-fake-bin');
+      fs.mkdirSync(fakeBinDir, { recursive: true });
+      const fakeYarnPath = path.join(fakeBinDir, 'yarn');
+      fs.writeFileSync(fakeYarnPath, '#!/bin/sh\necho "3.6.1"\n');
+      fs.chmodSync(fakeYarnPath, 0o755);
 
-      // A directory where "yarn" can't be resolved as an executable at all
-      // (PATH stripped) must report unknown, not silently default to any
-      // particular generation.
       const originalPath = process.env.PATH;
-      process.env.PATH = '';
       try {
+        process.env.PATH = `${fakeBinDir}:${originalPath}`;
+        const version = await compat.resolveYarnVersionFromBinary(cwd);
+        assert.strictEqual(version, '3.6.1', `expected the fake yarn's own version, got ${JSON.stringify(version)}`);
+
+        // A directory where "yarn" can't be resolved as an executable at
+        // all (PATH stripped) must report unknown, not silently default to
+        // any particular generation.
+        process.env.PATH = '';
         const unresolved = await compat.resolveYarnVersionFromBinary(cwd);
         assert.strictEqual(unresolved, undefined);
       } finally {

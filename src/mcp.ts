@@ -265,9 +265,11 @@ export function createPackdevMcpServer(): McpServer {
               "so the app's own pretest/prebuild hooks still run normally and the verdict stays " +
               "meaningful. Off by default: install scripts are load-bearing for native packages " +
               "(esbuild, sharp, better-sqlite3), so blocking them can turn a healthy version " +
-              "into a false FAILED. Has no effect under Yarn Berry (no such install flag exists " +
-              "there) — see testCommandCaveats for an IGNORE_SCRIPTS_UNSUPPORTED warning when " +
-              "that happens.",
+              "into a false FAILED. Uses --ignore-scripts under npm/pnpm/Yarn Classic and " +
+              "--mode=skip-build under Yarn Berry (Berry's closest equivalent — skips build/" +
+              "lifecycle scripts); has no effect only when the yarn generation actually in use " +
+              "couldn't be determined — see testCommandCaveats for an IGNORE_SCRIPTS_UNSUPPORTED " +
+              "warning when that happens.",
           ),
         mode: z
           .enum(["hermetic", "workspace"])

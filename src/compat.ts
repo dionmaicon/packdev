@@ -972,31 +972,37 @@ async function runCommand(
 
 // Whether `runInstall`'s ignoreScripts request could actually be honored for
 // this manager/version: npm and pnpm both support --ignore-scripts on every
-// version we support. Yarn Classic (1.x) supports --ignore-scripts too, but
-// Yarn Berry (2+) has no such flag — it disables *build* scripts (a
-// different, narrower mechanism: `enableScripts: false` in .yarnrc.yml still
-// runs installs, just skips postinstall-style build steps for some
-// packages) and cannot be steered per-invocation the way this flag implies.
-// A yarn PackageManagerInfo with no `version` (source: "lockfile", a bare
-// yarn.lock with no packageManager field pinning it) is NOT safe to assume
-// classic — a Berry project can be set up exactly that way, via .yarnrc.yml/
-// yarnPath alone. Treating unknown as unsupported is the safe direction: the
-// worst case is a real Yarn Classic project not getting --ignore-scripts (a
-// missed hardening, not a broken install), whereas assuming supported for
-// an actual Berry project passes it an option that flag doesn't recognize,
-// which can fail the install outright instead of raising the intended
-// IGNORE_SCRIPTS_UNSUPPORTED caveat. Callers that need better-than-"unknown"
-// accuracy here should resolve the real generation from the invoked binary
-// first — see `resolveYarnVersionFromBinary` — and pass that resolved
-// version through `packageManagerInfo.version` before calling this.
-// Exported so callers can decide whether to warn instead of silently
-// assuming the block took effect.
-export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): boolean {
-  if (packageManagerInfo.manager !== "yarn") return true;
+// version we support, and Yarn Classic (1.x) supports --ignore-scripts too.
+// Yarn Berry (2+) has no --ignore-scripts flag, but it has an equivalent for
+// this specific use case: `yarn install --mode=skip-build` skips running
+// installed packages' build/lifecycle scripts for that one install, without
+// touching the app's own scripts the way a global enableScripts:false in
+// .yarnrc.yml would. A yarn PackageManagerInfo with no `version` (source:
+// "lockfile", a bare yarn.lock with no packageManager field pinning it) is
+// NOT safe to assume classic — a Berry project can be set up exactly that
+// way, via .yarnrc.yml/yarnPath alone — so which of the two arguments is
+// correct can't be decided without knowing the real generation. Returns
+// undefined in that unknown case (never a guessed default): passing the
+// wrong manager's flag can fail the install outright instead of raising the
+// intended IGNORE_SCRIPTS_UNSUPPORTED caveat. Callers that need
+// better-than-"unknown" accuracy should resolve the real generation from
+// the invoked binary first — see `resolveYarnVersionFromBinary` — and pass
+// that resolved version through `packageManagerInfo.version` before calling
+// this.
+export function resolveIgnoreScriptsInstallArgs(packageManagerInfo: PackageManagerInfo): string[] | undefined {
+  if (packageManagerInfo.manager !== "yarn") return ["--ignore-scripts"];
   const version = packageManagerInfo.version;
-  if (!version) return false;
+  if (!version) return undefined;
   const major = Number.parseInt(version.split(".")[0] ?? "", 10);
-  return Number.isFinite(major) && major < 2;
+  if (!Number.isFinite(major)) return undefined;
+  return major < 2 ? ["--ignore-scripts"] : ["--mode=skip-build"];
+}
+
+// Exported so callers can decide whether to warn instead of silently
+// assuming the block took effect — see resolveIgnoreScriptsInstallArgs for
+// what "supported" resolves to per manager/version.
+export function ignoreScriptsSupported(packageManagerInfo: PackageManagerInfo): boolean {
+  return resolveIgnoreScriptsInstallArgs(packageManagerInfo) !== undefined;
 }
 
 // Queries the actual yarn binary that will run the install for its real
@@ -1026,7 +1032,7 @@ export function runInstall(
     "install",
     ...(registryUrl ? ["--registry", registryUrl] : []),
     ...(preferOffline ? ["--prefer-offline"] : []),
-    ...(ignoreScripts && ignoreScriptsSupported(packageManagerInfo) ? ["--ignore-scripts"] : []),
+    ...(ignoreScripts ? (resolveIgnoreScriptsInstallArgs(packageManagerInfo) ?? []) : []),
   ];
   return runCommand(packageManagerInfo.manager, args, sandboxDir);
 }
@@ -1736,8 +1742,9 @@ async function analyzeTestHarnessAcrossTargets(
       severity: "warning",
       message:
         `--ignore-install-scripts has no effect for ${formatPackageManager(packageManagerInfo)} — ` +
-        "Yarn Berry has no --ignore-scripts install flag, so the candidate's own install scripts " +
-        "still ran unblocked in the sandbox",
+        "the yarn generation actually running here (classic vs Berry) could not be determined, " +
+        "so neither --ignore-scripts nor Berry's --mode=skip-build could be chosen safely; the " +
+        "candidate's own install/build scripts ran unblocked in the sandbox",
     });
   }
   const primaryCommand = await resolveHarnessCommand(options.appDir, options, packageManagerInfo);
